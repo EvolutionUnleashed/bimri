@@ -1,99 +1,182 @@
-# BIMRI — Brief Interaction Memory & Retrieval Intelligence
+# BIMRI v3 — Brief Interaction Memory & Retrieval Intelligence
 
-A persistent memory architecture for Claude Cowork that gives your agent continuity across sessions.
+A compact persistent-memory protocol for Claude Cowork.
 
-Cowork doesn't have memory. Every session starts from scratch. BIMRI fixes that by maintaining a structured memory file in each workspace folder that the agent reads at session start and updates at session end. The file self-maintains through importance scoring, freshness decay, and automatic pruning — which means it gets smarter over time without growing indefinitely.
+Cowork starts each fresh chat without reliable folder-level memory. BIMRI v3 fixes that by maintaining one structured memory file inside each workspace folder. Claude reads it at session start, uses it as local working context, and updates it before the final response.
+
+BIMRI v3 is intentionally small: one active memory file, one rolling backup, no protocol sprawl.
 
 **Status:** Experimental. Running in production across multiple workspaces. Feedback welcome.
 
 ## The Problem
 
-Every flat-file memory system hits the same wall. The agent appends summaries after each session, the file grows linearly, and after a few weeks it's eating a third of the context window before the agent does any real work. Old entries that stopped being relevant sit at the same priority as yesterday's critical decisions. Signal-to-noise collapses quietly until the memory file becomes the problem it was supposed to solve.
+Flat-file memory systems usually fail the same way: they become diaries.
 
-This is context rot. BIMRI is built specifically so it can't happen.
+The agent appends a session summary every time, stale context never truly leaves, and the file quietly becomes a context swamp. The result is worse than forgetting: old noise competes with current signal.
+
+BIMRI v3 is designed around active memory, not historical logging.
+
+## What Changed in v3
+
+BIMRI v3 is a simplification and pruning hardening release.
+
+Key changes:
+
+- Uses only `BIMRI.md` and `BIMRI-backup.md` by default.
+- Stops creating `working/`, `.bimri/`, `AGENTS.md`, `CLAUDE.md`, `INSTRUCTIONS.md`, archive folders, or extra backups.
+- Replaces automatic session summaries with memory deltas.
+- Adds session-based decay as well as date-based decay, so multiple Cowork chats in one day still age memory.
+- Removes the IMPORTANCE 4/5 floor rule.
+- Makes pruning mandatory and destructive inside active memory.
+- Confirms updates with counts instead of only saying “BIMRI updated.”
 
 ## How It Works
 
-BIMRI splits memory into three tiers that serve different cognitive functions.
+BIMRI splits memory into three tiers.
 
-**Tier 1 — Core Intelligence (~3,000 tokens).** Permanent foundational knowledge. Workspace purpose, user preferences, key objectives, hard constraints. Never decays. Sits at the top of the file so the agent reads it first.
+**Tier 1 — Core Intelligence (~3,000 tokens).** Durable workspace purpose, permanent user preferences, standing constraints, and operating principles. Tier 1 does not decay.
 
-**Tier 2 — Active Context (~8,000 tokens).** Session summaries, current work state, open tasks, recent decisions. Every entry carries an importance score (1–5) and a timestamp. A freshness multiplier decays relevance over time using a static lookup table. Composite weight = importance × freshness. Entries below a threshold of 1.5 get pruned automatically.
+**Tier 2 — Active Context (~6,000 tokens or 30 entries).** Current useful context only: active projects, recent decisions that still matter, open loops, and near-future context. Tier 2 is not a session log.
 
-**Tier 3 — Pattern Recognition (~3,500 tokens).** Derived behavioral insights rather than raw events. The agent identifies recurring dynamics across sessions and tracks them with confidence scores — emerging (1–2 observations), developing (3–5), established (6+). Established patterns are treated as reliable predictions.
+**Tier 3 — Pattern Recognition (~3,500 tokens).** Repeated behaviors, decision patterns, workflow preferences, strategic themes, and recurring constraints. Patterns are compressed so BIMRI does not need to preserve every raw observation.
 
-The total file stabilizes around 10,000–15,000 tokens regardless of how many sessions you've run. At current pricing, that adds roughly 3–7 cents per conversation in input token cost.
+Whole-file target: under ~12,000 tokens. Hard ceiling: 15,000 tokens.
 
-## Key Design Decisions
+## File Structure
 
-**Lookup table instead of formula.** The first version used exponential decay math. Language models compute math inconsistently across sessions, which caused weight drift over time. A static 7-row lookup table eliminated that problem entirely.
+Auto-created per workspace folder:
 
-**Concrete scoring examples.** Abstract importance descriptions like "changes the fundamental understanding of the workspace" mean different things to different model instances. Real example sentences anchor each score level and tighten variance.
+```txt
+Any-Workspace/
+├── BIMRI.md          ← Active memory file
+└── BIMRI-backup.md   ← Rolling backup before each write
+```
 
-**Automatic backup.** Every session copies bimri.md to bimri-backup.md before making any modifications. If the agent botches a write, the previous version is right there.
+Legacy compatibility:
 
-**When in doubt, record it.** A low-importance entry that decays naturally costs almost nothing. A missed insight is gone forever. The system is designed to over-record and let pruning handle the rest.
+```txt
+Any-Workspace/
+├── bimri.md
+└── bimri-backup.md
+```
 
-## Setup (90 Seconds)
+If a folder already has lowercase files, BIMRI v3 uses them and does not create duplicates. New folders use uppercase by default.
 
-You need Claude Desktop with Cowork on a paid plan.
+## Setup
 
-1. Copy the contents of [`BIMRI-global-instructions.md`](BIMRI-global-instructions.md) from this repo.
+You need Claude Desktop with Cowork.
+
+1. Copy the contents of [`BIMRI-global-instructions.md`](BIMRI-global-instructions.md).
 2. Open Claude Desktop → Settings → Cowork → Global Instructions → Edit.
-3. Paste. Save.
+3. Paste.
+4. Save.
 
-That's it. Every folder you open in Cowork from this point forward gets BIMRI automatically. The agent checks for a memory file, creates one if it doesn't exist, runs a brief intake to seed foundational context, and starts working. The memory file self-maintains from there.
+Every folder opened in Cowork from that point forward gets BIMRI automatically.
 
-## File Structure (Auto-Created Per Folder)
+## Freshness Scoring
 
+BIMRI v3 calculates freshness from `LAST_USED`, not only creation date.
+
+Each Tier 2 entry tracks both:
+
+- days since last used
+- sessions since last used
+
+The lower multiplier wins.
+
+### Days Since Last Used
+
+| Days | Multiplier |
+|---|---:|
+| 0–1 | 1.0 |
+| 2–3 | 0.8 |
+| 4–5 | 0.5 |
+| 6–10 | 0.35 |
+| 11–15 | 0.2 |
+| 16–20 | 0.15 |
+| 21+ | 0.1 |
+
+### Sessions Since Last Used
+
+| Sessions | Multiplier |
+|---|---:|
+| 0–1 | 1.0 |
+| 2–3 | 0.8 |
+| 4–6 | 0.5 |
+| 7–10 | 0.35 |
+| 11–15 | 0.2 |
+| 16–25 | 0.15 |
+| 26+ | 0.1 |
+
+Composite weight:
+
+```txt
+IMP × freshness multiplier
 ```
-📁 Any-Workspace/
-├── bimri.md              ← Memory file (created and maintained by agent)
-├── bimri-backup.md       ← Rolling backup (created before each write)
-└── 📁 working/           ← Agent scratch space
-```
 
-## Freshness Lookup Table
+There is no floor rule.
 
-| Days Since Entry | Freshness Multiplier |
-|-----------------|---------------------|
-| 0–1             | 1.0                 |
-| 2–3             | 0.8                 |
-| 4–5             | 0.5                 |
-| 6–10            | 0.35                |
-| 11–15           | 0.2                 |
-| 16–20           | 0.15                |
-| 21+             | 0.1                 |
-
-**Floor rule:** Entries scored at importance 4 or 5 have a minimum composite weight of 4.0 regardless of age.
+If an important Tier 2 item becomes stale, it should be promoted into Tier 1, merged into Tier 3, or pruned from active memory.
 
 ## Maintenance
 
-**Every session:** Backup → write new entry → recalculate weights → prune below threshold → detect patterns → confirm write. Overhead: ~300–500 tokens.
+Every session:
 
-**Every 15th session:** Deep review of Core Intelligence accuracy, pattern merging, full weight recalibration, orphaned tag cleanup. Summary reported to user.
+```txt
+Backup → refresh weights → add useful memory delta if warranted → promote/compress → update patterns → prune → enforce budgets → update header → confirm counts
+```
 
-**Scheduled (optional):** Use `/schedule` in Cowork to automate weekly deep maintenance.
+Confirmation format:
 
-## Customisation
+```txt
+BIMRI updated: +X active, +Y core, +Z patterns, pruned N, Tier 2 now M entries, ~T tokens.
+```
 
-The numbers that control BIMRI's behavior all live in the global instructions file. You can adjust tier budgets, the total token target, and the maintenance cadence to suit your usage. The comments inside each bimri.md file are human-readable labels only — the agent follows the global instructions, not the file comments.
+Every 15th session, BIMRI performs stricter maintenance: merge redundant Tier 1 entries, merge duplicate Tier 3 patterns, prune Tier 2 aggressively, remove stale completed context, and compress wording.
 
-Keep in mind that total memory budget is a tradeoff. At 15,000 tokens you're using less than 10% of the 200k context window. Going beyond 30,000 starts to meaningfully reduce the agent's working capacity during sessions.
+## Design Principles
+
+### BIMRI is active memory, not a diary
+
+A session only gets written if remembering it will improve future work.
+
+### Tier 2 has no immortal entries
+
+If something matters permanently, it belongs in Tier 1. If something repeats, it belongs in Tier 3. If something is done, stale, low-weight, or historical, it leaves active BIMRI.
+
+### Pruned means removed
+
+BIMRI v3 does not merely flag stale entries. It removes them from active memory. The backup file is the rollback point.
+
+### Keep the filesystem clean
+
+BIMRI v3 works in any folder with any Cowork agent. It does not spawn protocol folders or scratch directories by default.
 
 ## Known Limitations
 
 These are real and worth understanding before you deploy.
 
-- **Agent compliance is probabilistic.** The protocol tells the agent what to do, but there's no enforcement layer guaranteeing it follows every step every session. The confirmation step ("BIMRI updated") exists so you can verify the write happened.
-- **Importance scoring varies between sessions.** Concrete examples in the protocol reduce this but don't eliminate it. Different model instances may score the same type of information slightly differently.
-- **Token counting is estimated.** The agent doesn't have a precise token counter. Budget thresholds are approximate. The scheduled maintenance pass helps catch drift.
-- **Pattern recognition can hallucinate.** The agent derives patterns from written summaries, not from the actual conversations. Ambiguous entry language could produce false patterns. Confidence scoring mitigates this but doesn't prevent it.
-- **No cross-folder intelligence.** Each workspace maintains independent memory. Knowledge doesn't transfer between folders without manual intervention.
+- **Agent compliance is probabilistic.** The protocol tells the agent what to do, but there is no enforcement layer guaranteeing it follows every step every session.
+- **Importance scoring still varies.** Concrete rules reduce variance, but different model instances may score the same memory candidate slightly differently.
+- **Token counting is estimated.** The agent does not have a precise token counter. Budget thresholds are approximate.
+- **Pattern recognition can hallucinate.** Patterns are derived from written memory, not from the full conversation history. Confidence scoring helps but does not eliminate this.
+- **No cross-folder intelligence.** Each workspace maintains independent memory unless you manually copy context between folders.
+
+## Migration from Earlier Versions
+
+Existing `bimri.md` files continue to work.
+
+For best results, ask Claude Cowork to perform a v3 migration pass in each workspace:
+
+```txt
+Migrate this BIMRI file to v3. Keep the three-tier structure. Convert useful session summaries into memory deltas, promote durable context into Tier 1, merge repeated observations into Tier 3, remove stale Tier 2 entries, update all weights using date + session freshness, and confirm counts.
+```
 
 ## Contributing
 
-This is an active experiment. If you deploy BIMRI and hit edge cases, unexpected behaviors, or have ideas for improving the architecture, open an issue. Specific feedback on scoring consistency, pattern detection accuracy, and token budget stability is especially valuable.
+This is an active experiment. If you deploy BIMRI and hit edge cases, unexpected behaviors, or have ideas for improving the architecture, open an issue.
+
+Specific feedback on pruning reliability, session-based decay, pattern compression, and token budget stability is especially valuable.
 
 ## License
 
@@ -102,6 +185,7 @@ MIT
 ## Author
 
 **Stu Jordan** — Agent Orchestrator
-- Community: [Evolution Unleashed](https://evolutionunleashed.com) (58,000+ members)
+
+- Community: [Evolution Unleashed](https://evolutionunleashed.com)
 - Patreon: [www.patreon.com/evolutionunleashedvip](https://www.patreon.com/evolutionunleashedvip)
 - Web: [evolutionunleashed.com](https://evolutionunleashed.com)
