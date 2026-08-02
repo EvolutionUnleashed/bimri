@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+
+# This repository's own local BIMRI runtime.
+.bimri/
+bimri.md
