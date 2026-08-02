@@ -1,6 +1,6 @@
-# Migrating Earlier BIMRI Versions to v5.0.1
+# Migrating Earlier BIMRI Versions to v5.0.2
 
-BIMRI v5.0.1 automatically migrates explicitly versioned v1-v3 tiered
+BIMRI v5.0.2 automatically migrates explicitly versioned v1-v3 tiered
 Markdown and the engine-based v4 format. This canonical repository publicly
 distributed the original v1 and streamlined v3 instructions; the parser also
 accepts a valid v2 header. Migration preserves old material before creating v5
@@ -227,35 +227,82 @@ backups, but they do not control v5 behavior. v5 maintenance is
 judgment-first, Tier 2 uses `tier2_max`, and archival requires an explicit
 accepted `close`.
 
-## v5.0 Maintenance Upgrade
+## v5 Maintenance Upgrades
 
-An existing v5.0 state upgrades automatically under the engine lock. Before
-changing state, the engine validates the complete v5.0 state and hot revision
-and preserves an exact content-addressed state backup under `.bimri/backups/`.
-It then changes the declared version to `5.0.1`.
+Existing v5.0 and v5.0.1 states upgrade automatically to v5.0.2 under the
+engine lock. Before changing state, the engine validates the complete source
+state and accepted head and preserves an exact content-addressed state backup
+under `.bimri/backups/`. Accepted historical revisions and existing governance
+records are never rewritten. Historical v5.0 and v5.0.1 resolutions retain
+their original effect semantics.
 
-If the complete active limit profile exactly matches the original v5.0
-defaults, the upgrade adopts the v5.0.1 defaults: 20 Tier 1 entries, 40 Tier 2
-entries, 12 Tier 3 entries, a 500-character new-entry text cap, and a
-49,152-byte hot view. If any limit was customized, the complete custom profile
-is retained. The engine does not infer which individual values the owner meant
-to customize.
+For v5.0, the capacity behavior introduced by v5.0.1 remains unchanged. If the
+complete active limit profile exactly matches the original v5.0 defaults, the
+upgrade adopts 20 Tier 1 entries, 40 Tier 2 entries, 12 Tier 3 entries, a
+500-character new-entry text cap, and a 49,152-byte hot view. If any v5.0 limit
+was customized, the complete custom profile is retained; the engine does not
+guess which individual values the owner meant to customize.
 
-When the active revision still contains the historical v5.0 header or fixed
-`12/20/8` comments, the engine preserves that revision byte-for-byte and makes
+For v5.0.1, the complete active limit profile is preserved exactly. The
+v5.0.2 upgrade changes the state version and generated-view metadata, not the
+owner's capacity choices.
+
+When the active revision still contains a historical v5.0 or v5.0.1 header or
+fixed cap comments, the engine preserves that revision byte-for-byte and makes
 a metadata-only next revision the active head. Entry lines are unchanged. If
 the normal descriptive comments would exceed a preserved custom byte cap, a
 shorter `state.json`-referenced form is used; normalization may not worsen any
 existing overflow. Interrupted retries reuse only byte-identical next-revision
 content, and conflicting revision bytes stop the upgrade.
 
-The upgrade receipt reports whether the defaults expanded, the old and active
-limit profiles, the state-backup path, and any metadata-only revision. A full
-semantic validation runs before `migrate` reports `Validation: PASSED`.
+The upgrade receipt names the source and target versions, reports whether the
+v5.0 defaults expanded or the existing limits were preserved, and records the
+old and active profiles, state-backup path, and any metadata-only revision. A
+full semantic validation runs before `migrate` reports `Validation: PASSED`.
 State/head/metadata preflight failures stop before upgrade authority changes.
-If a later workspace-wide check finds a malformed ancillary artifact, the
-command fails without claiming success and leaves the exact state backup plus
-the durable upgraded authority available for diagnosis.
+
+### Authority Damage Found During Upgrade
+
+Damage to a proposal, decision, conflict, or resolution does not authorize the
+engine to discard that record. When core state and the accepted head are valid,
+installation can complete the v5.0.2 engine and state/header upgrade while
+reporting `AUTHORITY RECOVERY NEEDED`. The install manifest records the
+recovery-required result. `start` remains available with a degraded brief, and
+`status` prints the full status but exits nonzero. Shared-memory commits remain
+paused until the authority graph validates.
+
+Recovery is explicit and owner-approved. First preserve the damaged record and
+put a validated blocker at its authority path:
+
+```text
+<verified-python> bimri-engine.py quarantine-authority \
+  --kind conflict --id C000003 --human-approved
+```
+
+The recovery copy is named by its SHA-256 hash and retains the exact original
+file bytes. For an unsafe symbolic-link authority path, BIMRI replaces the link
+without following it and preserves a canonical evidence record containing the
+exact target and target bytes; it does not touch the external target. Repair
+and review a separate copy. A deleted record can be quarantined only when a
+durable log, dependency, or conflict counter proves that exact ID existed;
+BIMRI records canonical absence evidence and refuses unreferenced IDs. Then
+stage restoration:
+
+```text
+<verified-python> bimri-engine.py restore-authority \
+  --kind conflict --id C000003 --from /path/to/repaired.json \
+  --human-approved
+```
+
+The engine validates the replacement's identity, structure, effects, and graph
+relationships in an isolated shadow before recording a content-addressed
+authorization receipt or replacing the blocker. It keeps the damaged recovery
+evidence. Missing or altered evidence makes `doctor` fail even when the
+canonical authority graph itself is healthy.
+Related proposal, decision, conflict, and resolution repairs may be restored
+one at a time. A partial restore remains blocked; only a complete, valid
+authority graph resumes shared-memory writes. Run `doctor` after the final
+restore and do not report the upgrade healthy until it passes.
 
 ## Idempotence and Bounded-Memory Repair
 
@@ -290,11 +337,11 @@ Have the installing agent run:
 The agent should confirm:
 
 - `doctor` reports `PASSED`, or only the documented inherited-overflow warning;
-- the version is `5.0.1` and the head is `V000000` or later;
+- the version is `5.0.2` and the head is `V000000` or later;
 - Tier 1, Tier 2, and Tier 3 counts are plausible;
 - expected legacy text appears in lowercase `bimri.md`;
 - the applicable migration record exists;
-- every preserved source and backup path named in that record exists; and
+- every preserved source and backup path named in that record exists;
 - recomputed source hashes match the hashes in the migration record; and
 - the printed receipt agrees with the migration record and validation result.
 
