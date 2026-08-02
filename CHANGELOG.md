@@ -3,6 +3,29 @@
 This file records the public BIMRI architecture history. Historical instruction
 files are preserved under [`legacy/`](legacy/) and are not current installers.
 
+## 5.0.2
+
+- Made human resolution explicit and provenance-preserving. A new resolution
+  requires `--human-approved`, which records an auditable human-approval
+  attestation without pretending to authenticate the caller. Choosing an agent
+  or external proposal may raise its trust to `confirmed`, while `source`
+  remains its immutable origin. Existing resolution history is not rewritten.
+- Added fail-closed recovery for damaged proposal, decision, conflict, and
+  resolution records. Degraded `start` and full `status` remain available;
+  `status` exits nonzero and shared-memory writes stay paused. Owner-approved
+  quarantine preserves exact damaged file bytes (or exact unsafe-link target
+  metadata) behind a validated blocker, and
+  staged restore validates replacements, retains the originals, and writes
+  content-addressed authorization receipts until the full graph is healthy.
+  Deleted records are recoverable through durably referenced absence evidence;
+  unreferenced IDs are refused, proposal IDs are never reused, and replacement
+  semantics are preflighted in an isolated authority-graph shadow.
+- Made direct hot-view recovery content-addressed and repeatable. Existing
+  v5.0.1 states upgrade their version and generated-view header automatically
+  without changing their limit profile or rewriting accepted revisions. An
+  unmapped Claude `hook-close` is now a successful no-op that cannot close a
+  different active run.
+
 ## 5.0.1
 
 - Expanded the generated hot view to 49,152 bytes, roughly 12,000 tokens for
