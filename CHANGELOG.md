@@ -3,6 +3,30 @@
 This file records the public BIMRI architecture history. Historical instruction
 files are preserved under [`legacy/`](legacy/) and are not current installers.
 
+## 5.0.1
+
+- Expanded the generated hot view to 49,152 bytes, roughly 12,000 tokens for
+  ordinary English, with 20 Tier 1, 40 Tier 2, and 12 Tier 3 entries. The
+  elastic curation target is approximately 3k/6k/3k tokens across the tiers;
+  the durable long tail remains in logs, revisions, decisions, resolutions,
+  archives, and backups. Stock v5.0 limit profiles expand automatically while
+  custom profiles remain unchanged. Historical v5.0 view labels are normalized
+  in a new immutable revision without rewriting their original revision or
+  worsening a preserved custom capacity.
+- Made v1-v4 conversion visible through an explicit installation receipt and
+  fail-closed handling for unclaimed legacy files beside structured state.
+  Inherited claims above 500 characters are preserved for later compression
+  when their complete serialized entries fit the 4,096-character safety
+  ceiling; new and edited claim text remains capped at 500 characters.
+- Replaced assumed `python3` invocations with verified absolute Python 3.8+
+  runtime bindings. Discovery rejects silent aliases, the installer validates
+  both its source and installed engine, and the rendered Claude hook snippet
+  pins that interpreter. The installing agent can merge and smoke-test the
+  snippet in machine-local Claude configuration without changing shared
+  settings. The installer writes host-only binding records at
+  `.bimri/runtime.local.json` and `.bimri/hooks.claude.local.json`; they are not
+  portable memory and must not be committed.
+
 ## 5.0.0
 
 - Made BIMRI a portable memory layer for Claude, Codex, and other local agents.

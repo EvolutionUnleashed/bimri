@@ -6,7 +6,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 bimri-engine.py hook-start"
+            "command": "__BIMRI_VERIFIED_PYTHON__",
+            "args": [
+              "${CLAUDE_PROJECT_DIR}/bimri-engine.py",
+              "hook-start"
+            ],
+            "timeout": 15
           }
         ]
       }
@@ -17,7 +22,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 bimri-engine.py hook-close"
+            "command": "__BIMRI_VERIFIED_PYTHON__",
+            "args": [
+              "${CLAUDE_PROJECT_DIR}/bimri-engine.py",
+              "hook-close"
+            ],
+            "timeout": 15
           }
         ]
       }

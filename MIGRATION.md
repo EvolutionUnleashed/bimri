@@ -1,21 +1,22 @@
-# Migrating BIMRI v1-v4 to v5
+# Migrating Earlier BIMRI Versions to v5.0.1
 
-BIMRI v5 directly migrates explicitly versioned v1-v3 tiered Markdown and the
-engine-based v4 format. This canonical repository publicly distributed the
-original v1 and streamlined v3 instructions; the parser also accepts a valid
-v2 header. Migration preserves old material before creating v5 state and stops
-when it cannot identify or interpret that material safely.
+BIMRI v5.0.1 automatically migrates explicitly versioned v1-v3 tiered
+Markdown and the engine-based v4 format. This canonical repository publicly
+distributed the original v1 and streamlined v3 instructions; the parser also
+accepts a valid v2 header. Migration preserves old material before creating v5
+state and stops when it cannot identify or interpret that material safely.
 
 Ask an agent to install v5 according to [`INSTALL.md`](INSTALL.md). After the
 v5 files are present, the same migration can be requested explicitly:
 
 ```text
-python3 bimri-engine.py migrate
+<verified-python> bimri-engine.py migrate
 ```
 
-Commands in this document use `python3`. The agent must use whichever local
-executable provides Python 3.8 or newer. That is commonly `python3` outside
-Windows and `python` on a standard Windows installation.
+`<verified-python>` means the exact absolute Python executable established by
+the execution-and-sentinel procedure in [`INSTALL.md`](INSTALL.md). It is a
+placeholder, not a literal command. A PATH name and a zero-output probe are not
+evidence that Python ran.
 
 ## Required Before Every Upgrade
 
@@ -56,6 +57,7 @@ when any of these conditions applies:
 - a source or rolling backup is unreadable, malformed, or does not contain the
   expected explicitly versioned tiered structure;
 - a claimed v4 state cannot be parsed or reconciled with its memory and logs;
+- structured v5 state coexists with an unclaimed legacy hot-memory candidate;
 - an existing migration record or `V000000` disagrees with the deterministic
   conversion; or
 - a path or symbolic link would redirect a migration write outside the project.
@@ -101,9 +103,15 @@ trust: working
 ```
 
 Old importance, tags, and text are retained in the converted claim when valid
-and representable. The old header session count seeds the v5 run count. Dates,
-weights, observation counts, confidence, and other legacy-only metadata remain
-recoverable in the exact source backup. Generated keys and IDs are
+and representable. New and edited v5 claim text is capped at 500 characters.
+Migration may preserve longer inherited text without truncation when the
+complete serialized v5 entry, including metadata, is at most 4,096 characters.
+It marks text above 500 characters as inherited overflow and reports it for
+later human-guided compression. If a claim cannot fit losslessly within the
+serialized-entry ceiling, migration stops before mutation and its exact source
+bytes remain untouched. The old header session count seeds the v5 run count.
+Dates, weights, observation counts, confidence, and other legacy-only metadata
+remain recoverable in the exact source backup. Generated keys and IDs are
 deterministic, so an interrupted migration can repeat without duplicating
 claims.
 
@@ -130,11 +138,15 @@ Under the v5 engine lock, the reference engine:
    paths, mappings, and conversion result;
 8. writes v5 state with the revision hash;
 9. generates lowercase `bimri.md` and retires the old root-level legacy names;
-   and
-10. rebuilds the derived retrieval index.
+10. rebuilds the derived retrieval index; and
+11. prints a migration receipt naming the detected source version and file,
+    imported Tier 1 and Tier 2 counts, converted-pattern count, byte-exact
+    backup location, migration-record path, and validation result.
 
 If any required step fails, installation restores its transaction backup and
 reports the failure. The selected legacy files remain available byte-for-byte.
+Missing receipt fields or zero output is an installation failure, never an
+implicit success.
 
 ## v4 Migration
 
@@ -168,6 +180,12 @@ is mapped conservatively:
 Other valid kinds, importance, active/watch/closed status, first and last run,
 tags, text, evidence, falsifier, and pointers remain intact.
 
+As with v1-v3, inherited v4 claim text above 500 characters is preserved
+without truncation and reported for later compression when the complete
+converted entry fits the 4,096-character serialized-entry ceiling. Conversion
+stops before mutation if the entry cannot fit losslessly. The 500-character
+text limit continues to apply to every new or edited v5 claim.
+
 The converted memory becomes immutable revision `V000000`. `bimri.md` becomes
 the generated view of that revision. The runtime adds:
 
@@ -196,8 +214,9 @@ engine performs these steps under the local engine lock:
 5. creates immutable revision `V000000`;
 6. writes resumable `.bimri/migrations/v4-to-v5.json` state;
 7. writes v5 state with the revision hash;
-8. regenerates `bimri.md`; and
-9. rebuilds the retrieval index.
+8. regenerates `bimri.md`;
+9. rebuilds the retrieval index; and
+10. prints the same explicit migration receipt used for v1-v3 conversion.
 
 The migration record includes the completion time, exact source-memory hash,
 and relative paths to the state and memory backups.
@@ -207,6 +226,36 @@ The v4 fields `maintenance_mode`, `tier2_hard`, and
 backups, but they do not control v5 behavior. v5 maintenance is
 judgment-first, Tier 2 uses `tier2_max`, and archival requires an explicit
 accepted `close`.
+
+## v5.0 Maintenance Upgrade
+
+An existing v5.0 state upgrades automatically under the engine lock. Before
+changing state, the engine validates the complete v5.0 state and hot revision
+and preserves an exact content-addressed state backup under `.bimri/backups/`.
+It then changes the declared version to `5.0.1`.
+
+If the complete active limit profile exactly matches the original v5.0
+defaults, the upgrade adopts the v5.0.1 defaults: 20 Tier 1 entries, 40 Tier 2
+entries, 12 Tier 3 entries, a 500-character new-entry text cap, and a
+49,152-byte hot view. If any limit was customized, the complete custom profile
+is retained. The engine does not infer which individual values the owner meant
+to customize.
+
+When the active revision still contains the historical v5.0 header or fixed
+`12/20/8` comments, the engine preserves that revision byte-for-byte and makes
+a metadata-only next revision the active head. Entry lines are unchanged. If
+the normal descriptive comments would exceed a preserved custom byte cap, a
+shorter `state.json`-referenced form is used; normalization may not worsen any
+existing overflow. Interrupted retries reuse only byte-identical next-revision
+content, and conflicting revision bytes stop the upgrade.
+
+The upgrade receipt reports whether the defaults expanded, the old and active
+limit profiles, the state-backup path, and any metadata-only revision. A full
+semantic validation runs before `migrate` reports `Validation: PASSED`.
+State/head/metadata preflight failures stop before upgrade authority changes.
+If a later workspace-wide check finds a malformed ancillary artifact, the
+command fails without claiming success and leaves the exact state backup plus
+the durable upgraded authority available for diagnosis.
 
 ## Idempotence and Bounded-Memory Repair
 
@@ -219,12 +268,13 @@ appears legacy, the engine recomputes the deterministic conversion. It resumes
 only when the existing artifacts are byte-identical to that conversion. Any
 mismatch stops without overwriting either version.
 
-If valid legacy memory already exceeds a v5 tier or byte cap, migration
+If valid legacy memory already exceeds a v5 tier, byte, or new-entry text cap,
+migration
 preserves it and `doctor` reports a bounded-memory repair warning. Subsequent
 changes may only reduce inherited overflow without worsening another limit
 until all caps are satisfied.
 
-The 16,384-byte generated-view cap is independent of the tier line caps and may
+The 49,152-byte generated-view cap is independent of the tier line caps and may
 bind first. Tier counts alone do not prove that converted memory is within the
 complete rendered-view bound.
 
@@ -233,19 +283,20 @@ complete rendered-view bound.
 Have the installing agent run:
 
 ```text
-python3 bimri-engine.py doctor
-python3 bimri-engine.py status
+<verified-python> bimri-engine.py doctor
+<verified-python> bimri-engine.py status
 ```
 
 The agent should confirm:
 
 - `doctor` reports `PASSED`, or only the documented inherited-overflow warning;
-- the version is `5.0` and the head is `V000000` or later;
+- the version is `5.0.1` and the head is `V000000` or later;
 - Tier 1, Tier 2, and Tier 3 counts are plausible;
 - expected legacy text appears in lowercase `bimri.md`;
 - the applicable migration record exists;
 - every preserved source and backup path named in that record exists; and
-- recomputed source hashes match the hashes in the migration record.
+- recomputed source hashes match the hashes in the migration record; and
+- the printed receipt agrees with the migration record and validation result.
 
 Legacy entries intentionally remain `working` until the owner confirms them.
 No bulk confirmation is required. Review important claims conversationally as

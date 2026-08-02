@@ -1,11 +1,20 @@
-## BIMRI Memory Protocol v5
+## BIMRI Memory Protocol v5.0.1
 
 This project uses BIMRI portable memory. `bimri.md` is the small, readable
 current state. Full evidence and history live under `.bimri/`.
 
-Use the local Python 3.8+ executable for every command. Examples show `python3`;
-standard Windows installations commonly use `python`. Run multiline examples
-on one line or adapt the continuation syntax to the active shell.
+<!-- BIMRI:RUNTIME-BINDING:START -->
+Use the verified, absolute Python 3.8+ executable recorded for this machine in
+`.bimri/runtime.local.json`. `<verified-python>` means that exact executable;
+it is a placeholder, never a literal command. Do not substitute `python3`, `python`, or
+`py` without executing the discovery check in `INSTALL.md`. Zero output is a
+failed check. After moving this folder to another machine, rerun installation
+to verify and rebind the executable before running BIMRI.
+<!-- BIMRI:RUNTIME-BINDING:END -->
+
+The installer writes `.bimri/runtime.local.json` and
+`.bimri/hooks.claude.local.json` as host-only binding records. Do not commit
+them or copy their absolute paths into shared instructions.
 
 Concurrent use is safe only when every agent shares the same operating-system
 lock domain for this folder. Unless lock and atomic-rename behavior has been
@@ -14,11 +23,12 @@ runtime boundary active and hand off while BIMRI is quiescent.
 
 ### Start
 
-If a `=== BIMRI BRIEF ===` is already in context, use its run handle.
+If an `=== BIMRI BRIEF <run-id> | ... ===` header is already in context, use
+its run handle.
 Otherwise run:
 
 ```text
-python3 bimri-engine.py start --actor <your-agent-name>
+<verified-python> bimri-engine.py start --actor <your-agent-name>
 ```
 
 Read `bimri.md`. If the brief reports `HUMAN DECISION NEEDED`, ask the owner
@@ -31,7 +41,7 @@ command.
 Journal durable decisions, milestones and risks as they happen:
 
 ```text
-python3 bimri-engine.py journal --run <run> --importance 3 --text "full detail"
+<verified-python> bimri-engine.py journal --run <run> --importance 3 --text "full detail"
 ```
 
 Shared memory is engine-managed. Never edit `bimri.md`, `.bimri/state.json`,
@@ -40,7 +50,7 @@ revisions, proposals, conflicts or the index directly.
 Submit a stable-key proposal for anything that should affect a future run:
 
 ```text
-python3 bimri-engine.py propose --run <run> --tier 2 \
+<verified-python> bimri-engine.py propose --run <run> --tier 2 \
   --key launch.next-step --text "Verify the checkout flow."
 ```
 
@@ -61,7 +71,7 @@ deterministically; agents flag meaning-level uncertainty.
 Close only your own explicit run:
 
 ```text
-python3 bimri-engine.py close --run <run> \
+<verified-python> bimri-engine.py close --run <run> \
   --outcome success --summary "one-line result"
 ```
 
@@ -71,7 +81,7 @@ it normally; any other recovery requires the owner's explicit authorization.
 After the owner explicitly authorizes recovery, close an orphan with:
 
 ```text
-python3 bimri-engine.py recover-run --run <run> \
+<verified-python> bimri-engine.py recover-run --run <run> \
   --summary "Owner confirmed this orphaned run should close."
 ```
 

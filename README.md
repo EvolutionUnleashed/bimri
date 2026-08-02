@@ -1,6 +1,6 @@
 # BIMRI: Portable Memory for Local Agents
 
-**Brief Interaction Memory and Retrieval Intelligence, v5**
+**Brief Interaction Memory and Retrieval Intelligence, v5.0.1**
 
 BIMRI gives a project one durable memory that Claude, Codex, and other local
 agents can share without a server, database, account, or model-specific
@@ -15,11 +15,19 @@ to install BIMRI.
 The agent follows [`INSTALL.md`](INSTALL.md), merges BIMRI into the project's
 existing instructions, preserves existing BIMRI memory, and runs a self-check.
 The runtime is one Python 3.8+ standard-library script plus ordinary local
-files. There are no packages to install. Commands below use `python3`; use
-whichever executable provides Python 3.8 or newer (`python` on a standard
-Windows installation, and commonly `python3` elsewhere). Multiline examples
-use POSIX continuation syntax; on Windows, run them on one line or adapt them
-to the active shell and path format.
+files. There are no packages to install. Commands below use
+`<verified-python>` as a placeholder for the absolute Python 3.8+ executable
+that the installer has executed and verified on the current machine. A name
+such as `python3` is never assumed to work. Multiline examples use POSIX
+continuation syntax; on Windows, run them on one line or adapt them to the
+active shell and path format.
+
+Machine bindings are not portable memory. The installer writes
+`.bimri/runtime.local.json` with the verified runtime argv prefix and
+`.bimri/hooks.claude.local.json` with the rendered Claude hook source. Do not
+commit either file or copy its absolute paths into shared instructions. After
+moving the project or replacing Python, rerun installation to regenerate both
+files before an agent uses BIMRI.
 
 ## What v5 Is
 
@@ -59,8 +67,10 @@ actions. Tier 3 holds patterns only when evidence and a falsifier exist. Full
 detail belongs in run logs, revisions, decisions, and archives, where an agent
 can retrieve it when needed without forcing it into every future context.
 
-The result is active memory: the smallest current state that should change the
-next useful action, backed by durable evidence and history.
+The result is active memory: the current state most likely to change the next
+useful action, backed by a durable long tail. Run logs, immutable revisions,
+decisions, resolutions, archives, and migration backups remain available even
+when they are outside the generated hot view.
 
 ## Install
 
@@ -75,11 +85,17 @@ self-check.
 The installer command the agent runs is:
 
 ```text
-python3 bimri-engine.py install --target /absolute/path/to/the/project
+<verified-python> bimri-engine.py install --target /absolute/path/to/the/project
 ```
 
-Existing BIMRI v1-v4 memory migrates automatically. See
+Existing BIMRI v1-v4 memory migrates automatically during installation. The
+installer prints a migration receipt with the detected source version and
+file, imported counts, converted patterns, backup location, and validation
+result. See
 [`MIGRATION.md`](MIGRATION.md) for preservation and rollback details.
+An existing v5.0 state also upgrades automatically. If its complete limit
+profile still matches the original v5.0 defaults, v5.0.1 expands it to the new
+defaults. Any customized limit profile is preserved rather than guessed over.
 The v5 installer serializes with other v5 engine commands in the same lock
 domain. Before upgrading any earlier version, disable the old Claude Cowork
 Global Instructions and stop every agent using that memory. Earlier versions
@@ -100,14 +116,14 @@ Global Instructions while v5 is active.
 An agent starts by requesting its own run handle:
 
 ```text
-python3 bimri-engine.py start --actor codex
+<verified-python> bimri-engine.py start --actor codex
 ```
 
 The engine prints a brief and a handle such as `R000042`. The agent reads
 `bimri.md`, then journals durable detail as work happens:
 
 ```text
-python3 bimri-engine.py journal --run R000042 --importance 3 \
+<verified-python> bimri-engine.py journal --run R000042 --importance 3 \
   --text "Checkout retries must use the existing idempotency key."
 ```
 
@@ -115,7 +131,7 @@ Anything that should affect future runs is proposed under a stable,
 lowercase key:
 
 ```text
-python3 bimri-engine.py propose --run R000042 --tier 2 \
+<verified-python> bimri-engine.py propose --run R000042 --tier 2 \
   --key checkout.next-step \
   --text "Verify retry behavior under concurrent requests."
 ```
@@ -123,8 +139,8 @@ python3 bimri-engine.py propose --run R000042 --tier 2 \
 Proposals are applied by `sync` or `close`:
 
 ```text
-python3 bimri-engine.py sync --run R000042
-python3 bimri-engine.py close --run R000042 --outcome success \
+<verified-python> bimri-engine.py sync --run R000042
+<verified-python> bimri-engine.py close --run R000042 --outcome success \
   --summary "Retry behavior verified."
 ```
 
@@ -135,7 +151,7 @@ An orphaned run is never reaped automatically. After the owner explicitly
 confirms that it should close, an agent can recover it with:
 
 ```text
-python3 bimri-engine.py recover-run --run R000042 \
+<verified-python> bimri-engine.py recover-run --run R000042 \
   --summary "Owner confirmed this orphaned run should close."
 ```
 
@@ -146,15 +162,21 @@ outcomes.
 
 Hot memory has three bounded tiers:
 
-| Tier | Contents | Default cap |
-| --- | --- | ---: |
-| 1 | Durable facts, decisions, preferences, and operating rules | 12 |
-| 2 | Active work, risks, and next actions | 20 |
-| 3 | Evidence-backed patterns with a falsifier | 8 |
+| Tier | Contents | Default cap | Curation target |
+| --- | --- | ---: | ---: |
+| 1 | Durable facts, decisions, preferences, and operating rules | 20 | ~3,000 tokens |
+| 2 | Active work, risks, and next actions | 40 | ~6,000 tokens |
+| 3 | Evidence-backed patterns with a falsifier | 12 | ~3,000 tokens |
 
-The generated view also has an independent 16,384-byte cap. It is the primary
-size bound and may be reached before any tier reaches its line cap, because
-entry metadata, tags, pointers, and text all consume bytes.
+The generated view has an independent 49,152-byte cap, roughly 12,000 tokens
+for ordinary English text. Tokenization and UTF-8 width vary, so bytes are the
+enforced limit. The 3k/6k/3k tier split is an elastic curation target, not three
+hard partitions: spare capacity can serve another tier while the total byte
+cap and line caps still hold. Entry metadata, tags, pointers, and text all
+consume the same budget.
+
+These bounds govern only the generated hot view. The durable long tail is not
+subject to a 12,000-token total-memory ceiling.
 
 Tier 1 and Tier 2 entries carry a stable key, trust, and source:
 
@@ -189,7 +211,7 @@ agent explains the alternatives and asks the owner. It then records the
 owner's choice:
 
 ```text
-python3 bimri-engine.py resolve C000003 --choose R000042-Q001
+<verified-python> bimri-engine.py resolve C000003 --choose R000042-Q001
 ```
 
 The valid choice is a listed proposal ID, `current`, or `dismiss`. A chosen
@@ -210,8 +232,8 @@ Repository files:
 | `bimri-engine.py` | Dependency-free engine for locking, validation, and commits. |
 | `BIMRI-MEMORY.template.md` | Initial generated memory view. |
 | `BIMRI-STATE.template.json` | Initial engine-state shape. |
-| `hooks-example.json` | Optional Claude Code start and close hooks. |
-| `MIGRATION.md` | v1-v4 migration, verification, and rollback. |
+| `hooks-example.json` | Portable Claude hook template; installation renders a local copy. |
+| `MIGRATION.md` | Earlier-version migration, verification, and rollback. |
 | `CHANGELOG.md` | Architecture and release history. |
 | `legacy/` | Preserved, non-executable v1 and v3 instructions. |
 | `tests/` | Black-box concurrency, recovery, migration, and safety suite. |
@@ -237,6 +259,8 @@ Runtime files:
 | `.bimri/backups/` | Migration and pre-change safety copies. |
 | `.bimri/recovery/` | Preserved direct edits or recoverable material. |
 | `.bimri/migrations/` | Completed migration records. |
+| `.bimri/runtime.local.json` | Installer-written host-only runtime binding record; never commit. |
+| `.bimri/hooks.claude.local.json` | Installer-written host-only rendered Claude hook source; never commit. |
 
 Markdown carries the human-readable memory and evidence. Small JSON and TSV
 files carry transparent bookkeeping. All of it stays in the project folder.
@@ -244,11 +268,11 @@ files carry transparent bookkeeping. All of it stays in the project folder.
 ## Operational Commands
 
 ```text
-python3 bimri-engine.py status
-python3 bimri-engine.py doctor
-python3 bimri-engine.py maintain
-python3 bimri-engine.py index
-python3 bimri-engine.py migrate
+<verified-python> bimri-engine.py status
+<verified-python> bimri-engine.py doctor
+<verified-python> bimri-engine.py maintain
+<verified-python> bimri-engine.py index
+<verified-python> bimri-engine.py migrate
 ```
 
 `doctor` validates state, revisions, memory grammar, caps, proposals,
@@ -298,6 +322,14 @@ belongs in version control. For local-only memory:
 ```gitignore
 bimri.md
 .bimri/
+```
+
+If the project deliberately versions other `.bimri/` content, ignore the two
+host-bound adapter records explicitly:
+
+```gitignore
+.bimri/runtime.local.json
+.bimri/hooks.claude.local.json
 ```
 
 ## Author

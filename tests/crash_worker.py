@@ -7,6 +7,7 @@ use os._exit so neither BIMRI nor Python gets a chance to unwind or flush state.
 
 import importlib.util
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -102,6 +103,30 @@ def main():
             os._exit(94)
 
         engine._retire_legacy_sources = crash_before_legacy_retire
+    elif mode == "v4_crash_before_state":
+        original = engine.save_state
+
+        def crash_before_v4_state(paths, state):
+            if (
+                state.get("bimri_version") == engine.VERSION
+                and (paths.migrations / "v4-to-v5.json").exists()
+            ):
+                os._exit(95)
+            return original(paths, state)
+
+        engine.save_state = crash_before_v4_state
+    elif mode in {"v4_hot_change_after_backup", "v4_state_change_after_backup"}:
+        original = engine.backup_file
+
+        def change_v4_source_after_backup(paths, path, label):
+            result = original(paths, path, label)
+            if mode == "v4_hot_change_after_backup" and label == "bimri-v4.md":
+                paths.hot.write_bytes(paths.hot.read_bytes() + b"\nlate v4 hot writer\n")
+            if mode == "v4_state_change_after_backup" and label == "state-v4.json":
+                paths.state.write_bytes(paths.state.read_bytes() + b" \n")
+            return result
+
+        engine.backup_file = change_v4_source_after_backup
     elif mode == "legacy_source_change_before_retire":
         original = engine._retire_legacy_sources
 
@@ -114,6 +139,38 @@ def main():
             return original(paths, marker, revision_bytes)
 
         engine._retire_legacy_sources = change_source_before_retire
+    elif mode.startswith("python_verify_"):
+        completed_process = subprocess.CompletedProcess
+        timeout_expired = subprocess.TimeoutExpired
+
+        def fake_python_check(arguments, **_kwargs):
+            if mode == "python_verify_silent":
+                return completed_process(arguments, 0, "", "")
+            if mode == "python_verify_wrong":
+                return completed_process(
+                    arguments,
+                    0,
+                    '{"executable":"/wrong","sentinel":"wrong",'
+                    '"version":[3,8]}\n',
+                    "",
+                )
+            if mode == "python_verify_old":
+                token = arguments[-1]
+                return completed_process(
+                    arguments,
+                    0,
+                    engine.json.dumps({
+                        "executable": str(Path(sys.executable).resolve()),
+                        "sentinel": token,
+                        "version": [3, 7],
+                    }) + "\n",
+                    "",
+                )
+            if mode == "python_verify_timeout":
+                raise timeout_expired(arguments, 5)
+            raise RuntimeError("unknown Python verification fault")
+
+        engine.subprocess.run = fake_python_check
     else:
         raise SystemExit("unknown fault mode: " + mode)
 
