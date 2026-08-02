@@ -3841,8 +3841,8 @@ class BimriCliTest(unittest.TestCase):
             "<!-- BIMRI v5.0.2 | Generated view. Do not edit directly. -->",
             "<!-- BIMRI v5.0.1 | Generated view. Do not edit directly. -->",
         )
-        revision_path.write_text(historical, "utf-8")
-        (target / "bimri.md").write_text(historical, "utf-8")
+        revision_path.write_bytes(historical.encode("utf-8"))
+        (target / "bimri.md").write_bytes(historical.encode("utf-8"))
         state["bimri_version"] = "5.0.1"
         state["head_hash"] = hashlib.sha256(
             historical.encode("utf-8")
@@ -5671,8 +5671,8 @@ class BimriCliTest(unittest.TestCase):
             "<!-- BIMRI v5.0.2 | Generated view. Do not edit directly. -->",
             "<!-- BIMRI v5.0.1 | Generated view. Do not edit directly. -->",
         )
-        revision_path.write_text(historical, "utf-8")
-        (self.root / "bimri.md").write_text(historical, "utf-8")
+        revision_path.write_bytes(historical.encode("utf-8"))
+        (self.root / "bimri.md").write_bytes(historical.encode("utf-8"))
         state = self.state()
         limits_before = tuple(
             state[field]
