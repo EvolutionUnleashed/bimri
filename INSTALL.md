@@ -87,6 +87,10 @@ two paths to its ignore rules explicitly.
    v5 metadata, fits the 4,096-character safety ceiling. Conversion fails
    closed rather than truncating anything that cannot fit losslessly. New and
    edited claims retain the 500-character text limit.
+   Existing v5.0 and v5.0.1 state also upgrades automatically to v5.0.2 with
+   a byte-preserving backup. A v5.0 upgrade adopts the 12,000-token capacity
+   profile when its limits are still stock; a v5.0.1 upgrade preserves its
+   configured limits.
 7. Run `<verified-python> bimri-engine.py doctor` from the target project if
    you need to repeat the self-check.
 8. Confirm the installer wrote both local binding records above; never commit
@@ -98,7 +102,8 @@ two paths to its ignore rules explicitly.
    - for migration, the detected version and source file, imported counts,
      converted-pattern count, backup location, and validation result;
    - adapters enabled and whether Claude hooks were rebound;
-   - whether the hook smoke test and `doctor` passed; and
+   - whether the hook smoke test and `doctor` passed, or whether installation
+     completed in authority-recovery mode; and
    - any inherited-limit repair warning printed by the installer.
 
 For an existing v5 target, install uses the target's engine lock from before
@@ -114,6 +119,14 @@ Before changing target files, install writes rollback copies to
 `.bimri/install-backups/<timestamp>/`. If the self-check fails, it restores the
 touched paths and reports that exact backup directory. Do not discard the
 reported backup until the owner confirms the installation is healthy.
+
+Malformed canonical authority records do not force the installer to roll back
+the v5.0.2 recovery tools. When the core memory and state are sound, install
+finishes in `installed-recovery-required` mode, lists every blocker, and keeps
+shared-memory writes paused. `start` remains available with a loud recovery
+brief, while `status` and `doctor` remain nonzero for automation. After the
+owner reviews the evidence, use the human-attested `quarantine-authority` and
+`restore-authority` workflow in `BIMRI-PROTOCOL.md`; never hand-edit `.bimri/`.
 
 ## Claude Code Hooks
 
@@ -133,6 +146,10 @@ and `=== BIMRI BRIEF`; invoke `hook-close` with the same ID and require a normal
 close; then run `doctor`. A zero-output hook is a failed hook even if its
 process reports success. Confirm that the synthetic run is closed before
 reporting the installation complete.
+
+An automatic `hook-close` for an unknown or already-unmapped session is a
+successful no-op. The explicit `close` command remains strict so operator
+mistakes are still visible.
 
 The root `hooks-example.json` remains a portable placeholder template. Never
 paste its unresolved placeholder into Claude settings; use only the local

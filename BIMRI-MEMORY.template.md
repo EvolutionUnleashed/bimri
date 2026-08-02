@@ -1,6 +1,6 @@
 # BIMRI Memory
 
-<!-- BIMRI v5.0.1 | Generated view. Do not edit directly. -->
+<!-- BIMRI v5.0.2 | Generated view. Do not edit directly. -->
 <!-- Full history: .bimri/log/ | Revisions: .bimri/revisions/ -->
 
 ## Tier 1: Core Intelligence

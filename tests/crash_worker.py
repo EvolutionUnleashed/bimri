@@ -84,7 +84,7 @@ def main():
         engine.build_index = fail_index
     elif mode == "install_selfcheck":
 
-        def fail_selfcheck(_paths, _state):
+        def fail_selfcheck(_paths, _state, governance_issues=None):
             return ["forced post-migration self-check failure"], []
 
         engine.doctor_errors = fail_selfcheck
