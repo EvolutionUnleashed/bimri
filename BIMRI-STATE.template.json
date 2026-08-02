@@ -1,0 +1,22 @@
+{
+  "bimri_version": "5.0",
+  "project_id": "unset",
+  "cadence_class": "interactive",
+  "run_count": 0,
+  "conflict_count": 0,
+  "pattern_count": 0,
+  "head_revision": 0,
+  "head_hash": null,
+  "active_runs": {},
+  "session_runs": {},
+  "run_dates": {},
+  "last_started_at": null,
+  "last_closed_at": null,
+  "prune_policy": "archive_only",
+  "tier1_max": 12,
+  "tier2_max": 20,
+  "tier3_max": 8,
+  "entry_max_chars": 500,
+  "hot_max_bytes": 16384,
+  "flag_threshold": 0.5
+}
