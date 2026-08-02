@@ -1,6 +1,6 @@
 # BIMRI: Portable Memory for Local Agents
 
-**Brief Interaction Memory and Retrieval Intelligence, v5.0.1**
+**Brief Interaction Memory and Retrieval Intelligence, v5.0.2**
 
 BIMRI gives a project one durable memory that Claude, Codex, and other local
 agents can share without a server, database, account, or model-specific
@@ -39,10 +39,11 @@ hash, and either creates a new immutable revision or raises a conflict.
 
 The human remains the authority. BIMRI puts unresolved questions into the next
 agent brief. The agent asks the owner in normal conversation and records the
-answer with `resolve`; the owner never has to edit a memory file or run a
-command. Direct human statements can enter memory as confirmed. Agent
-inferences and external material remain working claims until the human confirms
-them.
+answer with `resolve --human-approved`; the owner never has to edit a memory
+file or run a command. The flag records the agent's assertion that the owner
+approved that exact choice. It is an auditable attestation, not authentication.
+Direct human statements can enter memory as confirmed. Agent inferences and
+external material remain working claims until the human confirms them.
 
 This design gives BIMRI four useful properties:
 
@@ -93,9 +94,11 @@ installer prints a migration receipt with the detected source version and
 file, imported counts, converted patterns, backup location, and validation
 result. See
 [`MIGRATION.md`](MIGRATION.md) for preservation and rollback details.
-An existing v5.0 state also upgrades automatically. If its complete limit
-profile still matches the original v5.0 defaults, v5.0.1 expands it to the new
-defaults. Any customized limit profile is preserved rather than guessed over.
+Existing v5.0 and v5.0.1 states also upgrade automatically. A stock v5.0 limit
+profile expands to the v5.0.1 capacity; custom v5.0 profiles remain custom.
+Every v5.0.1 limit remains unchanged during the v5.0.2 state and generated-view
+header upgrade. Earlier state bytes are backed up, and accepted revisions are
+preserved rather than rewritten.
 The v5 installer serializes with other v5 engine commands in the same lock
 domain. Before upgrading any earlier version, disable the old Claude Cowork
 Global Instructions and stop every agent using that memory. Earlier versions
@@ -147,6 +150,10 @@ Proposals are applied by `sync` or `close`:
 Every agent closes only its own explicit handle. When several runs are active,
 a handle-free close is refused.
 
+The optional Claude `hook-close` adapter also closes only its mapped session.
+If Claude sends `SessionEnd` without a corresponding active mapping, the hook
+returns a successful no-op and never guesses another run to close.
+
 An orphaned run is never reaped automatically. After the owner explicitly
 confirms that it should close, an agent can recover it with:
 
@@ -185,12 +192,13 @@ Tier 1 and Tier 2 entries carry a stable key, trust, and source:
 - `working` means useful but still provisional.
 - `contested` means a conflict is awaiting resolution.
 - `user`, `agent`, `external`, `system`, and `legacy` record where the claim
-  came from.
+  came from. Human approval may raise trust to `confirmed`; it does not rewrite
+  this immutable origin.
 
-Use `--source user --trust confirmed` only when the human directly supplied or
-approved the claim. Agent inference uses `--source agent --trust working`.
-Material read from outside the project uses
-`--source external --trust working`.
+Use `--source user --trust confirmed` only when the human directly supplied the
+claim. Agent inference uses `--source agent --trust working`, including before
+the owner later confirms it through resolution. Material read from outside the
+project uses `--source external --trust working`.
 
 Trust and source are transparent provenance labels, not an authentication
 boundary. Any local process that can rewrite the project can also rewrite its
@@ -211,12 +219,16 @@ agent explains the alternatives and asks the owner. It then records the
 owner's choice:
 
 ```text
-<verified-python> bimri-engine.py resolve C000003 --choose R000042-Q001
+<verified-python> bimri-engine.py resolve C000003 \
+  --choose R000042-Q001 --human-approved
 ```
 
 The valid choice is a listed proposal ID, `current`, or `dismiss`. A chosen
-proposal is recorded as human-confirmed where the tier supports trust. Both the
-question and the resolution remain in `.bimri/`.
+proposal that sets a Tier 1 or Tier 2 claim is recorded as human-confirmed,
+while its `source` continues to record its original provenance. Both the
+question and the resolution remain in `.bimri/`. `--human-approved` means the
+agent asserts that the owner explicitly chose that option; it cannot prove who
+ran the command.
 
 ## File Map
 
@@ -257,7 +269,7 @@ Runtime files:
 | `.bimri/index.tsv` | Rebuildable, non-authoritative retrieval index. |
 | `.bimri/archive/` | Closed memory with provenance. |
 | `.bimri/backups/` | Migration and pre-change safety copies. |
-| `.bimri/recovery/` | Preserved direct edits or recoverable material. |
+| `.bimri/recovery/` | Direct edits, damaged authority evidence, and restore receipts. |
 | `.bimri/migrations/` | Completed migration records. |
 | `.bimri/runtime.local.json` | Installer-written host-only runtime binding record; never commit. |
 | `.bimri/hooks.claude.local.json` | Installer-written host-only rendered Claude hook source; never commit. |
@@ -290,10 +302,60 @@ index failure cannot change a memory decision and can be repaired with
 `index`.
 
 If any process edits `bimri.md` directly, including CRLF-only changes, invalid
-UTF-8, or replacing it with an empty file, the next engine command preserves
-the edited bytes in `.bimri/recovery/`, immediately reports the event, and
-restores the accepted generated view. An exact byte copy of a referenced
+UTF-8, or replacing it with an empty file, the next synchronizing command
+preserves the edited bytes under a content-addressed
+`manual-hot-<sha256>.md` or `.bin` path in `.bimri/recovery/`, immediately
+reports the event, and restores the accepted generated view. Repeating the same
+edit reuses the same exact recovery bytes. An exact byte copy of a referenced
 immutable revision is already preserved and is simply healed as a stale view.
+
+## Authority Damage and Recovery
+
+Proposals, decisions, conflicts, and resolutions form the authority graph. If
+one of those JSON records is unreadable or invalid while state and the accepted
+head remain healthy, BIMRI enters a degraded recovery mode. `start` still
+provides a run and a brief, and `status` still prints the complete status plus
+`AUTHORITY RECOVERY NEEDED`; `status` exits nonzero so automation cannot mistake
+the warning for health. Shared-memory commits, conflict resolution,
+maintenance, migration, and index rebuilding remain paused. Isolated run
+journals and proposals can remain staged until recovery completes.
+
+After the owner reviews the damaged record, preserve it with:
+
+```text
+<verified-python> bimri-engine.py quarantine-authority \
+  --kind conflict --id C000003 --human-approved
+```
+
+`--kind` accepts `proposal`, `decision`, `conflict`, or `resolution` with the
+matching record ID. Quarantine refuses a valid regular record, stores damaged
+file bytes under a content-addressed path in `.bimri/recovery/`, and replaces
+the original path with a validated blocking stub. An unsafe symbolic-link
+record is replaced without following its target; the preserved evidence records
+the exact link target and its filesystem bytes, while the external target is
+left untouched. If a durably referenced authority record has been deleted,
+quarantine preserves canonical absence evidence before installing the blocker;
+an unknown ID with no log, dependency, or counter reference is refused as a
+likely typo. Quarantine never makes the remaining graph healthy by omission.
+
+Repair and review a separate copy, then restore it explicitly:
+
+```text
+<verified-python> bimri-engine.py restore-authority \
+  --kind conflict --id C000003 --from /path/to/repaired.json \
+  --human-approved
+```
+
+The engine validates the replacement's identity, structure, immutable effects,
+and relationships in an isolated shadow before it writes an authorization
+receipt or changes the blocker. Missing or altered evidence makes `doctor`
+fail even after canonical memory is healthy. When several related records are
+quarantined, valid restores may be staged one at a time; only recognized
+quarantine dependencies may remain unresolved. Shared-memory writes stay
+blocked until the complete authority graph validates. Run `doctor` after the
+final restore and resume only after it passes.
+For both recovery commands, `--human-approved` is an attestation of the owner's
+choice, not authentication of the caller.
 
 ## Concurrency and Portability Boundary
 
