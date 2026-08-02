@@ -153,6 +153,71 @@ class BimriCliTest(unittest.TestCase):
     def hot(self, root=None):
         return (root or self.root).joinpath("bimri.md").read_text("utf-8")
 
+    def assert_installed_runtime_binding(self, target, agents_text=None):
+        target = Path(target)
+        agents_text = agents_text or (target / "AGENTS.md").read_text("utf-8")
+        python_executable = str(Path(sys.executable).resolve())
+        engine_path = str((target / "bimri-engine.py").resolve())
+        installed_block = agents_text.split(
+            "<!-- BIMRI:START -->", 1
+        )[1].split("<!-- BIMRI:END -->", 1)[0].strip()
+        self.assertEqual(
+            installed_block,
+            (target / "BIMRI-AGENT-BLOCK.md").read_text("utf-8").strip(),
+        )
+        self.assertEqual(
+            installed_block.count("<!-- BIMRI:RUNTIME-BINDING:START -->"), 1
+        )
+        self.assertEqual(
+            installed_block.count("<!-- BIMRI:RUNTIME-BINDING:END -->"), 1
+        )
+        for generic_path in (
+            target / "AGENTS.md",
+            target / "BIMRI-AGENT-BLOCK.md",
+            target / "CLAUDE.md",
+            target / "hooks-example.json",
+        ):
+            generic_text = generic_path.read_text("utf-8")
+            self.assertNotIn(python_executable, generic_text)
+            self.assertNotIn(engine_path, generic_text)
+
+        runtime = json.loads(
+            (target / ".bimri" / "runtime.local.json").read_text("utf-8")
+        )
+        self.assertEqual(runtime, {
+            "argv_prefix": [python_executable, engine_path],
+            "engine_path": engine_path,
+            "host_bound": True,
+            "python_executable": python_executable,
+            "version": "5.0.1",
+        })
+
+        template = json.loads(
+            (target / "hooks-example.json").read_text("utf-8")
+        )
+        hooks = json.loads(
+            (target / ".bimri" / "hooks.claude.local.json").read_text("utf-8")
+        )
+        expected = {
+            "SessionStart": "hook-start",
+            "SessionEnd": "hook-close",
+        }
+        for event, subcommand in expected.items():
+            template_command = template["hooks"][event][0]["hooks"][0]
+            self.assertEqual(
+                template_command["command"], "__BIMRI_VERIFIED_PYTHON__"
+            )
+            command = hooks["hooks"][event][0]["hooks"][0]
+            self.assertEqual(command["type"], "command")
+            self.assertEqual(command["command"], python_executable)
+            self.assertEqual(command["args"], [
+                "${CLAUDE_PROJECT_DIR}/bimri-engine.py",
+                subcommand,
+            ])
+            self.assertEqual(command["timeout"], 15)
+        self.assertNotIn("__BIMRI_VERIFIED_PYTHON__", json.dumps(hooks))
+        self.assertFalse((target / ".claude").exists())
+
     def legacy_v3_bytes(self, claim="Preserve this legacy memory.", sessions=1):
         return (
             f"<!-- BIMRI v3.0 | Last Maintained: 2026-07-20 | Sessions: {sessions} -->\n"
@@ -2101,7 +2166,7 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(
             set(recorded),
             {
-                str(path.relative_to(self.root))
+                path.relative_to(self.root).as_posix()
                 for path in recovery_files
             },
         )
@@ -2156,7 +2221,7 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(
             set(conflict["extra"]["recovery_files"]),
             {
-                str(path.relative_to(self.root))
+                path.relative_to(self.root).as_posix()
                 for path in recovery_files
             },
         )
@@ -2210,11 +2275,17 @@ class BimriCliTest(unittest.TestCase):
         )
 
         first = self.cli("migrate")
-        self.assertIn("complete at v5.0", first.stdout)
+        self.assertIn("complete at v5.0.1.", first.stdout)
         state = self.state()
-        self.assertEqual(state["bimri_version"], "5.0")
+        self.assertEqual(state["bimri_version"], "5.0.1")
         self.assertEqual(state["project_id"], "legacy-project")
         self.assertEqual(state["run_count"], 3)
+        self.assertEqual(
+            (state["tier1_max"], state["tier2_max"], state["tier3_max"]),
+            (12, 20, 8),
+        )
+        self.assertEqual(state["entry_max_chars"], 500)
+        self.assertEqual(state["hot_max_bytes"], 49152)
         converted = self.hot()
         self.assertIn("[K:legacy.r3-e1]", converted)
         self.assertIn("[T:working] [SRC:legacy]", converted)
@@ -2227,7 +2298,7 @@ class BimriCliTest(unittest.TestCase):
         revisions_before = sorted(path.name for path in (bdir / "revisions").iterdir())
 
         second = self.cli("migrate")
-        self.assertIn("complete at v5.0", second.stdout)
+        self.assertIn("complete at v5.0.1.", second.stdout)
         self.assertEqual(marker_path.read_bytes(), marker_before)
         self.assertEqual(
             sorted(path.name for path in (bdir / "backups").iterdir()),
@@ -2405,13 +2476,7 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(agents.count("<!-- BIMRI:START -->"), 1)
         self.assertEqual(agents.count("<!-- BIMRI:END -->"), 1)
         self.assertEqual(claude.count("<!-- BIMRI:START -->"), 1)
-        expected_agent_block = (
-            REPOSITORY / "BIMRI-AGENT-BLOCK.md"
-        ).read_text("utf-8").strip()
-        installed_agent_block = agents.split(
-            "<!-- BIMRI:START -->", 1
-        )[1].split("<!-- BIMRI:END -->", 1)[0].strip()
-        self.assertEqual(installed_agent_block, expected_agent_block)
+        self.assert_installed_runtime_binding(target, agents)
         installed_claude_block = claude.split(
             "<!-- BIMRI:START -->", 1
         )[1].split("<!-- BIMRI:END -->", 1)[0].strip()
@@ -2500,15 +2565,7 @@ class BimriCliTest(unittest.TestCase):
         self.assertIn("Keep this content.", agents)
         self.assertEqual(agents.count("<!-- BIMRI:START -->"), 1)
         self.assertEqual(agents.count("<!-- BIMRI:END -->"), 1)
-        block = (REPOSITORY / "BIMRI-AGENT-BLOCK.md").read_text(
-            "utf-8"
-        ).strip()
-        self.assertEqual(
-            agents.split("<!-- BIMRI:START -->", 1)[1].split(
-                "<!-- BIMRI:END -->", 1
-            )[0].strip(),
-            block,
-        )
+        self.assert_installed_runtime_binding(target, agents)
         manifests = sorted(
             (target / ".bimri" / "install-backups").glob(
                 "*/install-manifest.json"
@@ -2678,6 +2735,12 @@ class BimriCliTest(unittest.TestCase):
         }
         for name, content in original_files.items():
             (target / name).write_text(content, "utf-8")
+        original_local_artifacts = {
+            "runtime.local.json": b'{"old":"runtime binding"}\n',
+            "hooks.claude.local.json": b'{"old":"hook binding"}\n',
+        }
+        for name, content in original_local_artifacts.items():
+            (bdir / name).write_bytes(content)
         legacy_keep = "Keep this unrelated legacy file.\n"
         (target / "legacy").mkdir()
         (target / "legacy" / "keep.txt").write_text(legacy_keep, "utf-8")
@@ -2700,6 +2763,8 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual((log_dir / "R1.md").read_text("utf-8"), legacy_log)
         for name, content in original_files.items():
             self.assertEqual((target / name).read_text("utf-8"), content)
+        for name, content in original_local_artifacts.items():
+            self.assertEqual((bdir / name).read_bytes(), content)
         self.assertEqual(
             (target / "legacy" / "keep.txt").read_text("utf-8"), legacy_keep
         )
@@ -2815,8 +2880,8 @@ class BimriCliTest(unittest.TestCase):
         escaped = revision_path.read_text("utf-8").replace(
             f".bimri/log/{run_id}.md", "../../outside.md"
         )
-        revision_path.write_text(escaped, "utf-8")
-        (self.root / "bimri.md").write_text(escaped, "utf-8")
+        revision_path.write_bytes(escaped.encode("utf-8"))
+        (self.root / "bimri.md").write_bytes(escaped.encode("utf-8"))
         state["head_hash"] = hashlib.sha256(escaped.encode("utf-8")).hexdigest()
         state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", "utf-8")
 
@@ -2828,13 +2893,47 @@ class BimriCliTest(unittest.TestCase):
             "## Tier 2: Active Context",
             "## Tier 2: Active Context\nthis is malformed shared memory",
         )
-        revision_path.write_text(malformed, "utf-8")
-        (self.root / "bimri.md").write_text(malformed, "utf-8")
+        revision_path.write_bytes(malformed.encode("utf-8"))
+        (self.root / "bimri.md").write_bytes(malformed.encode("utf-8"))
         state["head_hash"] = hashlib.sha256(malformed.encode("utf-8")).hexdigest()
         state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", "utf-8")
         malformed_result = self.cli("doctor", check=False)
         self.assertEqual(malformed_result.returncode, 1)
         self.assertIn("malformed Tier 2 entry", malformed_result.stdout)
+
+    def test_migrate_does_not_claim_validation_for_duplicate_memory_keys(self):
+        initialized = self.cli("migrate")
+        self.assertNotIn("index is missing", initialized.stdout)
+        self.assertTrue((self.root / ".bimri" / "index.tsv").is_file())
+        state_path = self.root / ".bimri" / "state.json"
+        state = self.state()
+        revision_path = (
+            self.root
+            / ".bimri"
+            / "revisions"
+            / f"V{state['head_revision']:06d}.md"
+        )
+        duplicate = revision_path.read_text("utf-8").replace(
+            "<!-- Confirmed facts, decisions, preferences and rules. Capacity: state.json. -->",
+            "<!-- Confirmed facts, decisions, preferences and rules. Capacity: state.json. -->\n\n"
+            "[R0-E1] [K:duplicate.key] [fact] [T:working] "
+            "[SRC:legacy] [] First value.\n\n"
+            "[R0-E2] [K:duplicate.key] [fact] [T:working] "
+            "[SRC:legacy] [] Second value.",
+        )
+        revision_path.write_bytes(duplicate.encode("utf-8"))
+        (self.root / "bimri.md").write_bytes(duplicate.encode("utf-8"))
+        state["head_hash"] = hashlib.sha256(duplicate.encode("utf-8")).hexdigest()
+        state_path.write_text(
+            json.dumps(state, indent=2, sort_keys=True) + "\n", "utf-8"
+        )
+
+        result = self.cli("migrate", check=False)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("migration validation failed", result.stderr)
+        self.assertIn("duplicate memory key: duplicate.key", result.stderr)
+        self.assertNotIn("Validation: PASSED", result.stdout)
 
     def test_doctor_reports_applying_orphan_revision_and_temp_litter(self):
         self.cli("migrate")
@@ -2864,10 +2963,10 @@ class BimriCliTest(unittest.TestCase):
         )
         revision_zero = (
             self.root / ".bimri" / "revisions" / "V000000.md"
-        ).read_text("utf-8")
+        ).read_bytes()
         (
             self.root / ".bimri" / "revisions" / "V000001.md"
-        ).write_text(revision_zero, "utf-8")
+        ).write_bytes(revision_zero)
         root_temp = self.root / ".bimri-tmp-crash-leftover"
         nested_temp = (
             self.root
@@ -3075,6 +3174,14 @@ class BimriCliTest(unittest.TestCase):
 
     def test_index_and_doctor_are_deterministic(self):
         run_id = self.start("codex")
+        self.cli(
+            "journal", "--run", run_id,
+            "--text", "Index paths stay portable across operating systems.",
+        )
+        archive_path = self.root / ".bimri" / "archive" / "portability.md"
+        archive_path.write_bytes(
+            b"[R999999-E999] Archived portability fixture.\n"
+        )
         first = self.propose(run_id, "zeta.item", "Zeta comes second alphabetically.")
         second = self.propose(run_id, "alpha.item", "Alpha comes first alphabetically.")
         self.cli("sync", "--run", run_id)
@@ -3101,6 +3208,10 @@ class BimriCliTest(unittest.TestCase):
         self.assertTrue(all(len(row.split("\t")) == 8 for row in rows))
         ids = [row.split("\t")[0] for row in rows[1:]]
         self.assertEqual(ids, sorted(ids))
+        indexed_files = {row.split("\t")[6] for row in rows[1:]}
+        self.assertIn(f".bimri/log/{run_id}.md", indexed_files)
+        self.assertIn(".bimri/archive/portability.md", indexed_files)
+        self.assertTrue(all("\\" not in path for path in indexed_files))
 
         first_doctor = self.cli("doctor")
         doctor_index_one = index_path.read_bytes()
@@ -3144,7 +3255,7 @@ class BimriCliTest(unittest.TestCase):
         (self.root / "BIMRI-backup.md").write_bytes(rolling)
 
         first = self.cli("migrate")
-        self.assertIn("complete at v5.0", first.stdout)
+        self.assertIn("complete at v5.0.1.", first.stdout)
         self.assertNotIn("BIMRI.md", {path.name for path in self.root.iterdir()})
         self.assertNotIn("BIMRI-backup.md", {path.name for path in self.root.iterdir()})
         self.assertTrue((self.root / "bimri.md").exists())
@@ -3497,13 +3608,13 @@ class BimriCliTest(unittest.TestCase):
 
     def test_legacy_import_may_inherit_tier_and_hot_byte_overflow(self):
         lines = []
-        for number in range(1, 31):
+        for number in range(1, 51):
             lines.extend([
                 f"[ID:T2-20260720-{number:02d}] [IMP:3] [CREATED:2026-07-20] "
                 f"[SESSION:1] [LAST_USED:2026-07-20] [LAST_USED_SESSION:1] "
                 f"[TAGS:legacy] [W:3.0]",
                 f"Inherited active claim number {number} with deliberately retained detail "
-                f"that makes the generated view exceed its normal byte ceiling. " + ("x" * 370),
+                f"that makes the generated view exceed its normal byte ceiling. " + ("x" * 950),
             ])
         source = (
             "<!-- BIMRI v3.0 | Last Maintained: 2026-07-20 | Sessions: 1 -->\n"
@@ -3515,7 +3626,7 @@ class BimriCliTest(unittest.TestCase):
         )
         (self.root / "BIMRI.md").write_text(source, "utf-8")
         self.cli("migrate")
-        self.assertEqual(self.hot().count("[K:legacy.v3.t2-20260720-"), 30)
+        self.assertEqual(self.hot().count("[K:legacy.v3.t2-20260720-"), 50)
         self.assertGreater(len(self.hot().encode("utf-8")), self.state()["hot_max_bytes"])
         doctor = self.cli("doctor")
         self.assertIn("BIMRI doctor: PASSED", doctor.stdout)
@@ -3639,6 +3750,1076 @@ class BimriCliTest(unittest.TestCase):
         self.cli("migrate")
         self.assertNotIn("BIMRI.md", {path.name for path in self.root.iterdir()})
         self.assertTrue((self.root / "bimri.md").exists())
+
+    def test_v4_long_pattern_is_preserved_as_repair_only_overflow(self):
+        bdir = self.root / ".bimri"
+        bdir.mkdir()
+        hypothesis = "Inherited long v4 pattern: " + ("p" * 700)
+        legacy_hot = (
+            "# BIMRI Memory\n\n"
+            "## Tier 1: Core Intelligence\n\n"
+            "## Tier 2: Active Context\n\n"
+            "## Tier 3: Pattern Recognition\n\n"
+            f"[P1] [emerging] [obs:2] [ev:R1-E1] {hypothesis} "
+            "| Falsify: contrary evidence\n\n"
+            "<!-- END BIMRI -->\n"
+        )
+        (self.root / "bimri.md").write_text(legacy_hot, "utf-8")
+        (bdir / "state.json").write_text(
+            json.dumps({
+                "bimri_version": "4.0",
+                "project_id": "long-v4-pattern",
+                "run_count": 0,
+                "current_run_id": "R000",
+            }, indent=2) + "\n",
+            "utf-8",
+        )
+
+        migrated = self.cli("migrate")
+
+        self.assertIn("Memory: migrated BIMRI v4.0", migrated.stdout)
+        self.assertIn("inherited overlength 1", migrated.stdout)
+        self.assertIn(hypothesis, self.hot())
+        pattern_line = next(
+            line for line in self.hot().splitlines() if line.startswith("[P1]")
+        )
+        self.assertLess(len(pattern_line), 4096)
+        doctor = self.cli("doctor")
+        self.assertIn("BIMRI doctor: PASSED", doctor.stdout)
+        self.assertIn(
+            "inherited v4 pattern text exceeds active entry cap", doctor.stdout
+        )
+        run_id = self.start("pattern-repair")
+        proposal_id = self.propose(
+            run_id,
+            "legacy.pattern-p1",
+            "Condensed inherited pattern.",
+            tier=3,
+            source="user",
+            trust="confirmed",
+            extra=(
+                "--target", "P1",
+                "--confidence", "emerging",
+                "--observations", "2",
+                "--evidence", "R1-E1",
+                "--falsifier", "Contrary evidence appears.",
+            ),
+        )
+        self.cli("sync", "--run", run_id)
+        self.assertEqual(self.decision(proposal_id)["outcome"], "accepted")
+        self.assertNotIn(
+            "inherited v4 pattern text exceeds active entry cap",
+            self.cli("doctor").stdout,
+        )
+
+    def test_v4_marker_forgery_fails_before_authority_changes(self):
+        hot = (
+            "# BIMRI Memory\n\n"
+            "## Tier 1: Core Intelligence\n\n"
+            "## Tier 2: Active Context\n\n"
+            "## Tier 3: Pattern Recognition\n\n"
+            "<!-- END BIMRI -->\n"
+        ).encode("utf-8")
+        base_state = {
+            "bimri_version": "4.0",
+            "project_id": "marker-validation",
+            "run_count": 0,
+            "current_run_id": "R000",
+        }
+        cases = ("empty", "missing", "traversal", "corrupt")
+        for case in cases:
+            with self.subTest(case=case):
+                root = self.root / case
+                bdir = root / ".bimri"
+                backups = bdir / "backups"
+                migrations = bdir / "migrations"
+                backups.mkdir(parents=True)
+                migrations.mkdir()
+                state_bytes = (
+                    json.dumps(base_state, indent=2) + "\n"
+                ).encode("utf-8")
+                state_path = bdir / "state.json"
+                hot_path = root / "bimri.md"
+                state_path.write_bytes(state_bytes)
+                hot_path.write_bytes(hot)
+                state_backup = backups / "state-v4.json-test"
+                hot_backup = backups / "bimri-v4.md-test"
+                if case == "corrupt":
+                    state_backup.write_bytes(state_bytes)
+                    hot_backup.write_bytes(b"not the authoritative hot memory\n")
+                marker = {} if case == "empty" else {
+                    "migration": "v4-to-v5",
+                    "completed_at": "2026-08-02T00:00:00Z",
+                    "source_hot_hash": hashlib.sha256(hot).hexdigest(),
+                    "backup_state": (
+                        "../escaped-state.json"
+                        if case == "traversal"
+                        else ".bimri/backups/state-v4.json-test"
+                    ),
+                    "backup_hot": (
+                        "../escaped-hot.md"
+                        if case == "traversal"
+                        else ".bimri/backups/bimri-v4.md-test"
+                    ),
+                }
+                marker_path = migrations / "v4-to-v5.json"
+                marker_bytes = (
+                    json.dumps(marker, indent=2, sort_keys=True) + "\n"
+                ).encode("utf-8")
+                marker_path.write_bytes(marker_bytes)
+
+                result = self.cli("migrate", root=root, check=False)
+
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("v4 migration", result.stderr)
+                self.assertEqual(state_path.read_bytes(), state_bytes)
+                self.assertEqual(hot_path.read_bytes(), hot)
+                self.assertEqual(marker_path.read_bytes(), marker_bytes)
+                self.assertFalse((bdir / "revisions" / "V000000.md").exists())
+
+    def test_v4_late_writers_stop_before_revision_or_state_commit(self):
+        hot = (
+            "# BIMRI Memory\n\n"
+            "## Tier 1: Core Intelligence\n\n"
+            "## Tier 2: Active Context\n\n"
+            "## Tier 3: Pattern Recognition\n\n"
+            "<!-- END BIMRI -->\n"
+        ).encode("utf-8")
+        state = (
+            json.dumps({
+                "bimri_version": "4.0",
+                "project_id": "late-v4-writer",
+                "run_count": 0,
+                "current_run_id": "R000",
+            }, indent=2) + "\n"
+        ).encode("utf-8")
+        for mode, changed_name in (
+            ("v4_hot_change_after_backup", "bimri.md"),
+            ("v4_state_change_after_backup", "state.json"),
+        ):
+            with self.subTest(mode=mode):
+                root = self.root / mode
+                bdir = root / ".bimri"
+                bdir.mkdir(parents=True)
+                (root / "bimri.md").write_bytes(hot)
+                (bdir / "state.json").write_bytes(state)
+
+                result = self.worker(mode, "migrate", root=root, check=False)
+
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("changed while migration was preparing", result.stderr)
+                changed_path = root / changed_name if changed_name == "bimri.md" else bdir / changed_name
+                original = hot if changed_name == "bimri.md" else state
+                self.assertTrue(changed_path.read_bytes().startswith(original))
+                unchanged_path = bdir / "state.json" if changed_name == "bimri.md" else root / "bimri.md"
+                unchanged = state if changed_name == "bimri.md" else hot
+                self.assertEqual(unchanged_path.read_bytes(), unchanged)
+                self.assertFalse((bdir / "revisions" / "V000000.md").exists())
+                self.assertFalse((bdir / "migrations" / "v4-to-v5.json").exists())
+                hot_backups = list((bdir / "backups").glob("bimri-v4.md-*"))
+                self.assertEqual(len(hot_backups), 1)
+                self.assertEqual(hot_backups[0].read_bytes(), hot)
+
+    def test_v4_pointer_escape_fails_before_authority_commit(self):
+        bdir = self.root / ".bimri"
+        bdir.mkdir()
+        hot = (
+            "# BIMRI Memory\n\n"
+            "## Tier 1: Core Intelligence\n\n"
+            "[R1-E1] [fact] [legacy] Unsafe pointer -> ../../outside.md\n\n"
+            "## Tier 2: Active Context\n\n"
+            "## Tier 3: Pattern Recognition\n\n"
+            "<!-- END BIMRI -->\n"
+        ).encode("utf-8")
+        state = (
+            json.dumps({
+                "bimri_version": "4.0",
+                "project_id": "pointer-escape",
+                "run_count": 0,
+                "current_run_id": "R000",
+            }, indent=2) + "\n"
+        ).encode("utf-8")
+        (self.root / "bimri.md").write_bytes(hot)
+        (bdir / "state.json").write_bytes(state)
+
+        result = self.cli("migrate", check=False)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("pointer escapes the BIMRI project", result.stderr)
+        self.assertEqual((self.root / "bimri.md").read_bytes(), hot)
+        self.assertEqual((bdir / "state.json").read_bytes(), state)
+        self.assertFalse((bdir / "revisions" / "V000000.md").exists())
+        self.assertFalse((bdir / "migrations" / "v4-to-v5.json").exists())
+
+    def test_v4_marker_and_backups_resume_after_crash_before_state(self):
+        bdir = self.root / ".bimri"
+        bdir.mkdir()
+        hot = (
+            "# BIMRI Memory\n\n"
+            "## Tier 1: Core Intelligence\n\n"
+            "[R2-E1] [fact] [legacy] Resume this v4 fact\n\n"
+            "## Tier 2: Active Context\n\n"
+            "## Tier 3: Pattern Recognition\n\n"
+            "<!-- END BIMRI -->\n"
+        ).encode("utf-8")
+        state_bytes = (
+            json.dumps({
+                "bimri_version": "4.0",
+                "project_id": "v4-crash-resume",
+                "run_count": 2,
+                "current_run_id": "R000",
+            }, indent=2) + "\n"
+        ).encode("utf-8")
+        (self.root / "bimri.md").write_bytes(hot)
+        (bdir / "state.json").write_bytes(state_bytes)
+
+        crashed = self.worker(
+            "v4_crash_before_state", "migrate", root=self.root, check=False
+        )
+
+        self.assertEqual(crashed.returncode, 95)
+        self.assertEqual((self.root / "bimri.md").read_bytes(), hot)
+        self.assertEqual((bdir / "state.json").read_bytes(), state_bytes)
+        marker_path = bdir / "migrations" / "v4-to-v5.json"
+        marker_before = marker_path.read_bytes()
+        marker = json.loads(marker_before)
+        for field in ("backup_state", "backup_hot"):
+            backup = self.root / marker[field]
+            self.assertTrue(backup.is_file())
+        revision_before = (bdir / "revisions" / "V000000.md").read_bytes()
+
+        resumed = self.cli("migrate")
+
+        self.assertIn("Memory: migrated BIMRI v4.0", resumed.stdout)
+        self.assertEqual(marker_path.read_bytes(), marker_before)
+        self.assertEqual(
+            (bdir / "revisions" / "V000000.md").read_bytes(), revision_before
+        )
+        self.assertEqual(self.state()["bimri_version"], "5.0.1")
+        self.assertIn("BIMRI doctor: PASSED", self.cli("doctor").stdout)
+
+    def test_v4_historical_conversion_keeps_v000000_and_normalizes_active_head(self):
+        bdir = self.root / ".bimri"
+        revisions = bdir / "revisions"
+        revisions.mkdir(parents=True)
+        claim = "Preserve the historical v4 conversion exactly."
+        source = (
+            "# BIMRI Memory\n\n"
+            "<!-- BIMRI v4 | Generated view. Do not edit directly. -->\n"
+            "<!-- Engine: legacy -->\n\n"
+            "## Tier 1: Core Intelligence\n\n"
+            "<!-- Confirmed facts, decisions, preferences and rules. Cap: 12. -->\n\n"
+            f"[R1-E1] [fact] [legacy] {claim}\n\n"
+            "## Tier 2: Active Context\n\n"
+            "<!-- Current work, risks and next actions. Cap: 20. -->\n\n"
+            "## Tier 3: Pattern Recognition\n\n"
+            "<!-- Evidence-backed patterns. Cap: 8. -->\n\n"
+            "<!-- END BIMRI -->\n"
+        )
+        historical = source.replace(
+            "<!-- BIMRI v4 | Generated view. Do not edit directly. -->",
+            "<!-- BIMRI v5 | Generated view. Do not edit directly. -->",
+        ).replace(
+            "<!-- Engine: legacy -->",
+            "<!-- Full history: .bimri/log/ | Revisions: .bimri/revisions/ -->",
+        ).replace(
+            f"[R1-E1] [fact] [legacy] {claim}",
+            "[R1-E1] [K:legacy.r1-e1] [fact] [T:working] "
+            f"[SRC:legacy] [legacy] {claim}",
+        )
+        (self.root / "bimri.md").write_bytes(source.encode("utf-8"))
+        state = {
+            "bimri_version": "4.0",
+            "project_id": "historical-v4",
+            "run_count": 1,
+            "current_run_id": "R000",
+        }
+        (bdir / "state.json").write_text(
+            json.dumps(state, indent=2) + "\n", "utf-8"
+        )
+        v0 = revisions / "V000000.md"
+        v0.write_bytes(historical.encode("utf-8"))
+
+        migrated = self.cli("migrate")
+
+        self.assertEqual(v0.read_text("utf-8"), historical)
+        self.assertIn(
+            "Memory metadata normalized in immutable revision V000001",
+            migrated.stdout,
+        )
+        current = self.state()
+        self.assertEqual(current["head_revision"], 1)
+        normalized = (revisions / "V000001.md").read_text("utf-8")
+        self.assertEqual((self.root / "bimri.md").read_text("utf-8"), normalized)
+        self.assertIn("BIMRI v5.0.1", normalized)
+        self.assertNotIn("Cap: 12", normalized)
+        self.assertEqual(normalized.count(claim), 1)
+        self.assertIn("BIMRI doctor: PASSED", self.cli("doctor").stdout)
+
+    def test_v4_state_refuses_distinct_unclaimed_legacy_before_migration(self):
+        probe = self.root / "case-probe"
+        probe.write_text("probe", "utf-8")
+        case_insensitive = (self.root / "CASE-PROBE").exists()
+        probe.unlink()
+        if case_insensitive:
+            return
+
+        def prepare(root):
+            bdir = root / ".bimri"
+            bdir.mkdir(parents=True)
+            state = (
+                json.dumps({
+                    "bimri_version": "4.0",
+                    "project_id": "v4-unclaimed",
+                    "run_count": 0,
+                    "current_run_id": "R000",
+                }, indent=2) + "\n"
+            ).encode("utf-8")
+            hot = (
+                "# BIMRI Memory\n\n"
+                "## Tier 1: Core Intelligence\n\n"
+                "## Tier 2: Active Context\n\n"
+                "## Tier 3: Pattern Recognition\n\n"
+                "<!-- END BIMRI -->\n"
+            ).encode("utf-8")
+            upper = self.legacy_v3_bytes("Competing legacy authority.")
+            (bdir / "state.json").write_bytes(state)
+            (root / "bimri.md").write_bytes(hot)
+            (root / "BIMRI.md").write_bytes(upper)
+            return state, hot, upper
+
+        direct_root = self.root / "direct"
+        state, hot, upper = prepare(direct_root)
+        direct = self.cli("migrate", root=direct_root, check=False)
+        self.assertEqual(direct.returncode, 2)
+        self.assertIn("unclaimed legacy root file", direct.stderr)
+        self.assertEqual((direct_root / ".bimri" / "state.json").read_bytes(), state)
+        self.assertEqual((direct_root / "bimri.md").read_bytes(), hot)
+        self.assertEqual((direct_root / "BIMRI.md").read_bytes(), upper)
+        self.assertFalse(
+            (direct_root / ".bimri" / "migrations" / "v4-to-v5.json").exists()
+        )
+
+        install_root = self.root / "install"
+        state, hot, upper = prepare(install_root)
+        installed = subprocess.run(
+            [sys.executable, str(ENGINE), "install", "--target", str(install_root)],
+            text=True,
+            capture_output=True,
+            timeout=45,
+        )
+        self.assertEqual(installed.returncode, 2)
+        self.assertIn("unclaimed legacy root file", installed.stderr)
+        self.assertEqual((install_root / ".bimri" / "state.json").read_bytes(), state)
+        self.assertEqual((install_root / "bimri.md").read_bytes(), hot)
+        self.assertEqual((install_root / "BIMRI.md").read_bytes(), upper)
+        self.assertFalse((install_root / "BIMRI-PROTOCOL.md").exists())
+
+    def test_python_verification_failures_precede_target_mutation(self):
+        cases = {
+            "python_verify_silent": "no valid BIMRI verification sentinel",
+            "python_verify_wrong": "wrong BIMRI verification sentinel",
+            "python_verify_old": "not Python 3.8 or newer",
+            "python_verify_timeout": "five-second verification check",
+        }
+        for mode, message in cases.items():
+            with self.subTest(mode=mode):
+                target = self.root / mode
+                result = self.worker(
+                    mode,
+                    "install",
+                    "--target",
+                    str(target),
+                    root=self.root,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(message, result.stderr)
+                self.assertFalse(target.exists())
+
+    def test_repository_runtime_templates_are_host_generic(self):
+        python_executable = str(Path(sys.executable).resolve())
+        repository_path = str(REPOSITORY.resolve())
+        for name in (
+            "AGENTS.md",
+            "BIMRI-AGENT-BLOCK.md",
+            "CLAUDE.md",
+            "hooks-example.json",
+        ):
+            with self.subTest(name=name):
+                text = (REPOSITORY / name).read_text("utf-8")
+                self.assertNotIn(python_executable, text)
+                self.assertNotIn(repository_path, text)
+        hooks = json.loads((REPOSITORY / "hooks-example.json").read_text("utf-8"))
+        for event in ("SessionStart", "SessionEnd"):
+            self.assertEqual(
+                hooks["hooks"][event][0]["hooks"][0]["command"],
+                "__BIMRI_VERIFIED_PYTHON__",
+            )
+
+    def test_self_install_rebinds_old_host_hooks_and_run_hint_is_safe(self):
+        target = self.root / "portable project with spaces"
+        install = subprocess.run(
+            [sys.executable, str(ENGINE), "install", "--target", str(target)],
+            text=True,
+            capture_output=True,
+            timeout=45,
+        )
+        self.assertEqual(install.returncode, 0, install.stdout + install.stderr)
+        hooks_path = target / ".bimri" / "hooks.claude.local.json"
+        hooks = json.loads(hooks_path.read_text("utf-8"))
+        for event in ("SessionStart", "SessionEnd"):
+            hooks["hooks"][event][0]["hooks"][0]["command"] = (
+                r"C:\Old Host\Python 3.10\python.exe"
+            )
+        hooks_path.write_text(
+            json.dumps(hooks, indent=2, ensure_ascii=False) + "\n", "utf-8"
+        )
+        runtime_path = target / ".bimri" / "runtime.local.json"
+        runtime = json.loads(runtime_path.read_text("utf-8"))
+        runtime.update({
+            "python_executable": r"C:\Old Host\Python 3.10\python.exe",
+            "engine_path": r"C:\Old Host\BIMRI\bimri-engine.py",
+            "argv_prefix": [
+                r"C:\Old Host\Python 3.10\python.exe",
+                r"C:\Old Host\BIMRI\bimri-engine.py",
+            ],
+        })
+        runtime_path.write_text(
+            json.dumps(runtime, indent=2, ensure_ascii=False) + "\n", "utf-8"
+        )
+
+        reinstall = subprocess.run(
+            [
+                sys.executable,
+                str(target / "bimri-engine.py"),
+                "install",
+                "--target",
+                str(target),
+            ],
+            text=True,
+            capture_output=True,
+            timeout=45,
+        )
+        self.assertEqual(
+            reinstall.returncode, 0, reinstall.stdout + reinstall.stderr
+        )
+        self.assert_installed_runtime_binding(target)
+
+        started = subprocess.run(
+            [
+                sys.executable,
+                str(target / "bimri-engine.py"),
+                "start",
+                "--actor",
+                "rebind-test",
+            ],
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        run_id = re.search(r"BIMRI RUN HANDLE: (R\d{6})", started.stdout).group(1)
+        run_log = (target / ".bimri" / "log" / f"{run_id}.md").read_text("utf-8")
+        self.assertIn("argv_prefix recorded in .bimri/runtime.local.json", run_log)
+        unsafe_hint = f"{Path(sys.executable).name} bimri-engine.py journal"
+        self.assertNotIn(unsafe_hint, run_log)
+
+    def test_v5_0_profiles_upgrade_with_metadata_only_revision(self):
+        profiles = {
+            "stock": {
+                "old": (12, 20, 8, 500, 16384),
+                "new": (20, 40, 12, 500, 49152),
+                "message": "stock limits expanded",
+            },
+            "custom": {
+                "old": (7, 9, 3, 240, 20000),
+                "new": (7, 9, 3, 240, 20000),
+                "message": "custom limits preserved",
+            },
+        }
+        fields = (
+            "tier1_max",
+            "tier2_max",
+            "tier3_max",
+            "entry_max_chars",
+            "hot_max_bytes",
+        )
+        for label, profile in profiles.items():
+            with self.subTest(profile=label):
+                root = self.root / label
+                self.cli("migrate", root=root)
+                state_path = root / ".bimri" / "state.json"
+                state = json.loads(state_path.read_text("utf-8"))
+                revision_path = root / ".bimri" / "revisions" / "V000000.md"
+                current_template = revision_path.read_text("utf-8")
+                historical = (
+                    current_template.replace(
+                        "<!-- BIMRI v5.0.1 | Generated view. Do not edit directly. -->",
+                        "<!-- BIMRI v5 | Generated view. Do not edit directly. -->",
+                    )
+                    .replace(
+                        "<!-- Confirmed facts, decisions, preferences and rules. Capacity: state.json. -->",
+                        "<!-- Confirmed facts, decisions, preferences and rules. Cap: 12. -->",
+                    )
+                    .replace(
+                        "<!-- Current work, risks and next actions. Capacity: state.json. -->",
+                        "<!-- Current work, risks and next actions. Cap: 20. -->",
+                    )
+                    .replace(
+                        "<!-- Evidence-backed patterns. Capacity: state.json. -->",
+                        "<!-- Evidence-backed patterns. Cap: 8. -->",
+                    )
+                )
+                entry = (
+                    "[R0-E1] [K:upgrade.metadata] [fact] [T:working] "
+                    "[SRC:legacy] [] Preserve this entry byte-for-byte."
+                )
+                historical = historical.replace(
+                    "<!-- Confirmed facts, decisions, preferences and rules. Cap: 12. -->",
+                    "<!-- Confirmed facts, decisions, preferences and rules. Cap: 12. -->"
+                    f"\n\n{entry}",
+                )
+                expected = (
+                    historical.replace(
+                        "<!-- BIMRI v5 | Generated view. Do not edit directly. -->",
+                        "<!-- BIMRI v5.0.1 | Generated view. Do not edit directly. -->",
+                    )
+                    .replace(
+                        "<!-- Confirmed facts, decisions, preferences and rules. Cap: 12. -->",
+                        "<!-- Confirmed facts, decisions, preferences and rules. Capacity: state.json. -->",
+                    )
+                    .replace(
+                        "<!-- Current work, risks and next actions. Cap: 20. -->",
+                        "<!-- Current work, risks and next actions. Capacity: state.json. -->",
+                    )
+                    .replace(
+                        "<!-- Evidence-backed patterns. Cap: 8. -->",
+                        "<!-- Evidence-backed patterns. Capacity: state.json. -->",
+                    )
+                )
+                revision_path.write_bytes(historical.encode("utf-8"))
+                (root / "bimri.md").write_bytes(historical.encode("utf-8"))
+                state["bimri_version"] = "5.0"
+                state.update(dict(zip(fields, profile["old"])))
+                state["head_hash"] = hashlib.sha256(
+                    historical.encode("utf-8")
+                ).hexdigest()
+                old_state_bytes = (
+                    json.dumps(state, indent=2, sort_keys=True) + "\n"
+                ).encode("utf-8")
+                state_path.write_bytes(old_state_bytes)
+
+                upgraded = self.cli("migrate", root=root)
+
+                self.assertIn("Memory: upgraded v5.0 to v5.0.1", upgraded.stdout)
+                self.assertIn(profile["message"], upgraded.stdout)
+                self.assertIn(
+                    f"entry {profile['new'][3]} chars", upgraded.stdout
+                )
+                if label == "custom":
+                    self.assertGreaterEqual(
+                        upgraded.stdout.count("entry 240 chars"), 2
+                    )
+                self.assertIn(
+                    "Memory metadata normalized in immutable revision V000001",
+                    upgraded.stdout,
+                )
+                current = self.state(root=root)
+                self.assertEqual(current["bimri_version"], "5.0.1")
+                self.assertEqual(
+                    tuple(current[field] for field in fields), profile["new"]
+                )
+                self.assertEqual(current["head_revision"], 1)
+                self.assertEqual(revision_path.read_text("utf-8"), historical)
+                normalized_revision = (
+                    root / ".bimri" / "revisions" / "V000001.md"
+                )
+                self.assertEqual(normalized_revision.read_text("utf-8"), expected)
+                self.assertEqual((root / "bimri.md").read_text("utf-8"), expected)
+                self.assertEqual(expected.count(entry), 1)
+                backups = list(
+                    (root / ".bimri" / "backups").glob("state-v5.0-*.json")
+                )
+                self.assertEqual(len(backups), 1)
+                self.assertEqual(backups[0].read_bytes(), old_state_bytes)
+                self.assertIn(
+                    "existing v5.0.1 verified; no migration performed",
+                    self.cli("migrate", root=root).stdout,
+                )
+                self.assertIn(
+                    "BIMRI doctor: PASSED", self.cli("doctor", root=root).stdout
+                )
+
+    def test_incomplete_v5_0_state_fails_without_default_guessing_or_mutation(self):
+        self.cli("migrate")
+        state_path = self.root / ".bimri" / "state.json"
+        state = self.state()
+        state["bimri_version"] = "5.0"
+        state.pop("hot_max_bytes")
+        incomplete = (
+            json.dumps(state, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        state_path.write_bytes(incomplete)
+        hot_before = (self.root / "bimri.md").read_bytes()
+        revision_before = (
+            self.root / ".bimri" / "revisions" / "V000000.md"
+        ).read_bytes()
+
+        result = self.cli("migrate", check=False)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("missing required v5 field(s): hot_max_bytes", result.stderr)
+        self.assertIn("stopped without filling them from defaults", result.stderr)
+        self.assertEqual(state_path.read_bytes(), incomplete)
+        self.assertEqual((self.root / "bimri.md").read_bytes(), hot_before)
+        self.assertEqual(
+            (self.root / ".bimri" / "revisions" / "V000000.md").read_bytes(),
+            revision_before,
+        )
+        self.assertEqual(
+            list((self.root / ".bimri" / "backups").glob("state-v5.0-*.json")),
+            [],
+        )
+
+    def test_v5_0_metadata_normalization_respects_exact_custom_byte_cap(self):
+        self.cli("migrate")
+        revision_path = self.root / ".bimri" / "revisions" / "V000000.md"
+        historical = (
+            revision_path.read_text("utf-8")
+            .replace(
+                "<!-- BIMRI v5.0.1 | Generated view. Do not edit directly. -->",
+                "<!-- BIMRI v5 | Generated view. Do not edit directly. -->",
+            )
+            .replace("Capacity: state.json.", "Cap: 12.", 1)
+            .replace("Capacity: state.json.", "Cap: 20.", 1)
+            .replace("Capacity: state.json.", "Cap: 8.", 1)
+        )
+        revision_path.write_bytes(historical.encode("utf-8"))
+        (self.root / "bimri.md").write_bytes(historical.encode("utf-8"))
+        state_path = self.root / ".bimri" / "state.json"
+        state = self.state()
+        state.update({
+            "bimri_version": "5.0",
+            "tier1_max": 7,
+            "tier2_max": 9,
+            "tier3_max": 3,
+            "entry_max_chars": 240,
+            "hot_max_bytes": len(historical.encode("utf-8")),
+            "head_hash": hashlib.sha256(historical.encode("utf-8")).hexdigest(),
+        })
+        state_path.write_text(
+            json.dumps(state, indent=2, sort_keys=True) + "\n", "utf-8"
+        )
+
+        upgraded = self.cli("migrate")
+
+        current = self.state()
+        normalized = (self.root / "bimri.md").read_bytes()
+        self.assertIn("custom limits preserved", upgraded.stdout)
+        self.assertLessEqual(len(normalized), current["hot_max_bytes"])
+        self.assertIn(b"BIMRI v5.0.1", normalized)
+        self.assertNotIn(b"Cap: 12", normalized)
+        doctor = self.cli("doctor")
+        self.assertNotIn("exceeds byte cap", doctor.stdout + doctor.stderr)
+
+    def test_current_v5_stale_metadata_preserves_manual_hot_edit(self):
+        self.cli("migrate")
+        revision = self.root / ".bimri" / "revisions" / "V000000.md"
+        historical = (
+            revision.read_text("utf-8")
+            .replace(
+                "<!-- BIMRI v5.0.1 | Generated view. Do not edit directly. -->",
+                "<!-- BIMRI v5 | Generated view. Do not edit directly. -->",
+            )
+            .replace("Capacity: state.json.", "Cap: 12.", 1)
+            .replace("Capacity: state.json.", "Cap: 20.", 1)
+            .replace("Capacity: state.json.", "Cap: 8.", 1)
+        )
+        revision.write_bytes(historical.encode("utf-8"))
+        state_path = self.root / ".bimri" / "state.json"
+        state = self.state()
+        state["head_hash"] = hashlib.sha256(
+            historical.encode("utf-8")
+        ).hexdigest()
+        state_path.write_text(
+            json.dumps(state, indent=2, sort_keys=True) + "\n", "utf-8"
+        )
+        direct_edit = b"Uncommitted owner edit on a current-version stale view.\n"
+        (self.root / "bimri.md").write_bytes(direct_edit)
+
+        migrated = self.cli("migrate")
+
+        self.assertIn("direct edit to bimri.md was preserved", migrated.stderr)
+        self.assertIn(
+            "Memory metadata normalized in immutable revision V000001",
+            migrated.stdout,
+        )
+        recovery = list(
+            (self.root / ".bimri" / "recovery").glob("manual-hot-*.md")
+        )
+        self.assertEqual(len(recovery), 1)
+        self.assertEqual(recovery[0].read_bytes(), direct_edit)
+        self.assertEqual(self.state()["head_revision"], 1)
+        normalized = (self.root / ".bimri" / "revisions" / "V000001.md")
+        self.assertEqual((self.root / "bimri.md").read_bytes(), normalized.read_bytes())
+
+    def test_current_v5_stale_metadata_conflicting_next_revision_is_fail_closed(self):
+        self.cli("migrate")
+        revisions = self.root / ".bimri" / "revisions"
+        revision = revisions / "V000000.md"
+        historical = revision.read_text("utf-8").replace(
+            "<!-- BIMRI v5.0.1 | Generated view. Do not edit directly. -->",
+            "<!-- BIMRI v5 | Generated view. Do not edit directly. -->",
+        )
+        revision.write_bytes(historical.encode("utf-8"))
+        (self.root / "bimri.md").write_bytes(historical.encode("utf-8"))
+        state_path = self.root / ".bimri" / "state.json"
+        state = self.state()
+        state["head_hash"] = hashlib.sha256(
+            historical.encode("utf-8")
+        ).hexdigest()
+        state_bytes = (
+            json.dumps(state, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        state_path.write_bytes(state_bytes)
+        collision = b"unrelated immutable revision bytes\n"
+        (revisions / "V000001.md").write_bytes(collision)
+
+        result = self.cli("migrate", check=False)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("metadata revision conflicts", result.stderr)
+        self.assertEqual(state_path.read_bytes(), state_bytes)
+        self.assertEqual((self.root / "bimri.md").read_text("utf-8"), historical)
+        self.assertEqual((revisions / "V000001.md").read_bytes(), collision)
+        self.assertEqual(list((self.root / ".bimri" / "recovery").iterdir()), [])
+
+    def test_v5_0_pointer_escape_fails_before_upgrade_authority_write(self):
+        self.cli("migrate")
+        state_path = self.root / ".bimri" / "state.json"
+        revision_path = self.root / ".bimri" / "revisions" / "V000000.md"
+        escaped = revision_path.read_text("utf-8").replace(
+            "<!-- Confirmed facts, decisions, preferences and rules. Capacity: state.json. -->",
+            "<!-- Confirmed facts, decisions, preferences and rules. Cap: 12. -->\n\n"
+            "[R0-E1] [K:upgrade.pointer] [fact] [T:working] "
+            "[SRC:legacy] [] Unsafe inherited pointer -> ../../outside.md",
+        ).replace(
+            "<!-- BIMRI v5.0.1 | Generated view. Do not edit directly. -->",
+            "<!-- BIMRI v5 | Generated view. Do not edit directly. -->",
+        ).replace(
+            "<!-- Current work, risks and next actions. Capacity: state.json. -->",
+            "<!-- Current work, risks and next actions. Cap: 20. -->",
+        ).replace(
+            "<!-- Evidence-backed patterns. Capacity: state.json. -->",
+            "<!-- Evidence-backed patterns. Cap: 8. -->",
+        )
+        revision_path.write_bytes(escaped.encode("utf-8"))
+        (self.root / "bimri.md").write_bytes(escaped.encode("utf-8"))
+        state = self.state()
+        state.update({
+            "bimri_version": "5.0",
+            "tier1_max": 12,
+            "tier2_max": 20,
+            "tier3_max": 8,
+            "entry_max_chars": 500,
+            "hot_max_bytes": 16384,
+            "head_hash": hashlib.sha256(escaped.encode("utf-8")).hexdigest(),
+        })
+        state_bytes = (
+            json.dumps(state, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        state_path.write_bytes(state_bytes)
+
+        result = self.cli("migrate", check=False)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("pointer escapes the BIMRI project", result.stderr)
+        self.assertEqual(state_path.read_bytes(), state_bytes)
+        self.assertEqual(revision_path.read_text("utf-8"), escaped)
+        self.assertEqual((self.root / "bimri.md").read_text("utf-8"), escaped)
+        self.assertFalse(
+            (self.root / ".bimri" / "revisions" / "V000001.md").exists()
+        )
+        self.assertEqual(
+            list((self.root / ".bimri" / "backups").glob("state-v5.0-*.json")),
+            [],
+        )
+
+    def test_v5_0_upgrade_preserves_direct_hot_edit_before_normalizing_view(self):
+        self.cli("migrate")
+        state_path = self.root / ".bimri" / "state.json"
+        revision_path = self.root / ".bimri" / "revisions" / "V000000.md"
+        historical = (
+            revision_path.read_text("utf-8")
+            .replace(
+                "<!-- BIMRI v5.0.1 | Generated view. Do not edit directly. -->",
+                "<!-- BIMRI v5 | Generated view. Do not edit directly. -->",
+            )
+            .replace("Capacity: state.json.", "Cap: 12.", 1)
+            .replace("Capacity: state.json.", "Cap: 20.", 1)
+            .replace("Capacity: state.json.", "Cap: 8.", 1)
+        )
+        revision_path.write_bytes(historical.encode("utf-8"))
+        state = self.state()
+        state.update({
+            "bimri_version": "5.0",
+            "tier1_max": 12,
+            "tier2_max": 20,
+            "tier3_max": 8,
+            "entry_max_chars": 500,
+            "hot_max_bytes": 16384,
+            "head_hash": hashlib.sha256(historical.encode("utf-8")).hexdigest(),
+        })
+        state_path.write_text(
+            json.dumps(state, indent=2, sort_keys=True) + "\n", "utf-8"
+        )
+        direct_edit = (
+            b"Owner-authored direct edit that must survive the v5.0.1 upgrade.\n"
+            b"Second byte-exact line.\n"
+        )
+        (self.root / "bimri.md").write_bytes(direct_edit)
+
+        upgraded = self.cli("migrate")
+
+        self.assertIn("direct edit to bimri.md was preserved", upgraded.stderr)
+        recovery_files = list(
+            (self.root / ".bimri" / "recovery").glob("manual-hot-*.md")
+        )
+        self.assertEqual(len(recovery_files), 1)
+        self.assertEqual(recovery_files[0].read_bytes(), direct_edit)
+        conflicts = list((self.root / ".bimri" / "conflicts").glob("C*.json"))
+        self.assertEqual(len(conflicts), 1)
+        conflict = json.loads(conflicts[0].read_text("utf-8"))
+        self.assertEqual(conflict["type"], "manual-edit")
+        self.assertEqual(
+            conflict["extra"]["recovery_file"],
+            recovery_files[0].relative_to(self.root).as_posix(),
+        )
+        normalized = (self.root / "bimri.md").read_text("utf-8")
+        self.assertIn("BIMRI v5.0.1", normalized)
+        self.assertIn("Capacity: state.json.", normalized)
+        self.assertNotEqual(normalized.encode("utf-8"), direct_edit)
+        self.assertEqual(self.state()["head_revision"], 1)
+
+    def test_v5_0_pending_proposal_remains_consumable_after_upgrade(self):
+        run_id = self.start("upgrade-agent")
+        proposal_id = self.propose(
+            run_id,
+            "upgrade.pending",
+            "This pending v5.0 proposal must survive the upgrade.",
+        )
+        proposal_path = self.root / ".bimri" / "proposals" / f"{proposal_id}.json"
+        proposal = json.loads(proposal_path.read_text("utf-8"))
+        proposal["bimri_version"] = "5.0"
+        proposal_path.write_text(
+            json.dumps(proposal, indent=2, sort_keys=True) + "\n", "utf-8"
+        )
+        state_path = self.root / ".bimri" / "state.json"
+        state = self.state()
+        state.update({
+            "bimri_version": "5.0",
+            "tier1_max": 12,
+            "tier2_max": 20,
+            "tier3_max": 8,
+            "entry_max_chars": 500,
+            "hot_max_bytes": 16384,
+        })
+        state_path.write_text(
+            json.dumps(state, indent=2, sort_keys=True) + "\n", "utf-8"
+        )
+
+        self.cli("sync", "--run", run_id)
+
+        self.assertEqual(self.decision(proposal_id)["outcome"], "accepted")
+        self.assertIn("[K:upgrade.pending]", self.hot())
+        self.assertEqual(self.state()["bimri_version"], "5.0.1")
+        self.assertIn("BIMRI doctor: PASSED", self.cli("doctor").stdout)
+
+    def test_installer_migrates_long_legacy_claim_with_receipt_and_repair_path(self):
+        target = self.root / "legacy target"
+        target.mkdir()
+        long_claim = "Preserve this inherited context exactly: " + ("x" * 700)
+        source = self.legacy_v3_bytes(long_claim)
+        (target / "BIMRI.md").write_bytes(source)
+
+        install = subprocess.run(
+            [sys.executable, str(ENGINE), "install", "--target", str(target)],
+            text=True,
+            capture_output=True,
+            timeout=45,
+        )
+
+        self.assertEqual(install.returncode, 0, install.stdout + install.stderr)
+        self.assertIn(
+            "Memory: migrated BIMRI v3 from BIMRI.md to v5.0.1.",
+            install.stdout,
+        )
+        self.assertIn("Tier 1 1; Tier 2 0; Tier 3 0; total 1", install.stdout)
+        self.assertIn("inherited overlength 1", install.stdout)
+        self.assertIn("Migration record: .bimri/migrations/legacy-to-v5.json", install.stdout)
+        self.assertIn(long_claim, self.hot(root=target))
+        doctor = self.cli("doctor", root=target)
+        self.assertIn("BIMRI doctor: PASSED", doctor.stdout)
+        self.assertIn("inherited legacy text exceeds active entry cap", doctor.stdout)
+
+        run_id = self.start("repair-agent", root=target)
+        oversize = self.cli(
+            "propose",
+            "--run",
+            run_id,
+            "--tier",
+            "2",
+            "--key",
+            "new.too-long",
+            "--text",
+            "y" * 501,
+            root=target,
+            check=False,
+        )
+        self.assertEqual(oversize.returncode, 2)
+        self.assertIn("exceeds 500 characters", oversize.stderr)
+        replacement = self.propose(
+            run_id,
+            "legacy.v3.t1-0001",
+            "Condensed inherited context.",
+            tier=1,
+            source="user",
+            trust="confirmed",
+            extra=("--target", "R0-E1"),
+            root=target,
+        )
+        self.cli("sync", "--run", run_id, root=target)
+        self.assertEqual(
+            self.decision(replacement, root=target)["outcome"], "accepted"
+        )
+        repaired = self.cli("doctor", root=target)
+        self.assertNotIn(
+            "inherited legacy text exceeds active entry cap", repaired.stdout
+        )
+
+        too_large_root = self.root / "serialized-ceiling"
+        too_large_root.mkdir()
+        too_large_source = self.legacy_v3_bytes("z" * 4096)
+        (too_large_root / "BIMRI.md").write_bytes(too_large_source)
+        refused = self.cli("migrate", root=too_large_root, check=False)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("serialized entry exceeds 4096 characters", refused.stderr)
+        self.assertEqual(
+            (too_large_root / "BIMRI.md").read_bytes(), too_large_source
+        )
+        self.assertFalse((too_large_root / ".bimri" / "state.json").exists())
+
+    def test_valid_state_refuses_distinct_unclaimed_legacy_root(self):
+        self.cli("migrate")
+        probe = self.root / "case-probe"
+        probe.write_text("probe", "utf-8")
+        case_insensitive = (self.root / "CASE-PROBE").exists()
+        probe.unlink()
+        if case_insensitive:
+            return
+
+        state_path = self.root / ".bimri" / "state.json"
+        revision_path = self.root / ".bimri" / "revisions" / "V000000.md"
+        state_before = state_path.read_bytes()
+        hot_before = (self.root / "bimri.md").read_bytes()
+        revision_before = revision_path.read_bytes()
+        legacy = self.legacy_v3_bytes("The owner must choose this lineage.")
+        upper = self.root / "BIMRI.md"
+        upper.write_bytes(legacy)
+
+        result = self.cli("doctor", check=False)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unclaimed legacy root file", result.stderr)
+        self.assertEqual(state_path.read_bytes(), state_before)
+        self.assertEqual((self.root / "bimri.md").read_bytes(), hot_before)
+        self.assertEqual(revision_path.read_bytes(), revision_before)
+        self.assertEqual(upper.read_bytes(), legacy)
+
+    def test_v5_0_crash_revision_resumes_with_historical_conversion_bytes(self):
+        claim = "Resume the historical converter without rewriting its revision."
+        source = self.legacy_v3_bytes(claim)
+        (self.root / "BIMRI.md").write_bytes(source)
+        revisions = self.root / ".bimri" / "revisions"
+        revisions.mkdir(parents=True)
+        historical = (
+            "# BIMRI Memory\n\n"
+            "<!-- BIMRI v5 | Generated view. Do not edit directly. -->\n"
+            "<!-- Full history: .bimri/log/ | Revisions: .bimri/revisions/ -->\n\n"
+            "## Tier 1: Core Intelligence\n\n"
+            "<!-- Confirmed facts, decisions, preferences and rules. Cap: 12. -->\n\n"
+            "[R0-E1] [K:legacy.v3.t1-0001] [fact] [T:working] "
+            f"[SRC:legacy] [] {claim}\n\n"
+            "## Tier 2: Active Context\n\n"
+            "<!-- Current work, risks and next actions. Cap: 20. -->\n\n"
+            "## Tier 3: Pattern Recognition\n\n"
+            "<!-- Evidence-backed patterns. Cap: 8. -->\n\n"
+            "<!-- END BIMRI -->\n"
+        ).encode("utf-8")
+        revision = revisions / "V000000.md"
+        revision.write_bytes(historical)
+
+        resumed = self.cli("migrate")
+
+        self.assertEqual(revision.read_bytes(), historical)
+        marker = json.loads(
+            (self.root / ".bimri" / "migrations" / "legacy-to-v5.json").read_text(
+                "utf-8"
+            )
+        )
+        self.assertEqual(marker["converter_version"], "5.0")
+        self.assertIn("Memory: migrated BIMRI v3", resumed.stdout)
+        self.assertIn(
+            "Memory metadata normalized in immutable revision V000001",
+            resumed.stdout,
+        )
+        state = self.state()
+        self.assertEqual(state["bimri_version"], "5.0.1")
+        self.assertEqual(state["head_revision"], 1)
+        normalized = (revisions / "V000001.md").read_bytes()
+        self.assertEqual((self.root / "bimri.md").read_bytes(), normalized)
+        self.assertIn(b"BIMRI v5.0.1", normalized)
+        self.assertIn(b"Capacity: state.json.", normalized)
+        self.assertNotIn(b"Cap: 12", normalized)
+        self.assertEqual(normalized.count(claim.encode("utf-8")), 1)
+        self.assertIn("BIMRI doctor: PASSED", self.cli("doctor").stdout)
+        verified = self.cli("migrate")
+        self.assertIn("no migration performed", verified.stdout)
+        self.assertEqual((revisions / "V000001.md").read_bytes(), normalized)
+        self.assertFalse((revisions / "V000002.md").exists())
+
+        # A completed v5.0 legacy migration must retire sources first, retain
+        # its exact state backup, and then use the normal v5.0 upgrade path.
+        (revisions / "V000001.md").unlink()
+        old_state = self.state()
+        old_state.update({
+            "bimri_version": "5.0",
+            "head_revision": 0,
+            "head_hash": hashlib.sha256(historical).hexdigest(),
+            "tier1_max": 12,
+            "tier2_max": 20,
+            "tier3_max": 8,
+            "entry_max_chars": 500,
+            "hot_max_bytes": 16384,
+        })
+        old_state_bytes = (
+            json.dumps(old_state, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        (self.root / ".bimri" / "state.json").write_bytes(old_state_bytes)
+        (self.root / "bimri.md").write_bytes(historical)
+
+        upgraded = self.cli("migrate")
+
+        self.assertIn("Memory: upgraded v5.0 to v5.0.1", upgraded.stdout)
+        state_backups = list(
+            (self.root / ".bimri" / "backups").glob("state-v5.0-*.json")
+        )
+        self.assertEqual(len(state_backups), 1)
+        self.assertEqual(state_backups[0].read_bytes(), old_state_bytes)
+        self.assertEqual(revision.read_bytes(), historical)
+        self.assertEqual((revisions / "V000001.md").read_bytes(), normalized)
+        self.assertEqual(self.state()["head_revision"], 1)
 
 
 if __name__ == "__main__":

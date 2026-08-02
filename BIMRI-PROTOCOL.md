@@ -1,4 +1,4 @@
-# BIMRI Protocol v5
+# BIMRI Protocol v5.0.1
 
 Brief Interaction Memory and Retrieval Intelligence.
 
@@ -14,11 +14,15 @@ requirements.
 BIMRI stores shared agent memory in a local project folder. It requires Python
 3.8 or newer and the Python standard library. It requires no server, database,
 account, daemon, package installation, or model-specific memory service.
-Commands in this specification show `python3`; implementations MUST use an
-executable that provides Python 3.8 or newer. That is commonly `python3` on
-POSIX systems and `python` on standard Windows installations. Multiline
-examples use POSIX continuation syntax; on Windows, run them on one line or
-adapt them to the active shell.
+Commands in this specification show `<verified-python>`. It means an absolute
+Python 3.8+ executable established on the current machine by executing a
+sentinel that prints its resolved `sys.executable`. Candidate discovery MUST
+reject non-zero exit, a version below 3.8, a missing or non-absolute executable,
+unexpected output, and zero output even when the process reports success. The
+resolved executable MUST pass the same sentinel when invoked directly and MUST
+then be reused exactly. [`INSTALL.md`](INSTALL.md) defines the reference
+discovery procedure. Multiline examples use POSIX continuation syntax; on
+Windows, run them on one line or adapt them to the active shell.
 
 v5 supports concurrent processes and agents only when all of them access the
 same folder through one shared operating-system/filesystem lock domain. Every
@@ -126,17 +130,22 @@ detectable.
 ## Tier 3: Pattern Recognition
 ```
 
-Each entry occupies exactly one line. Text is single-line UTF-8 and defaults
-to a maximum of 500 characters. The entire generated view defaults to 16,384
-bytes. The byte cap is independent of the tier line caps and is the primary
-bound on the complete rendered view. Metadata, tags, pointers, and text all
-consume that budget, so the byte cap may bind before any tier reaches its line
-cap. Tier 1 and Tier 2 entries may carry at most 12 unique normalized tags.
+Each entry occupies exactly one line. New or edited text is single-line UTF-8
+and defaults to a maximum of 500 characters. Migration MAY preserve longer
+inherited v1-v4 text without truncation when its complete serialized entry,
+including metadata, is at most 4,096 characters; Section 14 defines the
+required overflow behavior. The entire generated view defaults to 49,152
+bytes, roughly 12,000 tokens for ordinary English text. Bytes are normative
+because tokenization and UTF-8 width vary. The byte cap is independent of the
+tier line caps and is the primary bound on the complete rendered view.
+Metadata, tags, pointers, and text all consume that budget, so the byte cap may
+bind before any tier reaches its line cap. Tier 1 and Tier 2 entries may carry
+at most 12 unique normalized tags.
 
 ### 5.1 Tier 1
 
 Tier 1 contains durable facts, decisions, preferences, and operating rules.
-Its default cap is 12.
+Its default cap is 20, with an elastic curation target of roughly 3,000 tokens.
 
 ```text
 [R000042-E003] [K:project.goal] [decision] [T:confirmed] [SRC:user] [strategy] Ship a portable local memory layer. -> .bimri/log/R000042.md
@@ -153,7 +162,7 @@ Normative field order:
 ### 5.2 Tier 2
 
 Tier 2 contains active work, risks, watches, and next actions. Its default cap
-is 20.
+is 40, with an elastic curation target of roughly 6,000 tokens.
 
 ```text
 [R000044-E001] [K:checkout.next-step] [I:3] [active] [T:working] [SRC:agent] [F:R000044] [L:R000044] [checkout] Verify retry behavior. -> .bimri/log/R000044.md
@@ -170,7 +179,8 @@ subject. `L` records the most recent run that touched it.
 
 ### 5.3 Tier 3
 
-Tier 3 contains evidence-backed, falsifiable patterns. Its default cap is 8.
+Tier 3 contains evidence-backed, falsifiable patterns. Its default cap is 12,
+with an elastic curation target of roughly 3,000 tokens.
 
 ```text
 [P0004] [K:workflow.arch-first] [developing] [obs:4] [ev:R000004-E002,R000009-E001] The owner simplifies architecture before adding features. | Falsify: repeated preference for feature speed over structure.
@@ -220,7 +230,7 @@ the human to approve the same statement a second time.
 An agent requests an isolated run:
 
 ```text
-python3 bimri-engine.py start --actor <lowercase-agent-slug>
+<verified-python> bimri-engine.py start --actor <lowercase-agent-slug>
 ```
 
 Under the engine lock, `start` MUST:
@@ -251,7 +261,7 @@ Durable reasoning, decisions, milestones, risks, and evidence SHOULD be written
 as they occur:
 
 ```text
-python3 bimri-engine.py journal --run R000042 --importance 3 \
+<verified-python> bimri-engine.py journal --run R000042 --importance 3 \
   --text "Full durable detail."
 ```
 
@@ -270,7 +280,7 @@ headline.
 Shared state changes MUST be submitted as proposals:
 
 ```text
-python3 bimri-engine.py propose --run R000042 --operation set --tier 2 \
+<verified-python> bimri-engine.py propose --run R000042 --operation set --tier 2 \
   --key checkout.next-step --importance 3 --status active \
   --trust working --source agent --tags checkout \
   --text "Verify retry behavior."
@@ -305,14 +315,14 @@ engine cannot determine from structure alone.
 `sync` processes a run's unprocessed proposals while keeping the run open:
 
 ```text
-python3 bimri-engine.py sync --run R000042
+<verified-python> bimri-engine.py sync --run R000042
 ```
 
 `close` records the outcome, processes the run's proposals, and removes only
 that run from `active_runs`:
 
 ```text
-python3 bimri-engine.py close --run R000042 --outcome success \
+<verified-python> bimri-engine.py close --run R000042 --outcome success \
   --summary "Retry behavior verified."
 ```
 
@@ -330,7 +340,7 @@ An orphaned active run remains owned by its original agent until the human
 owner explicitly authorizes recovery. An agent records that authorization with:
 
 ```text
-python3 bimri-engine.py recover-run --run R000042 \
+<verified-python> bimri-engine.py recover-run --run R000042 \
   --summary "Owner confirmed this orphaned run should close."
 ```
 
@@ -425,9 +435,9 @@ value, proposal IDs, and a human-readable question. The agent asks the human
 and records one of:
 
 ```text
-python3 bimri-engine.py resolve C000007 --choose R000042-Q002
-python3 bimri-engine.py resolve C000007 --choose current
-python3 bimri-engine.py resolve C000007 --choose dismiss
+<verified-python> bimri-engine.py resolve C000007 --choose R000042-Q002
+<verified-python> bimri-engine.py resolve C000007 --choose current
+<verified-python> bimri-engine.py resolve C000007 --choose dismiss
 ```
 
 Choosing a proposal applies it under the lock as a human decision and records
@@ -473,11 +483,12 @@ Default limits are:
 
 | Limit | Value |
 | --- | ---: |
-| Tier 1 lines | 12 |
-| Tier 2 lines | 20 |
-| Tier 3 lines | 8 |
+| Tier 1 lines | 20 |
+| Tier 2 lines | 40 |
+| Tier 3 lines | 12 |
 | Entry text | 500 characters |
-| Generated view | 16,384 bytes |
+| Inherited v1-v4 serialized entry | 4,096 characters |
+| Generated view | 49,152 bytes |
 
 The accepted head MUST satisfy the active tier caps and byte limit. A proposal
 that would violate them becomes a human-visible conflict. A migrated legacy
@@ -485,10 +496,17 @@ head that already exceeds a limit MAY temporarily retain inherited overflow;
 the engine permits only changes that strictly reduce at least one overflow
 without worsening another until the head is within all limits.
 
-The 16,384-byte generated-view cap is enforced independently and may bind
+The 49,152-byte generated-view cap is enforced independently and may bind
 before the line caps. Tier line caps are maximum counts, not a promise that
 every tier can simultaneously hold its maximum number of maximum-length
 entries.
+
+The target allocation is roughly 3,000 tokens for Tier 1, 6,000 for Tier 2,
+and 3,000 for Tier 3. These targets guide curation and are not hard byte
+partitions. Unused capacity MAY serve another tier while the total byte cap,
+line caps, and entry grammar remain satisfied. Evidence and history outside
+the generated view remain durable in logs, revisions, decisions, resolutions,
+archives, and backups.
 
 `maintain` computes cadence-aware freshness for Tier 2 and reports entries that
 need judgment. It does not silently decide their meaning. Closed entries leave
@@ -516,7 +534,7 @@ archive. Because the index is derived, corruption or deletion of the index is
 repaired with:
 
 ```text
-python3 bimri-engine.py index
+<verified-python> bimri-engine.py index
 ```
 
 The index MUST NOT be used as authority for commit, conflict, trust, archive,
@@ -528,7 +546,7 @@ but does not change accepted memory.
 `doctor` and `validate` are aliases:
 
 ```text
-python3 bimri-engine.py doctor
+<verified-python> bimri-engine.py doctor
 ```
 
 Validation covers strict state parsing, revision grammar, the head hash,
@@ -552,12 +570,29 @@ changes; operating-system permissions define the security boundary.
 An installing agent runs:
 
 ```text
-python3 bimri-engine.py install --target /absolute/project/path
+<verified-python> bimri-engine.py install --target /absolute/project/path
 ```
 
 The installer copies the core files, merges a marked BIMRI block into existing
 `AGENTS.md` and `CLAUDE.md`, initializes or migrates memory, rebuilds the index,
 and runs the self-check. It SHOULD complete without asking setup questions.
+Before its first target mutation, the reference installer MUST re-launch
+itself through its resolved absolute `sys.executable` with a fresh private
+sentinel, enforce a bounded timeout, and validate the exact non-empty response.
+It MUST stop if that executable is older than Python 3.8, missing, redirected
+to a non-file, silent, or unable to execute the installed engine. The verified
+absolute executable MUST be printed in the installation result. The reference
+installer MUST write `.bimri/runtime.local.json` with the verified runtime argv
+prefix and `.bimri/hooks.claude.local.json` with the rendered Claude hook
+source. The portable instruction and hook templates MUST remain free of
+machine-specific absolute paths.
+
+The two `.local.json` files are host-bound adapter artifacts, not canonical
+state, and MUST NOT be treated as memory authority. They MUST remain
+uncommitted and MUST be regenerated after the folder moves to another host or
+Python changes. Their absolute paths MUST NOT be copied into shared
+instructions or configuration.
+
 For an existing v5 target, every installer mutation MUST be serialized by the
 same engine lock used by runtime commands. Before upgrading v1-v4, every old
 writer and command MUST stop because the v5 installer cannot assume that an
@@ -571,20 +606,50 @@ Before mutation, the installer MUST preserve existing target files in
 the touched paths to their pre-install state and report that exact backup
 directory in the error.
 
-Claude Code MAY use `hook-start` and `hook-close` from
-`hooks-example.json`. A hook session ID maps to one run, so the close hook
-closes only its own session. Hooks are adapters; they do not change the memory
-format. The Claude adapter is optional. Any local agent that follows the
-universal instructions and uses the engine MAY share the same memory within
-the lock-domain boundary.
+When memory is migrated, the successful installation output MUST include an
+explicit receipt: detected source version and file, imported tier counts,
+converted-pattern count, byte-exact backup location, migration-record path,
+and validation result. The installing agent MUST treat missing expected output
+or zero output as failure rather than inferring success from process status.
 
-## 14. Legacy Compatibility
+Claude Code MAY use `hook-start` and `hook-close` from the rendered
+`.bimri/hooks.claude.local.json`. The installer does not mutate Claude's
+settings. An installing agent that enables hooks MUST merge only the BIMRI
+entries into machine-local `.claude/settings.local.json`, preserve unrelated
+settings and hooks, and replace prior BIMRI entries instead of duplicating
+them. It MUST inspect the merged hooks, invoke start and close with one
+synthetic session ID, require their expected non-empty output, confirm that run
+closed, and run `doctor`. Shared `.claude/settings.json` MUST NOT contain the
+machine-specific absolute interpreter.
+
+A hook session ID maps to one run, so the close hook closes only its own
+session. Hooks are adapters; they do not change the memory format. The Claude
+adapter is optional. Any local agent that follows the universal instructions
+and uses the engine MAY share the same memory within the lock-domain boundary.
+After moving the folder to a different host or replacing Python, an agent MUST
+repeat discovery and rerun either the self-contained installed engine against
+its own folder or a clean BIMRI source with the new verified executable. It
+MUST then replace the machine-local BIMRI hook entries from the newly rendered
+template and repeat the smoke test before normal use.
+
+## 14. Earlier-Version Compatibility
 
 The reference engine directly migrates recognized v1-v4 sources as
 defined in [`MIGRATION.md`](MIGRATION.md). Every migration MUST select its
 source deterministically, preserve exact source and rolling-backup bytes where
 present, record their paths and cryptographic hashes, and stop before replacing
 legacy memory when source selection or parsing is ambiguous.
+
+Migration MUST preserve inherited claim text above 500 characters without
+truncation when the complete converted entry, including v5 metadata, fits the
+4,096-character serialized-entry ceiling, and MUST report it as inherited
+overflow. New proposals and edits remain limited to 500 text characters. An
+entry that cannot fit losslessly within the serialized ceiling MUST stop
+migration before canonical state changes. Until inherited overflow is
+compressed or archived through an accepted change, the engine MUST allow only
+changes that reduce an overflow without worsening another active limit.
+Structured v5 state coexisting with an unclaimed legacy hot-memory candidate
+MUST stop for human resolution rather than silently ignoring or merging it.
 
 ### 14.1 v1-v3
 
@@ -617,4 +682,18 @@ The migration lock serializes v5 commands in the same lock domain; it does not
 make any live legacy process safe. A v1-v4 folder MUST be quiescent before
 installation or migration begins and remain so through validation.
 
-<!-- END BIMRI PROTOCOL v5 -->
+### 14.3 v5.0
+
+A v5.0 state MUST be validated and backed up before its version changes to
+v5.0.1. When its complete limit profile exactly equals the stock v5.0 profile,
+the implementation SHOULD adopt the v5.0.1 defaults. If any limit differs, the
+complete custom profile MUST be preserved. The upgrade receipt MUST state
+whether defaults expanded and record the old profile, active profile, and
+backup path. Historical fixed-cap view metadata MUST NOT remain the active
+description after expansion: the implementation MUST preserve the old
+revision, create or exactly reuse a metadata-only next revision, leave entry
+lines unchanged, and avoid worsening any existing overflow under a preserved
+custom profile. Unknown generated-view bytes MUST pass through the normal
+manual-edit recovery and human-conflict path before that view is refreshed.
+
+<!-- END BIMRI PROTOCOL v5.0.1 -->

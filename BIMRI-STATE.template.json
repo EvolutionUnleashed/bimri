@@ -1,5 +1,5 @@
 {
-  "bimri_version": "5.0",
+  "bimri_version": "5.0.1",
   "project_id": "unset",
   "cadence_class": "interactive",
   "run_count": 0,
@@ -13,10 +13,10 @@
   "last_started_at": null,
   "last_closed_at": null,
   "prune_policy": "archive_only",
-  "tier1_max": 12,
-  "tier2_max": 20,
-  "tier3_max": 8,
+  "tier1_max": 20,
+  "tier2_max": 40,
+  "tier3_max": 12,
   "entry_max_chars": 500,
-  "hot_max_bytes": 16384,
+  "hot_max_bytes": 49152,
   "flag_threshold": 0.5
 }

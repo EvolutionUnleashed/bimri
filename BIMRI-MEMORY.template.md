@@ -1,18 +1,18 @@
 # BIMRI Memory
 
-<!-- BIMRI v5 | Generated view. Do not edit directly. -->
+<!-- BIMRI v5.0.1 | Generated view. Do not edit directly. -->
 <!-- Full history: .bimri/log/ | Revisions: .bimri/revisions/ -->
 
 ## Tier 1: Core Intelligence
 
-<!-- Confirmed facts, decisions, preferences and rules. Cap: 12. -->
+<!-- Confirmed facts, decisions, preferences and rules. Capacity: state.json. -->
 
 ## Tier 2: Active Context
 
-<!-- Current work, risks and next actions. Cap: 20. -->
+<!-- Current work, risks and next actions. Capacity: state.json. -->
 
 ## Tier 3: Pattern Recognition
 
-<!-- Evidence-backed patterns. Cap: 8. -->
+<!-- Evidence-backed patterns. Capacity: state.json. -->
 
 <!-- END BIMRI -->

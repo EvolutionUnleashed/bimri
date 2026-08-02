@@ -33,11 +33,12 @@ import os
 import random
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 try:  # pragma: no cover - platform-specific import
     import fcntl
@@ -50,7 +51,9 @@ except ImportError:  # pragma: no cover
     msvcrt = None
 
 
-VERSION = "5.0"
+VERSION = "5.0.1"
+PREVIOUS_V5_VERSION = "5.0"
+COMPATIBLE_ARTIFACT_VERSIONS = {PREVIOUS_V5_VERSION, VERSION}
 RUN_RE = re.compile(r"^R\d{6}$")
 ENTRY_RE = re.compile(r"^R\d{6}-E\d{3}$")
 LEGACY_ENTRY_RE = re.compile(r"^R\d+-E\d+$")
@@ -111,40 +114,21 @@ CONFLICT_TYPES = {
 MAX_PATTERN_EVIDENCE = 24
 MAX_SERIALIZED_ENTRY_CHARS = 4096
 
-DEFAULT_STATE = {
-    "bimri_version": VERSION,
-    "project_id": "unset",
-    "cadence_class": "interactive",
-    "run_count": 0,
-    "conflict_count": 0,
-    "pattern_count": 0,
-    "head_revision": 0,
-    "head_hash": None,
-    "active_runs": {},
-    "session_runs": {},
-    "run_dates": {},
-    "last_started_at": None,
-    "last_closed_at": None,
-    "prune_policy": "archive_only",
+LIMIT_FIELDS = (
+    "tier1_max",
+    "tier2_max",
+    "tier3_max",
+    "entry_max_chars",
+    "hot_max_bytes",
+)
+V5_0_DEFAULT_LIMITS = {
     "tier1_max": 12,
     "tier2_max": 20,
     "tier3_max": 8,
     "entry_max_chars": 500,
     "hot_max_bytes": 16384,
-    "flag_threshold": 0.5,
 }
-
-DECAY_DAYS = [
-    (1, 1.0), (3, 0.8), (5, 0.5), (10, 0.35),
-    (15, 0.2), (20, 0.15), (10**9, 0.1),
-]
-DECAY_RUNS = {
-    "interactive": [(1, 1.0), (3, 0.8), (5, 0.5), (10, 0.35), (10**9, 0.2)],
-    "daily_cron": [(2, 1.0), (6, 0.8), (12, 0.5), (24, 0.35), (10**9, 0.2)],
-    "hourly_cron": [(24, 1.0), (72, 0.8), (168, 0.5), (336, 0.35), (10**9, 0.2)],
-}
-
-HOT_TEMPLATE = """# BIMRI Memory
+V5_0_HOT_TEMPLATE = """# BIMRI Memory
 
 <!-- BIMRI v5 | Generated view. Do not edit directly. -->
 <!-- Full history: .bimri/log/ | Revisions: .bimri/revisions/ -->
@@ -160,6 +144,59 @@ HOT_TEMPLATE = """# BIMRI Memory
 ## Tier 3: Pattern Recognition
 
 <!-- Evidence-backed patterns. Cap: 8. -->
+
+<!-- END BIMRI -->
+"""
+
+DEFAULT_STATE = {
+    "bimri_version": VERSION,
+    "project_id": "unset",
+    "cadence_class": "interactive",
+    "run_count": 0,
+    "conflict_count": 0,
+    "pattern_count": 0,
+    "head_revision": 0,
+    "head_hash": None,
+    "active_runs": {},
+    "session_runs": {},
+    "run_dates": {},
+    "last_started_at": None,
+    "last_closed_at": None,
+    "prune_policy": "archive_only",
+    "tier1_max": 20,
+    "tier2_max": 40,
+    "tier3_max": 12,
+    "entry_max_chars": 500,
+    "hot_max_bytes": 49152,
+    "flag_threshold": 0.5,
+}
+
+DECAY_DAYS = [
+    (1, 1.0), (3, 0.8), (5, 0.5), (10, 0.35),
+    (15, 0.2), (20, 0.15), (10**9, 0.1),
+]
+DECAY_RUNS = {
+    "interactive": [(1, 1.0), (3, 0.8), (5, 0.5), (10, 0.35), (10**9, 0.2)],
+    "daily_cron": [(2, 1.0), (6, 0.8), (12, 0.5), (24, 0.35), (10**9, 0.2)],
+    "hourly_cron": [(24, 1.0), (72, 0.8), (168, 0.5), (336, 0.35), (10**9, 0.2)],
+}
+
+HOT_TEMPLATE = """# BIMRI Memory
+
+<!-- BIMRI v5.0.1 | Generated view. Do not edit directly. -->
+<!-- Full history: .bimri/log/ | Revisions: .bimri/revisions/ -->
+
+## Tier 1: Core Intelligence
+
+<!-- Confirmed facts, decisions, preferences and rules. Capacity: state.json. -->
+
+## Tier 2: Active Context
+
+<!-- Current work, risks and next actions. Capacity: state.json. -->
+
+## Tier 3: Pattern Recognition
+
+<!-- Evidence-backed patterns. Capacity: state.json. -->
 
 <!-- END BIMRI -->
 """
@@ -220,6 +257,10 @@ class BimriError(RuntimeError):
 class Paths:
     def __init__(self, root):
         self.root = Path(root).resolve()
+        # Per-invocation facts for callers such as the installer. This is
+        # deliberately ephemeral so an old migration is never reported as if
+        # it happened during the current command.
+        self.migration_receipt = None
         self.bdir = self.root / ".bimri"
         self.hot = self.root / "bimri.md"
         self.state = self.bdir / "state.json"
@@ -588,7 +629,22 @@ def read_json_strict(path, label):
     return data
 
 
-def validate_state(state):
+def limits_profile(state):
+    return {key: state[key] for key in LIMIT_FIELDS}
+
+
+def record_migration_receipt(paths, action, source_version=None, **details):
+    receipt = {
+        "action": action,
+        "source_version": source_version,
+        "target_version": VERSION,
+    }
+    receipt.update(details)
+    paths.migration_receipt = receipt
+    return receipt
+
+
+def validate_state(state, accepted_versions=None):
     required_ints = (
         "run_count", "conflict_count", "pattern_count", "head_revision",
         "tier1_max", "tier2_max", "tier3_max",
@@ -604,7 +660,8 @@ def validate_state(state):
     for key in ("run_count", "conflict_count", "head_revision"):
         if state[key] > 999999:
             raise BimriError(f"state field {key} exceeds its six-digit ID space.")
-    if state.get("bimri_version") != VERSION:
+    accepted_versions = accepted_versions or {VERSION}
+    if state.get("bimri_version") not in accepted_versions:
         raise BimriError(f"unsupported BIMRI state version: {state.get('bimri_version')}")
     if state.get("legacy_migration") not in (None, "legacy-to-v5"):
         raise BimriError("state legacy_migration has an unsupported value.")
@@ -700,7 +757,9 @@ def _legacy_claim_text(line, label):
             f"{label} contains the reserved v5 pointer delimiter ' -> '; "
             "rewrite that claim explicitly before migration."
         )
-    return clean_scalar(stripped, label, 500)
+    # Preserve inherited claims above the v5 authoring cap. The converted
+    # serialized entry remains subject to MAX_SERIALIZED_ENTRY_CHARS.
+    return clean_scalar(stripped, label, MAX_SERIALIZED_ENTRY_CHARS)
 
 
 def _legacy_tags(value, label):
@@ -1004,7 +1063,30 @@ def _legacy_key(version, source_id, ordinal):
     return clean_key(key)
 
 
-def convert_legacy_hot(plan):
+def legacy_import_summary(parsed):
+    claims = parsed["claims"]
+    return {
+        "claims_imported": len(claims),
+        "tier1_imported": sum(
+            claim["source_tier"] == 1 for claim in claims
+        ),
+        "tier2_imported": sum(
+            claim["source_tier"] in {2, 3} for claim in claims
+        ),
+        "patterns_converted_to_watches": sum(
+            claim["source_tier"] == 3 for claim in claims
+        ),
+        "inherited_overlength_claims": sum(
+            len(claim["text"]) > DEFAULT_STATE["entry_max_chars"]
+            for claim in claims
+        ),
+        "longest_claim_chars": max(
+            (len(claim["text"]) for claim in claims), default=0
+        ),
+    }
+
+
+def convert_legacy_hot(plan, template=None, historical_spacing=False):
     parsed = plan["parsed"]
     tier1_lines = []
     tier2_lines = []
@@ -1041,14 +1123,14 @@ def convert_legacy_hot(plan):
             "target_tier": target_tier,
             "source_text_sha256": sha256_text(claim["text"]),
         })
-    content = HOT_TEMPLATE
-    if tier1_lines:
-        needle = "<!-- Confirmed facts, decisions, preferences and rules. Cap: 12. -->"
-        content = content.replace(needle, needle + "\n\n" + "\n".join(tier1_lines))
-    if tier2_lines:
-        needle = "<!-- Current work, risks and next actions. Cap: 20. -->"
-        content = content.replace(needle, needle + "\n\n" + "\n".join(tier2_lines))
-    return content, id_map
+    lines = (template or HOT_TEMPLATE).splitlines()
+    insert_lines_in_tier(
+        lines, 1, tier1_lines, leading_blank=historical_spacing
+    )
+    insert_lines_in_tier(
+        lines, 2, tier2_lines, leading_blank=historical_spacing
+    )
+    return render_content(lines), id_map
 
 
 def _legacy_backup_destination(paths, asset):
@@ -1158,6 +1240,7 @@ def _validate_legacy_marker(paths, marker, state=None):
             )
         validated_assets.append({
             "role": asset["role"],
+            "source_path": source_path,
             "sha256": digest,
             "parsed": parsed,
         })
@@ -1197,10 +1280,33 @@ def _validate_legacy_marker(paths, marker, state=None):
             raise BimriError("legacy migration marker contains an invalid ID mapping.") from exc
         seen_target_ids.add(target_id)
         seen_target_keys.add(target_key)
-    expected_revision, expected_id_map = convert_legacy_hot({
-        "parsed": authoritative["parsed"],
-    })
-    if revision_bytes != expected_revision.encode("utf-8"):
+    conversion_version = marker.get("converter_version")
+    if conversion_version not in {None, PREVIOUS_V5_VERSION, VERSION}:
+        raise BimriError(
+            "legacy migration marker has an unsupported converter version."
+        )
+    templates = {
+        PREVIOUS_V5_VERSION: V5_0_HOT_TEMPLATE,
+        VERSION: HOT_TEMPLATE,
+    }
+    candidate_versions = (
+        (PREVIOUS_V5_VERSION, VERSION)
+        if conversion_version is None
+        else (conversion_version,)
+    )
+    expected_id_map = None
+    matching_conversion = None
+    for candidate_version in candidate_versions:
+        expected_revision, candidate_id_map = convert_legacy_hot(
+            {"parsed": authoritative["parsed"]},
+            template=templates[candidate_version],
+            historical_spacing=(candidate_version == PREVIOUS_V5_VERSION),
+        )
+        expected_id_map = candidate_id_map
+        if revision_bytes == expected_revision.encode("utf-8"):
+            matching_conversion = candidate_version
+            break
+    if matching_conversion is None:
         raise BimriError(
             "legacy migration revision is not the deterministic conversion of "
             "its preserved active source."
@@ -1209,6 +1315,22 @@ def _validate_legacy_marker(paths, marker, state=None):
         raise BimriError(
             "legacy migration ID map is not the deterministic source-to-v5 mapping."
         )
+    receipt = marker.get("receipt")
+    if receipt is not None:
+        expected_receipt = legacy_import_summary(authoritative["parsed"])
+        if not isinstance(receipt, dict):
+            raise BimriError("legacy migration receipt must be an object.")
+        active_sources = {
+            asset["source_path"] for asset in validated_assets
+            if asset["role"] == "active memory"
+        }
+        if receipt.get("source_file") not in active_sources:
+            raise BimriError("legacy migration receipt source file is invalid.")
+        if receipt.get("source_version") != authoritative["parsed"]["version"]:
+            raise BimriError("legacy migration receipt source version is invalid.")
+        for key, value in expected_receipt.items():
+            if receipt.get(key) != value:
+                raise BimriError("legacy migration receipt counts are invalid.")
     if state is not None and state.get("legacy_migration") != "legacy-to-v5":
         raise BimriError("v5 state does not claim its legacy migration authority.")
     if state is not None and state.get("head_revision") == 0:
@@ -1353,7 +1475,20 @@ def finalize_legacy_migration(paths, state):
 
 def migrate_legacy(paths, plan):
     converted, id_map = convert_legacy_hot(plan)
+    conversion_version = VERSION
     _validate_legacy_runtime_namespace(paths, plan)
+    revision = revision_path(paths, 0)
+    if revision.exists() and not revision.is_symlink():
+        existing_revision = revision.read_bytes()
+        if existing_revision != converted.encode("utf-8"):
+            old_converted, old_id_map = convert_legacy_hot(
+                plan,
+                template=V5_0_HOT_TEMPLATE,
+                historical_spacing=True,
+            )
+            if existing_revision == old_converted.encode("utf-8"):
+                converted, id_map = old_converted, old_id_map
+                conversion_version = PREVIOUS_V5_VERSION
     state = fresh_state()
     state["run_count"] = plan["parsed"]["sessions"]
     _, _, errors, _ = validate_hot_content(
@@ -1375,7 +1510,6 @@ def migrate_legacy(paths, plan):
             "backup_path": destination.relative_to(paths.root).as_posix(),
         })
     revision_bytes = converted.encode("utf-8")
-    revision = revision_path(paths, 0)
     if revision.exists():
         if revision.is_symlink() or revision.read_bytes() != revision_bytes:
             raise BimriError(
@@ -1403,6 +1537,12 @@ def migrate_legacy(paths, plan):
                 )
     else:
         marker = dict(marker_core)
+        marker["converter_version"] = conversion_version
+        marker["receipt"] = {
+            "source_file": plan["primary"]["relative"],
+            "source_version": plan["parsed"]["version"],
+            **legacy_import_summary(plan["parsed"]),
+        }
         marker["completed_at"] = now_iso()
         atomic_write_json(marker_path, marker)
     # A crash retry may arrive with durable marker/revision artifacts but no
@@ -1412,7 +1552,19 @@ def migrate_legacy(paths, plan):
     state["head_hash"] = revision_hash
     state["legacy_migration"] = "legacy-to-v5"
     save_state(paths, state)
-    _retire_legacy_sources(paths, marker, revision_bytes)
+    finalize_legacy_migration(paths, state)
+    metadata_revision = finalize_current_v5_metadata(paths, state)
+    summary = legacy_import_summary(plan["parsed"])
+    record_migration_receipt(
+        paths,
+        "migrated",
+        source_version=str(plan["parsed"]["version"]),
+        source_file=plan["primary"]["relative"],
+        imported=summary,
+        backups=[asset["backup_path"] for asset in assets],
+        limits=limits_profile(state),
+        metadata_revision=metadata_revision,
+    )
     return state
 
 
@@ -1448,17 +1600,23 @@ def initialize_v5(paths):
     state["head_hash"] = sha256_text(content)
     save_state(paths, state)
     atomic_write_text(paths.hot, content)
+    record_migration_receipt(
+        paths, "initialized", limits=limits_profile(state)
+    )
     return state
 
 
-def convert_v4_hot(content):
+def convert_v4_hot(content, generated_header=None):
     output = []
     tier = 0
+    generated_header = generated_header or (
+        "<!-- BIMRI v5.0.1 | Generated view. Do not edit directly. -->"
+    )
     for line in content.splitlines():
         stripped = line.strip()
         low = stripped.lower()
         if stripped.startswith("<!-- BIMRI v4"):
-            line = "<!-- BIMRI v5 | Generated view. Do not edit directly. -->"
+            line = generated_header
         elif stripped.startswith("<!-- Engine:"):
             line = (
                 "<!-- Full history: .bimri/log/ | "
@@ -1507,40 +1665,183 @@ def convert_v4_hot(content):
     return "\n".join(output) + "\n"
 
 
+def _v4_marker_backup(paths, marker, field, required):
+    value = marker.get(field)
+    if value is None:
+        if required:
+            raise BimriError(f"v4 migration marker is missing {field}.")
+        return None, None
+    if not isinstance(value, str) or not value:
+        raise BimriError(f"v4 migration marker has an invalid {field} path.")
+    portable = PurePosixPath(value.replace("\\", "/"))
+    if (
+        portable.is_absolute()
+        or len(portable.parts) != 3
+        or portable.parts[:2] != (".bimri", "backups")
+        or portable.parts[2] in {"", ".", ".."}
+    ):
+        raise BimriError(
+            f"v4 migration marker {field} must name a direct .bimri/backups file."
+        )
+    candidate = paths.root.joinpath(*portable.parts)
+    if candidate.is_symlink() or not candidate.is_file():
+        raise BimriError(f"v4 migration {field} is missing or unsafe: {value}")
+    try:
+        resolved = candidate.resolve(strict=True)
+        backup_root = paths.backups.resolve(strict=True)
+        content = candidate.read_bytes()
+    except OSError as exc:
+        raise BimriError(f"v4 migration {field} is unreadable: {exc}") from exc
+    if resolved.parent != backup_root:
+        raise BimriError(f"v4 migration {field} escaped .bimri/backups.")
+    return candidate, content
+
+
+def _validate_v4_marker(paths, marker, original_hot_bytes):
+    if marker.get("migration") != "v4-to-v5":
+        raise BimriError("v4 migration marker has an invalid migration type.")
+    try:
+        parse_timestamp(marker.get("completed_at"), "v4 migration completion time")
+    except BimriError as exc:
+        raise BimriError(f"v4 migration marker has an invalid completion time: {exc}") from exc
+    source_hot_hash = str(marker.get("source_hot_hash", ""))
+    if (
+        not HASH_RE.fullmatch(source_hot_hash)
+        or source_hot_hash != sha256_bytes(original_hot_bytes)
+    ):
+        raise BimriError(
+            "v4 migration marker source hash does not match the current v4 memory."
+        )
+    backup_hot, backup_hot_bytes = _v4_marker_backup(
+        paths, marker, "backup_hot", required=True
+    )
+    if backup_hot_bytes != original_hot_bytes:
+        raise BimriError(
+            "v4 migration hot backup does not match the current v4 memory."
+        )
+    recorded_hot_backup_hash = marker.get("backup_hot_sha256")
+    if recorded_hot_backup_hash is not None and (
+        not isinstance(recorded_hot_backup_hash, str)
+        or recorded_hot_backup_hash != sha256_bytes(backup_hot_bytes)
+    ):
+        raise BimriError("v4 migration marker hot-backup hash is invalid.")
+
+    state_exists = paths.state.exists() or paths.state.is_symlink()
+    backup_state, backup_state_bytes = _v4_marker_backup(
+        paths, marker, "backup_state", required=state_exists
+    )
+    if state_exists:
+        if paths.state.is_symlink() or not paths.state.is_file():
+            raise BimriError("v4 state is missing or unsafe during migration resume.")
+        current_state_bytes = paths.state.read_bytes()
+        if backup_state_bytes != current_state_bytes:
+            raise BimriError(
+                "v4 migration state backup does not match the current v4 state."
+            )
+        source_state_hash = marker.get("source_state_hash")
+        if source_state_hash is not None and (
+            not isinstance(source_state_hash, str)
+            or source_state_hash != sha256_bytes(current_state_bytes)
+        ):
+            raise BimriError("v4 migration marker source-state hash is invalid.")
+        backup_state_hash = marker.get("backup_state_sha256")
+        if backup_state_hash is not None and (
+            not isinstance(backup_state_hash, str)
+            or backup_state_hash != sha256_bytes(backup_state_bytes)
+        ):
+            raise BimriError("v4 migration marker state-backup hash is invalid.")
+    elif marker.get("backup_state") is not None:
+        raise BimriError(
+            "v4 migration marker claims a state backup but no v4 state exists."
+        )
+    return backup_state, backup_hot
+
+
+def _verify_v4_sources_unchanged(paths, hot_bytes, state_bytes):
+    if paths.hot.is_symlink() or not paths.hot.is_file():
+        raise BimriError("v4 bimri.md became missing or unsafe during migration.")
+    if paths.hot.read_bytes() != hot_bytes:
+        raise BimriError(
+            "v4 bimri.md changed while migration was preparing; retry when quiescent."
+        )
+    if state_bytes is None:
+        if paths.state.exists() or paths.state.is_symlink():
+            raise BimriError(
+                "v4 state appeared while migration was preparing; retry when quiescent."
+            )
+        return
+    if paths.state.is_symlink() or not paths.state.is_file():
+        raise BimriError("v4 state became missing or unsafe during migration.")
+    if paths.state.read_bytes() != state_bytes:
+        raise BimriError(
+            "v4 state changed while migration was preparing; retry when quiescent."
+        )
+
+
 def migrate_v4(paths, old_state):
     if not paths.hot.exists():
         raise BimriError(
             "v4 state exists but bimri.md is missing. BIMRI stopped without "
             "creating replacement memory; restore the file from backup first."
         )
+    if paths.hot.is_symlink() or not paths.hot.is_file():
+        raise BimriError("v4 bimri.md must be a regular non-symbolic file.")
     marker = paths.migrations / "v4-to-v5.json"
     marker_data = read_json_strict(marker, marker.name) if marker.exists() else None
-    backup_state = (
-        paths.root / marker_data["backup_state"]
-        if marker_data and marker_data.get("backup_state")
-        else backup_file(paths, paths.state, "state-v4.json")
-    )
-    backup_hot = (
-        paths.root / marker_data["backup_hot"]
-        if marker_data and marker_data.get("backup_hot")
-        else backup_file(paths, paths.hot, "bimri-v4.md")
-    )
     original_bytes = paths.hot.read_bytes()
+    original_state_bytes = paths.state.read_bytes() if paths.state.exists() else None
+    if marker_data is not None:
+        backup_state, backup_hot = _validate_v4_marker(
+            paths, marker_data, original_bytes
+        )
+    else:
+        backup_state = backup_file(paths, paths.state, "state-v4.json")
+        backup_hot = backup_file(paths, paths.hot, "bimri-v4.md")
+        if backup_hot is None or backup_hot.read_bytes() != original_bytes:
+            raise BimriError("v4 hot-memory backup did not preserve the selected source.")
+        if original_state_bytes is not None and (
+            backup_state is None or backup_state.read_bytes() != original_state_bytes
+        ):
+            raise BimriError("v4 state backup did not preserve the selected source.")
+    _verify_v4_sources_unchanged(paths, original_bytes, original_state_bytes)
     try:
         original = original_bytes.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise BimriError("v4 bimri.md is not valid UTF-8.") from exc
     converted = convert_v4_hot(original)
+    rev = revision_path(paths, 0)
+    if rev.is_symlink():
+        raise BimriError("v4 migration revision V000000 cannot be a symbolic link.")
+    if marker_data is not None and not rev.is_file():
+        raise BimriError(
+            "v4 migration marker exists but revision V000000 is missing."
+        )
+    if rev.exists() and not rev.is_symlink():
+        existing_revision = rev.read_bytes()
+        if existing_revision != converted.encode("utf-8"):
+            old_converted = convert_v4_hot(
+                original,
+                generated_header=(
+                    "<!-- BIMRI v5 | Generated view. Do not edit directly. -->"
+                ),
+            )
+            if existing_revision == old_converted.encode("utf-8"):
+                converted = old_converted
     run_numbers = [int(path.stem[1:]) for path in paths.logs.glob("R*.md")
                    if re.fullmatch(r"R\d+", path.stem)]
     state = fresh_state()
     for key in (
         "project_id", "cadence_class", "prune_policy",
-        "tier1_max", "tier2_max", "tier3_max",
         "flag_threshold", "run_dates",
     ):
         if key in old_state:
             state[key] = old_state[key]
+    # v4 has no declaration that distinguishes a stock value from an owner's
+    # configured value. Preserve every limit it actually records; only fields
+    # absent from v4 adopt the v5.0.1 defaults already present in fresh state.
+    state.update({
+        key: old_state[key] for key in LIMIT_FIELDS if key in old_state
+    })
     old_run_count = old_state.get("run_count", 0)
     if (
         isinstance(old_run_count, bool)
@@ -1549,15 +1850,25 @@ def migrate_v4(paths, old_state):
     ):
         raise BimriError("v4 state run_count must be a non-negative integer.")
     state["run_count"] = max([old_run_count] + run_numbers + [0])
-    _, _, migration_errors, _ = validate_hot_content(
+    # Reject malformed inherited limits and state fields before creating a
+    # revision or migration marker. Exact source backups may already exist,
+    # but no new authority has been committed at this point.
+    validate_state(state)
+    _, converted_entries, migration_errors, counts = validate_hot_content(
         converted, state, allow_legacy_overflow=True
+    )
+    migration_errors.extend(
+        error for error in (
+            pointer_validation_error(paths, entry)
+            for entry in converted_entries
+        ) if error
     )
     if migration_errors:
         raise BimriError(
             "v4 memory could not be converted safely. The original and backups "
             "were preserved: " + "; ".join(migration_errors)
         )
-    rev = revision_path(paths, 0)
+    _verify_v4_sources_unchanged(paths, original_bytes, original_state_bytes)
     if rev.exists():
         existing = rev.read_bytes()
         if existing != converted.encode("utf-8"):
@@ -1573,15 +1884,54 @@ def migrate_v4(paths, old_state):
             "migration": "v4-to-v5",
             "completed_at": now_iso(),
             "source_hot_hash": sha256_bytes(original_bytes),
+            "source_state_hash": (
+                sha256_bytes(original_state_bytes)
+                if original_state_bytes is not None else None
+            ),
             "backup_state": (
-                str(backup_state.relative_to(paths.root)) if backup_state else None
+                backup_state.relative_to(paths.root).as_posix()
+                if backup_state else None
+            ),
+            "backup_state_sha256": (
+                sha256_bytes(backup_state.read_bytes()) if backup_state else None
             ),
             "backup_hot": (
-                str(backup_hot.relative_to(paths.root)) if backup_hot else None
+                backup_hot.relative_to(paths.root).as_posix()
+                if backup_hot else None
             ),
+            "backup_hot_sha256": sha256_bytes(backup_hot.read_bytes()),
         })
+    metadata_revision, generated_view = stage_v5_0_metadata_revision(
+        paths, state, converted
+    )
+    _verify_v4_sources_unchanged(paths, original_bytes, original_state_bytes)
     save_state(paths, state)
-    atomic_write_text(paths.hot, converted)
+    atomic_write_text(paths.hot, generated_view)
+    record_migration_receipt(
+        paths,
+        "migrated",
+        source_version=str(old_state.get("bimri_version") or "4.0"),
+        source_file="bimri.md",
+        imported={
+            "tier1": counts[1],
+            "tier2": counts[2],
+            "tier3": counts[3],
+            "total": sum(counts.values()),
+            "inherited_overlength_claims": sum(
+                len(entry.get("text", "")) > state["entry_max_chars"]
+                and (
+                    entry.get("source") == "legacy" or entry["tier"] == 3
+                )
+                for entry in converted_entries
+            ),
+        },
+        backups=[
+            path.relative_to(paths.root).as_posix()
+            for path in (backup_state, backup_hot) if path is not None
+        ],
+        limits=limits_profile(state),
+        metadata_revision=metadata_revision,
+    )
     return state
 
 
@@ -1593,6 +1943,329 @@ def looks_like_v4_hot(content):
         for line in content.splitlines()
         for regex in (V4_T1_RE, V4_T2_RE, V4_PATTERN_RE)
     )
+
+
+def reject_unclaimed_legacy_roots(paths):
+    """Reject legacy root files that are distinct from the generated view."""
+    unclaimed = []
+    for path in _actual_legacy_root_paths(
+        paths, LEGACY_ACTIVE_NAMES + LEGACY_BACKUP_NAMES
+    ):
+        is_generated_view = False
+        if (
+            path.name.casefold() == "bimri.md"
+            and not path.is_symlink()
+            and paths.hot.exists()
+            and not paths.hot.is_symlink()
+        ):
+            try:
+                is_generated_view = os.path.samefile(str(path), str(paths.hot))
+            except OSError:
+                is_generated_view = path == paths.hot
+        if not is_generated_view:
+            unclaimed.append(path.name)
+    if unclaimed:
+        raise BimriError(
+            "selected structured BIMRI authority coexists with unclaimed legacy root "
+            "file(s): " + ", ".join(sorted(unclaimed)) + ". BIMRI stopped "
+            "without importing or deleting them. Ask the owner which memory "
+            "is authoritative, then move or remove the unclaimed files."
+        )
+
+
+V5_0_METADATA_UPDATES = {
+    "<!-- BIMRI v5 | Generated view. Do not edit directly. -->":
+        "<!-- BIMRI v5.0.1 | Generated view. Do not edit directly. -->",
+    "<!-- Confirmed facts, decisions, preferences and rules. Cap: 12. -->":
+        "<!-- Confirmed facts, decisions, preferences and rules. Capacity: state.json. -->",
+    "<!-- Current work, risks and next actions. Cap: 20. -->":
+        "<!-- Current work, risks and next actions. Capacity: state.json. -->",
+    "<!-- Evidence-backed patterns. Cap: 8. -->":
+        "<!-- Evidence-backed patterns. Capacity: state.json. -->",
+}
+V5_0_COMPACT_METADATA_UPDATES = {
+    "<!-- BIMRI v5 | Generated view. Do not edit directly. -->":
+        "<!-- BIMRI v5.0.1 | Generated. -->",
+    "<!-- Confirmed facts, decisions, preferences and rules. Cap: 12. -->":
+        "<!-- Tier 1 capacity: state.json. -->",
+    "<!-- Current work, risks and next actions. Cap: 20. -->":
+        "<!-- Tier 2 capacity: state.json. -->",
+    "<!-- Evidence-backed patterns. Cap: 8. -->":
+        "<!-- Tier 3 capacity: state.json. -->",
+}
+
+
+def normalize_v5_0_hot_metadata(content, compact=False):
+    """Update only exact historical metadata lines, preserving entry bytes."""
+    updates = (
+        V5_0_COMPACT_METADATA_UPDATES if compact else V5_0_METADATA_UPDATES
+    )
+    rendered = []
+    for line in content.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        ending = line[len(body):]
+        rendered.append(updates.get(body, body) + ending)
+    return "".join(rendered)
+
+
+def select_v5_0_metadata_normalization(content, state):
+    """Choose rich or compact truthful metadata without worsening overflow."""
+    normalized = normalize_v5_0_hot_metadata(content)
+    if normalized == content:
+        return content
+    old_overflow = overflow_vector(content, state)
+    normalized_overflow = overflow_vector(normalized, state)
+    if (
+        old_overflow is not None
+        and normalized_overflow is not None
+        and any(
+            new_value > old_value
+            for new_value, old_value in zip(normalized_overflow, old_overflow)
+        )
+    ):
+        normalized = normalize_v5_0_hot_metadata(content, compact=True)
+        normalized_overflow = overflow_vector(normalized, state)
+    if (
+        old_overflow is None
+        or normalized_overflow is None
+        or any(
+            new_value > old_value
+            for new_value, old_value in zip(normalized_overflow, old_overflow)
+        )
+    ):
+        raise BimriError(
+            "cannot normalize v5.0 metadata without increasing bounded-memory "
+            "overflow; BIMRI stopped before writing new authority."
+        )
+    return normalized
+
+
+def stage_v5_0_metadata_revision(paths, state, content, normalized=None):
+    """Create/reuse one deterministic metadata-only revision and update state."""
+    normalized = (
+        select_v5_0_metadata_normalization(content, state)
+        if normalized is None else normalized
+    )
+    if normalized == content:
+        return None, content
+    _, entries, errors, _ = validate_hot_content(
+        normalized, state, allow_legacy_overflow=True
+    )
+    errors.extend(
+        error for error in (
+            pointer_validation_error(paths, entry) for entry in entries
+        ) if error
+    )
+    if errors:
+        raise BimriError(
+            "cannot normalize v5.0 metadata safely: " + "; ".join(errors)
+        )
+    number = state["head_revision"] + 1
+    if number > 999999:
+        raise BimriError("BIMRI has exhausted its six-digit revision ID space.")
+    revision = revision_path(paths, number)
+    normalized_bytes = normalized.encode("utf-8")
+    if revision.exists() or revision.is_symlink():
+        if (
+            revision.is_symlink()
+            or not revision.is_file()
+            or revision.read_bytes() != normalized_bytes
+        ):
+            raise BimriError(
+                "v5.0.1 metadata revision conflicts with an existing "
+                f"{revision.name}; BIMRI stopped without overwriting it."
+            )
+    else:
+        exclusive_write_bytes(revision, normalized_bytes)
+    state["head_revision"] = number
+    state["head_hash"] = sha256_bytes(normalized_bytes)
+    state["last_revision_reason"] = "v5.0.1 metadata normalization"
+    return revision.name, normalized
+
+
+def finalize_current_v5_metadata(paths, state):
+    """Normalize stale v5.0 view metadata in current-version authority."""
+    if state.get("bimri_version") != VERSION:
+        return None
+    head = revision_path(paths, state["head_revision"])
+    if not head.is_file() or head.is_symlink():
+        raise BimriError(
+            "cannot normalize current metadata: head revision is missing or unsafe."
+        )
+    head_bytes = head.read_bytes()
+    if sha256_bytes(head_bytes) != state["head_hash"]:
+        raise BimriError(
+            "cannot normalize current metadata: state head hash does not match "
+            "the head revision."
+        )
+    try:
+        content = head_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise BimriError(
+            "cannot normalize current metadata: head revision is not UTF-8."
+        ) from exc
+    normalized = select_v5_0_metadata_normalization(content, state)
+    if normalized == content:
+        return None
+
+    # Validate and preflight the deterministic next path before sync can write
+    # a manual-edit recovery/conflict. A conflicting path must fail without
+    # changing any current authority.
+    _, entries, errors, _ = validate_hot_content(
+        normalized, state, allow_legacy_overflow=True
+    )
+    errors.extend(
+        error for error in (
+            pointer_validation_error(paths, entry) for entry in entries
+        ) if error
+    )
+    if errors:
+        raise BimriError(
+            "cannot normalize current metadata safely: " + "; ".join(errors)
+        )
+    number = state["head_revision"] + 1
+    if number > 999999:
+        raise BimriError("BIMRI has exhausted its six-digit revision ID space.")
+    candidate = revision_path(paths, number)
+    normalized_bytes = normalized.encode("utf-8")
+    if candidate.exists() or candidate.is_symlink():
+        if (
+            candidate.is_symlink()
+            or not candidate.is_file()
+            or candidate.read_bytes() != normalized_bytes
+        ):
+            raise BimriError(
+                "v5.0.1 metadata revision conflicts with an existing "
+                f"{candidate.name}; BIMRI stopped without overwriting it."
+            )
+
+    # Run recovery while the old head is still authoritative. This preserves
+    # unknown hot bytes byte-for-byte and restores the old generated view.
+    sync_generated_view(paths, state)
+    authority_state_bytes = paths.state.read_bytes()
+    if head.read_bytes() != head_bytes:
+        raise BimriError(
+            "current head changed while metadata normalization was preparing; "
+            "retry when BIMRI is quiescent."
+        )
+    metadata_revision, normalized = stage_v5_0_metadata_revision(
+        paths, state, content, normalized=normalized
+    )
+    if (
+        paths.state.read_bytes() != authority_state_bytes
+        or head.read_bytes() != head_bytes
+    ):
+        raise BimriError(
+            "current state or head changed while metadata normalization was "
+            "committing; BIMRI stopped before replacing state."
+        )
+    save_state(paths, state)
+    write_generated_view(paths, normalized, warn_only=True)
+    return metadata_revision
+
+
+def upgrade_v5_0_state(paths, state):
+    old_limits = limits_profile(state)
+    expanded_default_limits = old_limits == V5_0_DEFAULT_LIMITS
+    upgraded = copy.deepcopy(state)
+    upgraded["bimri_version"] = VERSION
+    if expanded_default_limits:
+        upgraded.update(limits_profile(DEFAULT_STATE))
+    # Validate both authorities before any upgrade write. A syntactically valid
+    # state file must never be enough to bless a missing, corrupt or mismatched
+    # head revision.
+    validate_state(upgraded)
+    head = revision_path(paths, state["head_revision"])
+    if not head.is_file() or head.is_symlink():
+        raise BimriError(
+            f"cannot upgrade v5.0: head revision is missing or unsafe: {head.name}"
+        )
+    try:
+        head_bytes = head.read_bytes()
+        head_content = head_bytes.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise BimriError(f"cannot upgrade v5.0: head revision is unreadable: {exc}") from exc
+    if sha256_bytes(head_bytes) != state["head_hash"]:
+        raise BimriError(
+            "cannot upgrade v5.0: state head hash does not match the head revision."
+        )
+    _, head_entries, head_errors, _ = validate_hot_content(
+        head_content, state, allow_legacy_overflow=True
+    )
+    head_errors.extend(
+        error for error in (
+            pointer_validation_error(paths, entry)
+            for entry in head_entries
+        ) if error
+    )
+    if head_errors:
+        raise BimriError(
+            "cannot upgrade v5.0: head revision is invalid: "
+            + "; ".join(head_errors)
+        )
+
+    normalized_content = select_v5_0_metadata_normalization(
+        head_content, upgraded
+    )
+    metadata_revision = None
+
+    source_bytes = paths.state.read_bytes()
+    source_hash = sha256_bytes(source_bytes)
+    backup = paths.backups / f"state-v5.0-{source_hash}.json"
+    if backup.exists():
+        if backup.is_symlink() or backup.read_bytes() != source_bytes:
+            raise BimriError("v5.0 state upgrade backup conflicts with source state.")
+    else:
+        exclusive_write_bytes(backup, source_bytes)
+
+    if paths.state.read_bytes() != source_bytes or head.read_bytes() != head_bytes:
+        raise BimriError(
+            "v5.0 state or head revision changed while the upgrade was "
+            "preparing; retry when BIMRI is quiescent."
+        )
+    metadata_revision, normalized_content = stage_v5_0_metadata_revision(
+        paths, upgraded, head_content, normalized=normalized_content
+    )
+
+    if paths.state.read_bytes() != source_bytes or head.read_bytes() != head_bytes:
+        raise BimriError(
+            "v5.0 state or head revision changed while the upgrade was "
+            "committing; BIMRI stopped before replacing state."
+        )
+    save_state(paths, upgraded)
+    if metadata_revision is not None:
+        # Preserve the normal manual-edit recovery path. The old generated
+        # head can be replaced directly, but any other current hot bytes must
+        # pass through sync_generated_view so they are recovered byte-for-byte
+        # and raised as a human-visible conflict before the normalized view is
+        # restored.
+        current_hot = paths.hot.read_bytes() if paths.hot.exists() else None
+        if current_hot == head_bytes:
+            write_generated_view(paths, normalized_content, warn_only=True)
+        else:
+            sync_generated_view(paths, upgraded)
+    record_migration_receipt(
+        paths,
+        "upgraded",
+        source_version=PREVIOUS_V5_VERSION,
+        expanded_default_limits=expanded_default_limits,
+        old_limits=old_limits,
+        limits=limits_profile(upgraded),
+        backups=[backup.relative_to(paths.root).as_posix()],
+        metadata_revision=metadata_revision,
+    )
+    return upgraded
+
+
+def require_complete_v5_state(raw):
+    """Reject partial structured state instead of guessing authoritative data."""
+    missing = sorted(key for key in DEFAULT_STATE if key not in raw)
+    if missing:
+        raise BimriError(
+            "state.json is missing required v5 field(s): "
+            + ", ".join(missing)
+            + ". BIMRI stopped without filling them from defaults."
+        )
 
 
 def load_or_initialize(paths):
@@ -1608,21 +2281,45 @@ def load_or_initialize(paths):
             ensure_v4_install_is_quiescent(
                 paths, {"bimri_version": "4.0"}
             )
+            reject_unclaimed_legacy_roots(paths)
             return migrate_v4(paths, {})
         return initialize_v5(paths)
     raw = read_json_strict(paths.state, "state.json")
     version = str(raw.get("bimri_version", ""))
     if version.startswith("4") or (not version and "current_run_id" in raw):
         ensure_v4_install_is_quiescent(paths, raw)
+        reject_unclaimed_legacy_roots(paths)
         return migrate_v4(paths, raw)
+    if raw.get("bimri_version") == PREVIOUS_V5_VERSION:
+        require_complete_v5_state(raw)
+        merged = fresh_state()
+        merged.update(V5_0_DEFAULT_LIMITS)
+        merged["bimri_version"] = PREVIOUS_V5_VERSION
+        merged.update(raw)
+        state = validate_state(
+            merged, accepted_versions={PREVIOUS_V5_VERSION}
+        )
+        finalize_legacy_migration(paths, state)
+        reject_unclaimed_legacy_roots(paths)
+        return upgrade_v5_0_state(paths, state)
     if raw.get("bimri_version") != VERSION:
         raise BimriError(
             f"unsupported BIMRI state version: {raw.get('bimri_version')}"
         )
+    require_complete_v5_state(raw)
     merged = fresh_state()
     merged.update(raw)
     state = validate_state(merged)
     finalize_legacy_migration(paths, state)
+    reject_unclaimed_legacy_roots(paths)
+    metadata_revision = finalize_current_v5_metadata(paths, state)
+    record_migration_receipt(
+        paths,
+        "verified",
+        source_version=VERSION,
+        limits=limits_profile(state),
+        metadata_revision=metadata_revision,
+    )
     return state
 
 
@@ -1718,10 +2415,36 @@ def validate_hot_content(content, state, allow_legacy_overflow=False):
             except BimriError as exc:
                 errors.append(str(exc))
         text = entry.get("text", "")
+        inherited_overlength = (
+            (
+                entry.get("source") == "legacy"
+                # Tier 3 has no source field. New v5 proposals cannot author
+                # overlength patterns, so an overlength pattern that survives
+                # structural validation is inherited v4 content.
+                or entry["tier"] == 3
+            )
+            and len(text) > state["entry_max_chars"]
+        )
         try:
-            clean_scalar(text, f"memory text {entry['id']}", state["entry_max_chars"])
+            clean_scalar(
+                text,
+                f"memory text {entry['id']}",
+                (
+                    MAX_SERIALIZED_ENTRY_CHARS
+                    if inherited_overlength
+                    else state["entry_max_chars"]
+                ),
+            )
         except BimriError as exc:
             errors.append(str(exc))
+        if inherited_overlength and not allow_legacy_overflow:
+            inheritance = (
+                "legacy" if entry.get("source") == "legacy" else "v4 pattern"
+            )
+            errors.append(
+                f"{entry['id']} inherited {inheritance} text exceeds active entry "
+                f"cap: {len(text)}/{state['entry_max_chars']} characters"
+            )
         for field in ("tags", "ev"):
             if entry.get(field) and ("\t" in entry[field] or "\n" in entry[field]):
                 errors.append(f"{entry['id']} has unsafe {field}.")
@@ -1772,7 +2495,7 @@ def validate_hot_content(content, state, allow_legacy_overflow=False):
 
 
 def overflow_vector(content, state):
-    _, _, structural_errors, counts = validate_hot_content(
+    _, entries, structural_errors, counts = validate_hot_content(
         content, state, allow_legacy_overflow=True
     )
     if structural_errors:
@@ -1782,11 +2505,21 @@ def overflow_vector(content, state):
         2: state["tier2_max"],
         3: state["tier3_max"],
     }
+    inherited_excess = [
+        len(entry.get("text", "")) - state["entry_max_chars"]
+        for entry in entries
+        if (
+            (entry.get("source") == "legacy" or entry["tier"] == 3)
+            and len(entry.get("text", "")) > state["entry_max_chars"]
+        )
+    ]
     return (
         max(0, counts[1] - limits[1]),
         max(0, counts[2] - limits[2]),
         max(0, counts[3] - limits[3]),
         max(0, len(content.encode("utf-8")) - state["hot_max_bytes"]),
+        len(inherited_excess),
+        sum(inherited_excess),
     )
 
 
@@ -1798,6 +2531,19 @@ def strictly_reduces_overflow(before, after, state):
     return all(new_value <= old_value for new_value, old_value in zip(new, old)) and any(
         new_value < old_value for new_value, old_value in zip(new, old)
     )
+
+
+def pointer_validation_error(paths, entry):
+    pointer = entry.get("ptr")
+    if not pointer:
+        return None
+    try:
+        candidate = (paths.root / pointer).resolve()
+    except OSError as exc:
+        return f"{entry['id']} pointer cannot be resolved safely: {exc}"
+    if paths.root not in candidate.parents and candidate != paths.root:
+        return f"{entry['id']} pointer escapes the BIMRI project."
+    return None
 
 
 def find_entry(entries, key=None, target_id=None):
@@ -1829,7 +2575,7 @@ def resolve_entry(entries, key, target_id=None, require_target=False):
     return by_key or by_target
 
 
-def insert_in_tier(lines, tier, new_line):
+def insert_lines_in_tier(lines, tier, new_lines, leading_blank=False):
     heading = f"## tier {tier}"
     start = None
     end = len(lines)
@@ -1849,8 +2595,15 @@ def insert_in_tier(lines, tier, new_line):
     insert_at = end
     while insert_at > start + 1 and not lines[insert_at - 1].strip():
         insert_at -= 1
-    lines.insert(insert_at, new_line)
+    block = list(new_lines)
+    if block and leading_blank:
+        block.insert(0, "")
+    lines[insert_at:insert_at] = block
     return lines
+
+
+def insert_in_tier(lines, tier, new_line):
+    return insert_lines_in_tier(lines, tier, [new_line])
 
 
 def render_content(lines):
@@ -1938,19 +2691,20 @@ def sync_generated_view(paths, state):
             f"{uuid.uuid4().hex[:8]}{suffix}"
         )
         exclusive_write_bytes(recovery, current_bytes)
+        relative_recovery = recovery.relative_to(paths.root).as_posix()
         conflict = create_system_conflict(
             paths, state, "manual-edit", "manual.bimri",
             "BIMRI found a direct edit to generated hot memory. The edit was "
-            f"preserved at {recovery.relative_to(paths.root)}. Ask the owner "
+            f"preserved at {relative_recovery}. Ask the owner "
             "whether the agent should review and re-submit it as proposals.",
             {
-                "recovery_file": str(recovery.relative_to(paths.root)),
-                "recovery_files": [str(recovery.relative_to(paths.root))],
+                "recovery_file": relative_recovery,
+                "recovery_files": [relative_recovery],
             },
         )
         print(
             "BIMRI NOTICE: a direct edit to bimri.md was preserved at "
-            f"{recovery.relative_to(paths.root)} and the generated view was "
+            f"{relative_recovery} and the generated view was "
             f"restored. Human decision: {conflict}.",
             file=sys.stderr,
         )
@@ -2104,7 +2858,7 @@ def validate_conflict_record(
 ):
     if not isinstance(conflict, dict):
         raise BimriError("conflict must be a JSON object.")
-    if conflict.get("bimri_version") != VERSION:
+    if conflict.get("bimri_version") not in COMPATIBLE_ARTIFACT_VERSIONS:
         raise BimriError("conflict BIMRI version is invalid.")
     conflict_id = validate_fixed_id(
         conflict.get("conflict_id"), CONFLICT_RE, "conflict ID"
@@ -2177,7 +2931,7 @@ def validate_resolution_record(
 ):
     if not isinstance(resolution, dict):
         raise BimriError("resolution must be a JSON object.")
-    if resolution.get("bimri_version") != VERSION:
+    if resolution.get("bimri_version") not in COMPATIBLE_ARTIFACT_VERSIONS:
         raise BimriError("resolution BIMRI version is invalid.")
     conflict_id = validate_fixed_id(
         resolution.get("conflict_id"), CONFLICT_RE, "resolution conflict ID"
@@ -2426,7 +3180,7 @@ def render_proposed_line(proposal, state):
 def validate_proposal(proposal, state=None):
     if not isinstance(proposal, dict):
         raise BimriError("proposal must be a JSON object.")
-    if proposal.get("bimri_version") != VERSION:
+    if proposal.get("bimri_version") not in COMPATIBLE_ARTIFACT_VERSIONS:
         raise BimriError("proposal BIMRI version is invalid.")
     proposal_id = validate_fixed_id(
         proposal.get("proposal_id"), PROPOSAL_RE, "proposal ID"
@@ -2546,7 +3300,7 @@ def validate_proposal(proposal, state=None):
 def validate_decision(decision, proposal_id):
     if not isinstance(decision, dict):
         raise BimriError("decision must be a JSON object.")
-    if decision.get("bimri_version") != VERSION:
+    if decision.get("bimri_version") not in COMPATIBLE_ARTIFACT_VERSIONS:
         raise BimriError("decision BIMRI version is invalid.")
     if decision.get("proposal_id") != proposal_id:
         raise BimriError("decision proposal ID mismatch.")
@@ -3109,7 +3863,7 @@ def build_index(paths, state):
             if match:
                 rows.append([
                     match.group(1), "", "log", "", "", "detail",
-                    str(log.relative_to(paths.root)), line.strip()[:160],
+                    log.relative_to(paths.root).as_posix(), line.strip()[:160],
                 ])
     for archive in sorted(paths.archive.glob("*.md")):
         if archive.is_symlink():
@@ -3121,7 +3875,7 @@ def build_index(paths, state):
             if match:
                 rows.append([
                     match.group(1), "", "archive", "", "", "archived",
-                    str(archive.relative_to(paths.root)), line[:160],
+                    archive.relative_to(paths.root).as_posix(), line[:160],
                 ])
     safe_rows = []
     for row in rows:
@@ -3241,14 +3995,15 @@ def cmd_start(paths, actor, session=None):
             run_id = f"R{number:06d}"
             log = run_log_path(paths, run_id)
             try:
-                interpreter = Path(sys.executable).name or "python"
                 exclusive_write_text(
                     log,
                     f"# Run {run_id} | {now_iso()} | actor:{actor} | "
                     f"base:V{state['head_revision']:06d}\n\n"
                     "## Journal\n\n"
-                    f"<!-- Use `{interpreter} bimri-engine.py journal --run "
-                    f"{run_id} --text \"...\"` for durable detail. -->\n\n"
+                    "<!-- Use the host-only argv_prefix recorded in "
+                    ".bimri/runtime.local.json with "
+                    f"`journal --run {run_id} --text \"...\"` "
+                    "for durable detail. -->\n\n"
                     "## Proposals\n\n"
                     "## Outcome\n\n",
                 )
@@ -3350,10 +4105,21 @@ def cmd_propose(paths, args):
             raise BimriError("Tier 1 requires a valid --kind.")
         if tier == 2 and args.status not in TIER2_STATUSES:
             raise BimriError("Tier 2 requires a valid --status.")
-        text = (
-            base_entry["text"] if operation in {"touch", "close"}
-            else clean_scalar(args.text, "memory text", state["entry_max_chars"])
-        )
+        if operation in {"touch", "close"}:
+            text = base_entry["text"]
+            if len(text) > state["entry_max_chars"]:
+                # Touch and close act on the immutable base snapshot and do not
+                # author text. Keep the proposal itself within the current
+                # authoring cap while the base hash retains exact authority.
+                descriptor = (
+                    f"{operation} inherited {base_entry['id']} "
+                    f"sha256:{sha256_text(text)}"
+                )
+                text = descriptor[:state["entry_max_chars"]]
+        else:
+            text = clean_scalar(
+                args.text, "memory text", state["entry_max_chars"]
+            )
         rationale = clean_scalar(
             args.rationale or text, "proposal rationale", 4000
         )
@@ -3927,20 +4693,21 @@ def doctor_errors(paths, state):
             content = rev.read_text(encoding="utf-8")
             _, entries, hot_errors, counts = validate_hot_content(content, state)
             for hot_error in hot_errors:
-                if "exceeds cap:" in hot_error or "exceeds byte cap:" in hot_error:
+                if (
+                    "exceeds cap:" in hot_error
+                    or "exceeds byte cap:" in hot_error
+                    or "inherited legacy text exceeds active entry cap:" in hot_error
+                    or "inherited v4 pattern text exceeds active entry cap:" in hot_error
+                ):
                     warnings.append(
                         "bounded-memory repair needed: " + hot_error
                     )
                 else:
                     errors.append(hot_error)
             for entry in entries:
-                pointer = entry.get("ptr")
-                if pointer:
-                    candidate = (paths.root / pointer).resolve()
-                    if paths.root not in candidate.parents and candidate != paths.root:
-                        errors.append(
-                            f"{entry['id']} pointer escapes the BIMRI project."
-                        )
+                pointer_error = pointer_validation_error(paths, entry)
+                if pointer_error:
+                    errors.append(pointer_error)
         except (UnicodeDecodeError, OSError) as exc:
             errors.append(f"head revision is unreadable: {exc}")
     else:
@@ -4135,6 +4902,8 @@ def cmd_doctor(paths):
 
 AGENT_BLOCK_START = "<!-- BIMRI:START -->"
 AGENT_BLOCK_END = "<!-- BIMRI:END -->"
+PYTHON_COMMAND_PLACEHOLDER = "__BIMRI_VERIFIED_PYTHON__"
+PYTHON_SENTINEL_SWITCH = "--_bimri-python-sentinel"
 INSTALL_CORE = (
     "bimri-engine.py",
     "BIMRI-PROTOCOL.md",
@@ -4155,6 +4924,192 @@ INSTALL_FILE_MAP = tuple((name, name) for name in INSTALL_CORE) + (
 )
 INSTALL_ADAPTERS = ("AGENTS.md", "CLAUDE.md")
 INSTALL_DIRECTORIES = ("legacy", "legacy/v1", "legacy/v3")
+INSTALL_LOCAL_ARTIFACTS = (
+    ".bimri/runtime.local.json",
+    ".bimri/hooks.claude.local.json",
+)
+
+
+def install_source_file(source_paths, source_name):
+    """Resolve canonical sources and their self-contained installed names."""
+    if source_name == "LICENSE":
+        packaged = source_paths.root / "BIMRI-LICENSE"
+        if packaged.exists() or packaged.is_symlink():
+            return packaged
+    return source_paths.root / source_name
+
+
+def _python_sentinel_payload(token):
+    return {
+        "executable": str(Path(sys.executable).resolve()),
+        "sentinel": token,
+        "version": [sys.version_info.major, sys.version_info.minor],
+    }
+
+
+def verify_python_relaunch(executable, engine):
+    """Prove that one exact interpreter can execute one exact BIMRI engine."""
+    executable = Path(executable)
+    engine = Path(engine)
+    token = uuid.uuid4().hex
+    try:
+        check = subprocess.run(
+            [
+                str(executable),
+                str(engine),
+                PYTHON_SENTINEL_SWITCH,
+                token,
+            ],
+            stdin=subprocess.DEVNULL,
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise BimriError(
+            "the current Python interpreter did not complete BIMRI's "
+            "five-second verification check."
+        ) from exc
+    except OSError as exc:
+        raise BimriError(
+            f"the current Python interpreter could not relaunch BIMRI: {exc}"
+        ) from exc
+
+    if check.returncode != 0:
+        detail = check.stderr.strip() or check.stdout.strip() or "no output"
+        raise BimriError(
+            "the current Python interpreter failed BIMRI's verification "
+            f"check (exit {check.returncode}): {detail}"
+        )
+    try:
+        payload = json.loads(check.stdout)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise BimriError(
+            "the current Python interpreter returned no valid BIMRI "
+            "verification sentinel."
+        ) from exc
+    if not isinstance(payload, dict) or payload.get("sentinel") != token:
+        raise BimriError(
+            "the current Python interpreter returned the wrong BIMRI "
+            "verification sentinel."
+        )
+    version = payload.get("version")
+    if (
+        not isinstance(version, list)
+        or len(version) != 2
+        or any(type(value) is not int for value in version)
+        or tuple(version) < (3, 8)
+    ):
+        raise BimriError(
+            "the relaunched Python interpreter is not Python 3.8 or newer."
+        )
+    reported = payload.get("executable")
+    if not isinstance(reported, str):
+        raise BimriError(
+            "the relaunched Python interpreter did not report its executable."
+        )
+    try:
+        reported_executable = Path(reported).resolve(strict=True)
+    except OSError as exc:
+        raise BimriError(
+            "the relaunched Python interpreter reported an invalid "
+            f"executable: {exc}"
+        ) from exc
+    if os.path.normcase(str(reported_executable)) != os.path.normcase(
+        str(executable)
+    ):
+        raise BimriError(
+            "the relaunched Python interpreter did not match sys.executable."
+        )
+    return str(executable)
+
+
+def verified_python_executable():
+    """Return the current interpreter only after a bounded self-relaunch."""
+    if sys.version_info < (3, 8):
+        raise BimriError(
+            "BIMRI requires Python 3.8 or newer; the current interpreter is "
+            f"{sys.version_info.major}.{sys.version_info.minor}."
+        )
+    raw_executable = Path(sys.executable)
+    if not raw_executable.is_absolute():
+        raise BimriError(
+            "the current Python interpreter does not report an absolute "
+            "sys.executable path."
+        )
+    try:
+        executable = raw_executable.resolve(strict=True)
+    except OSError as exc:
+        raise BimriError(
+            f"the current Python interpreter cannot be resolved: {exc}"
+        ) from exc
+    if not executable.is_file():
+        raise BimriError(
+            "the current Python interpreter is not an existing regular file: "
+            f"{executable}"
+        )
+    return verify_python_relaunch(executable, Path(__file__).resolve())
+
+
+def render_hooks_snippet(template, destination, python_executable):
+    try:
+        payload = json.loads(template.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BimriError(f"hooks-example.json is not valid JSON: {exc}") from exc
+    try:
+        hooks = payload["hooks"]
+        expected = {
+            "SessionStart": "hook-start",
+            "SessionEnd": "hook-close",
+        }
+        rendered = 0
+        for event, subcommand in expected.items():
+            groups = hooks[event]
+            if not isinstance(groups, list) or len(groups) != 1:
+                raise KeyError(event)
+            commands = groups[0]["hooks"]
+            if not isinstance(commands, list) or len(commands) != 1:
+                raise KeyError(event)
+            command = commands[0]
+            if command.get("type") != "command":
+                raise KeyError(event)
+            if command.get("command") != PYTHON_COMMAND_PLACEHOLDER:
+                raise KeyError(event)
+            if command.get("args") != [
+                "${CLAUDE_PROJECT_DIR}/bimri-engine.py",
+                subcommand,
+            ]:
+                raise KeyError(event)
+            if command.get("timeout") != 15:
+                raise KeyError(event)
+            command["command"] = python_executable
+            rendered += 1
+    except (KeyError, TypeError, AttributeError) as exc:
+        raise BimriError(
+            "hooks-example.json does not match the BIMRI exec-form template."
+        ) from exc
+    if rendered != 2:
+        raise BimriError(
+            "hooks-example.json did not contain both BIMRI hook commands."
+        )
+    atomic_write_text(
+        destination,
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+    )
+
+
+def write_local_runtime_binding(
+    runtime_path, python_executable, engine_path
+):
+    engine_path = str(Path(engine_path).resolve())
+    binding = {
+        "version": VERSION,
+        "host_bound": True,
+        "python_executable": python_executable,
+        "engine_path": engine_path,
+        "argv_prefix": [python_executable, engine_path],
+    }
+    atomic_write_json(runtime_path, binding)
 
 
 def merge_marked_block(path, block):
@@ -4273,7 +5228,7 @@ def validate_install_target(source_paths, target, target_paths, backup_root):
                 f"installer target directory is not a directory: {relative}"
             )
     for source_name, destination_name in INSTALL_FILE_MAP:
-        source = source_paths.root / source_name
+        source = install_source_file(source_paths, source_name)
         destination = target / destination_name
         if (
             not source.is_file()
@@ -4302,6 +5257,16 @@ def validate_install_target(source_paths, target, target_paths, backup_root):
             raise BimriError(
                 f"installer instruction target is not a regular file: {name}"
             )
+    for relative in INSTALL_LOCAL_ARTIFACTS:
+        destination = target / relative
+        if destination.is_symlink():
+            raise BimriError(
+                f"refusing to replace redirected local artifact: {relative}"
+            )
+        if destination.exists() and not destination.is_file():
+            raise BimriError(
+                f"installer local artifact is not a regular file: {relative}"
+            )
 
 
 def snapshot_install_target(target_paths, backup_dir):
@@ -4325,6 +5290,7 @@ def snapshot_install_target(target_paths, backup_dir):
         *(destination for _source, destination in INSTALL_FILE_MAP),
         *INSTALL_ADAPTERS,
         *legacy_names,
+        *INSTALL_LOCAL_ARTIFACTS,
         ".bimri/state.json",
         ".bimri/index.tsv",
     ]
@@ -4456,7 +5422,138 @@ def rollback_install(target_paths, backup_dir, manifest):
     return errors
 
 
+def migration_receipt_lines(receipt):
+    """Render one invocation's migration facts without consulting old markers."""
+    if not isinstance(receipt, dict):
+        raise BimriError("memory operation completed without a migration receipt.")
+    action = receipt.get("action")
+    limits = receipt.get("limits", {})
+    profile = (
+        f"T1/T2/T3 {limits.get('tier1_max')}/{limits.get('tier2_max')}/"
+        f"{limits.get('tier3_max')}, entry {limits.get('entry_max_chars')} chars, "
+        f"{limits.get('hot_max_bytes'):,} bytes"
+        if all(
+            isinstance(limits.get(key), int)
+            for key in (
+                "tier1_max", "tier2_max", "tier3_max",
+                "entry_max_chars", "hot_max_bytes",
+            )
+        )
+        else None
+    )
+    if action == "initialized":
+        line = f"Memory: initialized at v{VERSION}"
+        if profile:
+            line += f" ({profile})"
+        return [line + ".", "Validation: PASSED."]
+    if action == "verified":
+        lines = [f"Memory: existing v{VERSION} verified."]
+        if receipt.get("metadata_revision"):
+            lines.append(
+                "Memory metadata normalized in immutable revision "
+                + receipt["metadata_revision"]
+                + "."
+            )
+        else:
+            lines[0] = (
+                f"Memory: existing v{VERSION} verified; no migration performed."
+            )
+        lines.append("Validation: PASSED.")
+        return lines
+    if action == "upgraded":
+        source = receipt.get("source_version")
+        old_limits = receipt.get("old_limits", {})
+        old_profile = (
+            f"T1/T2/T3 {old_limits.get('tier1_max')}/"
+            f"{old_limits.get('tier2_max')}/{old_limits.get('tier3_max')}, "
+            f"entry {old_limits.get('entry_max_chars')} chars, "
+            f"{old_limits.get('hot_max_bytes'):,} bytes"
+            if all(
+                isinstance(old_limits.get(key), int)
+                for key in (
+                    "tier1_max", "tier2_max", "tier3_max",
+                    "entry_max_chars", "hot_max_bytes",
+                )
+            )
+            else None
+        )
+        disposition = (
+            "stock limits expanded"
+            if receipt.get("expanded_default_limits")
+            else "custom limits preserved"
+        )
+        lines = [
+            f"Memory: upgraded v{source} to v{VERSION}; {disposition}"
+            + (f" ({profile})." if profile else ".")
+        ]
+        if old_profile:
+            lines.append("Previous limits: " + old_profile + ".")
+        backups = receipt.get("backups") or []
+        if backups:
+            lines.append("State backup: " + ", ".join(backups) + ".")
+        if receipt.get("metadata_revision"):
+            lines.append(
+                "Memory metadata normalized in immutable revision "
+                + receipt["metadata_revision"]
+                + "."
+            )
+        lines.append("Validation: PASSED.")
+        return lines
+    if action == "migrated":
+        source = receipt.get("source_version")
+        source_file = receipt.get("source_file") or "detected legacy source"
+        imported = receipt.get("imported") or {}
+        if "claims_imported" in imported:
+            tier1 = imported.get("tier1_imported", 0)
+            tier2 = imported.get("tier2_imported", 0)
+            tier3 = 0
+            total = imported.get("claims_imported", tier1 + tier2)
+            patterns = imported.get("patterns_converted_to_watches", 0)
+            overlength = imported.get("inherited_overlength_claims", 0)
+        else:
+            tier1 = imported.get("tier1", 0)
+            tier2 = imported.get("tier2", 0)
+            tier3 = imported.get("tier3", 0)
+            total = imported.get("total", tier1 + tier2 + tier3)
+            patterns = tier3
+            overlength = imported.get("inherited_overlength_claims", 0)
+        lines = [
+            f"Memory: migrated BIMRI v{source} from {source_file} to v{VERSION}.",
+            "Imported: "
+            f"Tier 1 {tier1}; Tier 2 {tier2}; Tier 3 {tier3}; total {total}; "
+            f"converted patterns {patterns}; inherited overlength {overlength}.",
+        ]
+        backups = receipt.get("backups") or []
+        if backups:
+            lines.append("Byte-exact backups: " + ", ".join(backups) + ".")
+        if receipt.get("metadata_revision"):
+            lines.append(
+                "Memory metadata normalized in immutable revision "
+                + receipt["metadata_revision"]
+                + "."
+            )
+        marker = (
+            ".bimri/migrations/legacy-to-v5.json"
+            if str(source) in {"1", "2", "3"}
+            else ".bimri/migrations/v4-to-v5.json"
+        )
+        lines.append(f"Migration record: {marker}.")
+        if receipt.get("expanded_default_limits") is not None:
+            lines.append(
+                "Limits: "
+                + (
+                    "stock profile expanded."
+                    if receipt["expanded_default_limits"]
+                    else "custom profile preserved."
+                )
+            )
+        lines.append("Validation: PASSED.")
+        return lines
+    raise BimriError(f"memory operation returned an unknown receipt action: {action}")
+
+
 def cmd_install(source_paths, target):
+    python_executable = verified_python_executable()
     target = Path(target).resolve()
     if target.parent == target:
         raise BimriError("refusing to install BIMRI into a filesystem root.")
@@ -4480,6 +5577,11 @@ def cmd_install(source_paths, target):
                 target_paths.state, "target state.json"
             )
             ensure_v4_install_is_quiescent(target_paths, raw_state)
+            raw_version = str(raw_state.get("bimri_version", ""))
+            if raw_version.startswith("4") or (
+                not raw_version and "current_run_id" in raw_state
+            ):
+                reject_unclaimed_legacy_roots(target_paths)
         backup_root.mkdir(parents=True, exist_ok=True)
         fsync_directory(backup_root.parent)
         if target_paths.bdir not in backup_root.resolve().parents:
@@ -4496,10 +5598,15 @@ def cmd_install(source_paths, target):
         manifest = snapshot_install_target(target_paths, backup_dir)
         try:
             for source_name, destination_name in INSTALL_FILE_MAP:
-                source = source_paths.root / source_name
+                source = install_source_file(source_paths, source_name)
                 destination = target / destination_name
                 if source.resolve() != destination.resolve():
                     atomic_copy_file(source, destination)
+            installed_engine = (target / "bimri-engine.py").resolve()
+            verify_python_relaunch(
+                python_executable,
+                installed_engine,
+            )
             block = (
                 source_paths.root / "BIMRI-AGENT-BLOCK.md"
             ).read_text(encoding="utf-8")
@@ -4507,7 +5614,10 @@ def cmd_install(source_paths, target):
             claude_block = (
                 "@AGENTS.md\n\n"
                 "Use BIMRI-PROTOCOL.md for the full memory protocol. "
-                "BIMRI shared memory is engine-managed."
+                "BIMRI shared memory is engine-managed. Read the host-only "
+                "argument prefix from `.bimri/runtime.local.json`. Merge the "
+                "rendered `.bimri/hooks.claude.local.json` snippet into "
+                "`.claude/settings.local.json` manually."
             )
             merge_marked_block(target / "CLAUDE.md", claude_block)
             state = load_or_initialize(target_paths)
@@ -4518,6 +5628,21 @@ def cmd_install(source_paths, target):
                 raise BimriError(
                     "installation self-check failed: " + "; ".join(errors)
                 )
+            # Host-only adapters are deliberately written after memory has
+            # been initialized or migrated. Legacy migration treats unknown
+            # .bimri files as possible orphaned authority, so pre-creating
+            # these local records would make a clean install look ambiguous.
+            write_local_runtime_binding(
+                target_paths.bdir / "runtime.local.json",
+                python_executable,
+                installed_engine,
+            )
+            render_hooks_snippet(
+                source_paths.root / "hooks-example.json",
+                target_paths.bdir / "hooks.claude.local.json",
+                python_executable,
+            )
+            migration_receipt_lines(target_paths.migration_receipt)
             manifest["status"] = "installed"
             manifest["completed_at"] = now_iso()
             atomic_write_json(
@@ -4538,13 +5663,18 @@ def cmd_install(source_paths, target):
                 "installation self-check failed; target files were rolled "
                 f"back. Backups: {backup_label}. Cause: {exc}"
             ) from exc
-    migrated = any(
-        (target_paths.migrations / name).exists()
-        for name in ("v4-to-v5.json", "legacy-to-v5.json")
-    )
     print(f"BIMRI {VERSION} installed.")
-    print("Existing memory preserved and migrated." if migrated else "Memory initialized.")
+    print(f"Verified Python: {python_executable}")
+    for line in migration_receipt_lines(target_paths.migration_receipt):
+        print(line)
     print("Universal AGENTS.md adapter enabled.")
+    print(
+        "Host-only runtime binding written to .bimri/runtime.local.json."
+    )
+    print(
+        "Claude Code hook snippet rendered to "
+        ".bimri/hooks.claude.local.json; .claude settings unchanged."
+    )
     print("Doctor passed.")
     for warning in install_warnings:
         print(f"Repair warning: {warning}")
@@ -4631,6 +5761,20 @@ def build_parser():
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if (
+        len(argv) == 2
+        and argv[0] == PYTHON_SENTINEL_SWITCH
+        and re.fullmatch(r"[0-9a-f]{32}", argv[1])
+    ):
+        print(
+            json.dumps(
+                _python_sentinel_payload(argv[1]),
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        return 0
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
@@ -4674,7 +5818,19 @@ def main(argv=None):
                 state = load_or_initialize(paths)
                 sync_generated_view(paths, state)
                 build_index(paths, state)
+                migration_errors, migration_warnings = doctor_errors(
+                    paths, state
+                )
+                if migration_errors:
+                    raise BimriError(
+                        "migration validation failed: "
+                        + "; ".join(migration_errors)
+                    )
             print(f"BIMRI: migration/initialization complete at v{VERSION}.")
+            for line in migration_receipt_lines(paths.migration_receipt):
+                print(line)
+            for warning in migration_warnings:
+                print(f"Repair warning: {warning}")
         elif command == "hook-start":
             payload = hook_payload()
             cmd_start(
