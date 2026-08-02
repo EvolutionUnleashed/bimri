@@ -2880,8 +2880,8 @@ class BimriCliTest(unittest.TestCase):
         escaped = revision_path.read_text("utf-8").replace(
             f".bimri/log/{run_id}.md", "../../outside.md"
         )
-        revision_path.write_text(escaped, "utf-8")
-        (self.root / "bimri.md").write_text(escaped, "utf-8")
+        revision_path.write_bytes(escaped.encode("utf-8"))
+        (self.root / "bimri.md").write_bytes(escaped.encode("utf-8"))
         state["head_hash"] = hashlib.sha256(escaped.encode("utf-8")).hexdigest()
         state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", "utf-8")
 
@@ -2893,8 +2893,8 @@ class BimriCliTest(unittest.TestCase):
             "## Tier 2: Active Context",
             "## Tier 2: Active Context\nthis is malformed shared memory",
         )
-        revision_path.write_text(malformed, "utf-8")
-        (self.root / "bimri.md").write_text(malformed, "utf-8")
+        revision_path.write_bytes(malformed.encode("utf-8"))
+        (self.root / "bimri.md").write_bytes(malformed.encode("utf-8"))
         state["head_hash"] = hashlib.sha256(malformed.encode("utf-8")).hexdigest()
         state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", "utf-8")
         malformed_result = self.cli("doctor", check=False)
@@ -2921,8 +2921,8 @@ class BimriCliTest(unittest.TestCase):
             "[R0-E2] [K:duplicate.key] [fact] [T:working] "
             "[SRC:legacy] [] Second value.",
         )
-        revision_path.write_text(duplicate, "utf-8")
-        (self.root / "bimri.md").write_text(duplicate, "utf-8")
+        revision_path.write_bytes(duplicate.encode("utf-8"))
+        (self.root / "bimri.md").write_bytes(duplicate.encode("utf-8"))
         state["head_hash"] = hashlib.sha256(duplicate.encode("utf-8")).hexdigest()
         state_path.write_text(
             json.dumps(state, indent=2, sort_keys=True) + "\n", "utf-8"
@@ -2963,10 +2963,10 @@ class BimriCliTest(unittest.TestCase):
         )
         revision_zero = (
             self.root / ".bimri" / "revisions" / "V000000.md"
-        ).read_text("utf-8")
+        ).read_bytes()
         (
             self.root / ".bimri" / "revisions" / "V000001.md"
-        ).write_text(revision_zero, "utf-8")
+        ).write_bytes(revision_zero)
         root_temp = self.root / ".bimri-tmp-crash-leftover"
         nested_temp = (
             self.root
@@ -4015,7 +4015,7 @@ class BimriCliTest(unittest.TestCase):
             "[R1-E1] [K:legacy.r1-e1] [fact] [T:working] "
             f"[SRC:legacy] [legacy] {claim}",
         )
-        (self.root / "bimri.md").write_text(source, "utf-8")
+        (self.root / "bimri.md").write_bytes(source.encode("utf-8"))
         state = {
             "bimri_version": "4.0",
             "project_id": "historical-v4",
@@ -4026,7 +4026,7 @@ class BimriCliTest(unittest.TestCase):
             json.dumps(state, indent=2) + "\n", "utf-8"
         )
         v0 = revisions / "V000000.md"
-        v0.write_text(historical, "utf-8")
+        v0.write_bytes(historical.encode("utf-8"))
 
         migrated = self.cli("migrate")
 
@@ -4286,8 +4286,8 @@ class BimriCliTest(unittest.TestCase):
                         "<!-- Evidence-backed patterns. Capacity: state.json. -->",
                     )
                 )
-                revision_path.write_text(historical, "utf-8")
-                (root / "bimri.md").write_text(historical, "utf-8")
+                revision_path.write_bytes(historical.encode("utf-8"))
+                (root / "bimri.md").write_bytes(historical.encode("utf-8"))
                 state["bimri_version"] = "5.0"
                 state.update(dict(zip(fields, profile["old"])))
                 state["head_hash"] = hashlib.sha256(
@@ -4383,8 +4383,8 @@ class BimriCliTest(unittest.TestCase):
             .replace("Capacity: state.json.", "Cap: 20.", 1)
             .replace("Capacity: state.json.", "Cap: 8.", 1)
         )
-        revision_path.write_text(historical, "utf-8")
-        (self.root / "bimri.md").write_text(historical, "utf-8")
+        revision_path.write_bytes(historical.encode("utf-8"))
+        (self.root / "bimri.md").write_bytes(historical.encode("utf-8"))
         state_path = self.root / ".bimri" / "state.json"
         state = self.state()
         state.update({
@@ -4424,7 +4424,7 @@ class BimriCliTest(unittest.TestCase):
             .replace("Capacity: state.json.", "Cap: 20.", 1)
             .replace("Capacity: state.json.", "Cap: 8.", 1)
         )
-        revision.write_text(historical, "utf-8")
+        revision.write_bytes(historical.encode("utf-8"))
         state_path = self.root / ".bimri" / "state.json"
         state = self.state()
         state["head_hash"] = hashlib.sha256(
@@ -4460,8 +4460,8 @@ class BimriCliTest(unittest.TestCase):
             "<!-- BIMRI v5.0.1 | Generated view. Do not edit directly. -->",
             "<!-- BIMRI v5 | Generated view. Do not edit directly. -->",
         )
-        revision.write_text(historical, "utf-8")
-        (self.root / "bimri.md").write_text(historical, "utf-8")
+        revision.write_bytes(historical.encode("utf-8"))
+        (self.root / "bimri.md").write_bytes(historical.encode("utf-8"))
         state_path = self.root / ".bimri" / "state.json"
         state = self.state()
         state["head_hash"] = hashlib.sha256(
@@ -4502,8 +4502,8 @@ class BimriCliTest(unittest.TestCase):
             "<!-- Evidence-backed patterns. Capacity: state.json. -->",
             "<!-- Evidence-backed patterns. Cap: 8. -->",
         )
-        revision_path.write_text(escaped, "utf-8")
-        (self.root / "bimri.md").write_text(escaped, "utf-8")
+        revision_path.write_bytes(escaped.encode("utf-8"))
+        (self.root / "bimri.md").write_bytes(escaped.encode("utf-8"))
         state = self.state()
         state.update({
             "bimri_version": "5.0",
@@ -4548,7 +4548,7 @@ class BimriCliTest(unittest.TestCase):
             .replace("Capacity: state.json.", "Cap: 20.", 1)
             .replace("Capacity: state.json.", "Cap: 8.", 1)
         )
-        revision_path.write_text(historical, "utf-8")
+        revision_path.write_bytes(historical.encode("utf-8"))
         state = self.state()
         state.update({
             "bimri_version": "5.0",
