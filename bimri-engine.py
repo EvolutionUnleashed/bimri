@@ -2691,19 +2691,20 @@ def sync_generated_view(paths, state):
             f"{uuid.uuid4().hex[:8]}{suffix}"
         )
         exclusive_write_bytes(recovery, current_bytes)
+        relative_recovery = recovery.relative_to(paths.root).as_posix()
         conflict = create_system_conflict(
             paths, state, "manual-edit", "manual.bimri",
             "BIMRI found a direct edit to generated hot memory. The edit was "
-            f"preserved at {recovery.relative_to(paths.root)}. Ask the owner "
+            f"preserved at {relative_recovery}. Ask the owner "
             "whether the agent should review and re-submit it as proposals.",
             {
-                "recovery_file": str(recovery.relative_to(paths.root)),
-                "recovery_files": [str(recovery.relative_to(paths.root))],
+                "recovery_file": relative_recovery,
+                "recovery_files": [relative_recovery],
             },
         )
         print(
             "BIMRI NOTICE: a direct edit to bimri.md was preserved at "
-            f"{recovery.relative_to(paths.root)} and the generated view was "
+            f"{relative_recovery} and the generated view was "
             f"restored. Human decision: {conflict}.",
             file=sys.stderr,
         )
@@ -3862,7 +3863,7 @@ def build_index(paths, state):
             if match:
                 rows.append([
                     match.group(1), "", "log", "", "", "detail",
-                    str(log.relative_to(paths.root)), line.strip()[:160],
+                    log.relative_to(paths.root).as_posix(), line.strip()[:160],
                 ])
     for archive in sorted(paths.archive.glob("*.md")):
         if archive.is_symlink():
@@ -3874,7 +3875,7 @@ def build_index(paths, state):
             if match:
                 rows.append([
                     match.group(1), "", "archive", "", "", "archived",
-                    str(archive.relative_to(paths.root)), line[:160],
+                    archive.relative_to(paths.root).as_posix(), line[:160],
                 ])
     safe_rows = []
     for row in rows:

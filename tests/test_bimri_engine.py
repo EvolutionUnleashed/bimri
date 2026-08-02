@@ -2166,7 +2166,7 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(
             set(recorded),
             {
-                str(path.relative_to(self.root))
+                path.relative_to(self.root).as_posix()
                 for path in recovery_files
             },
         )
@@ -2221,7 +2221,7 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(
             set(conflict["extra"]["recovery_files"]),
             {
-                str(path.relative_to(self.root))
+                path.relative_to(self.root).as_posix()
                 for path in recovery_files
             },
         )
@@ -3174,6 +3174,14 @@ class BimriCliTest(unittest.TestCase):
 
     def test_index_and_doctor_are_deterministic(self):
         run_id = self.start("codex")
+        self.cli(
+            "journal", "--run", run_id,
+            "--text", "Index paths stay portable across operating systems.",
+        )
+        archive_path = self.root / ".bimri" / "archive" / "portability.md"
+        archive_path.write_bytes(
+            b"[R999999-E999] Archived portability fixture.\n"
+        )
         first = self.propose(run_id, "zeta.item", "Zeta comes second alphabetically.")
         second = self.propose(run_id, "alpha.item", "Alpha comes first alphabetically.")
         self.cli("sync", "--run", run_id)
@@ -3200,6 +3208,10 @@ class BimriCliTest(unittest.TestCase):
         self.assertTrue(all(len(row.split("\t")) == 8 for row in rows))
         ids = [row.split("\t")[0] for row in rows[1:]]
         self.assertEqual(ids, sorted(ids))
+        indexed_files = {row.split("\t")[6] for row in rows[1:]}
+        self.assertIn(f".bimri/log/{run_id}.md", indexed_files)
+        self.assertIn(".bimri/archive/portability.md", indexed_files)
+        self.assertTrue(all("\\" not in path for path in indexed_files))
 
         first_doctor = self.cli("doctor")
         doctor_index_one = index_path.read_bytes()
