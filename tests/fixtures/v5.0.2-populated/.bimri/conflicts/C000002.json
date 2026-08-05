@@ -1,0 +1,16 @@
+{
+  "bimri_version": "5.0.2",
+  "conflict_id": "C000002",
+  "created_at": "2026-08-05T07:01:47Z",
+  "current_hash": "0f8aa9e006f966ab1b707d3ebbb2ee511f9fbcd573595184860648051b1c9b5d",
+  "current_line": "[R000009-E001] [K:fixture.resolved] [I:3] [active] [T:working] [SRC:agent] [F:R000009] [L:R000009] [] Resolved conflict first value. -> .bimri/log/R000009.md",
+  "key": "fixture.resolved",
+  "proposal_hashes": {
+    "R000010-Q001": "534e466a86ffd1354e7720414b7296def25636dcfb22f897f3b38f603fa11252"
+  },
+  "proposal_ids": [
+    "R000010-Q001"
+  ],
+  "question": "Memory changed while agents were working on fixture.resolved. Which version should BIMRI remember?",
+  "type": "stale-base"
+}

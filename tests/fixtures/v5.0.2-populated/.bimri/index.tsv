@@ -1,0 +1,16 @@
+id	key	loc	trust	source	status	file	headline
+R000001-E001	fixture.subject	T2	working	agent	active	bimri.md	Accepted v5.0.2 working memory.
+R000001-E001		log			detail	.bimri/log/R000001.md	[ID:R000001-E001] [I:3] Accepted v5.0.2 working memory.
+R000002-E001		log			detail	.bimri/log/R000002.md	[ID:R000002-E001] [I:3] Accepted v5.0.2 working memory.
+R000003-E001		log			detail	.bimri/log/R000003.md	[ID:R000003-E001] [I:3] Pending old-engine proposal.
+R000004-E001	fixture.concurrent	T2	working	agent	active	bimri.md	First concurrent value.
+R000004-E001		log			detail	.bimri/log/R000004.md	[ID:R000004-E001] [I:3] First concurrent value.
+R000005-E001		log			detail	.bimri/log/R000005.md	[ID:R000005-E001] [I:3] Second concurrent value.
+R000006-E001		archive			archived	.bimri/archive/2026-08.md	[ARCHIVED:2026-08-05] [BY:R000007-Q001] [closed] [R000006-E001] [K:fixture.remove] [I:3] [active] [T:working] [SRC:agent] [F:R000006] [L:R000006] [] This entry
+R000006-E001		log			detail	.bimri/log/R000006.md	[ID:R000006-E001] [I:3] This entry will be archived.
+R000007-E001		log			detail	.bimri/log/R000007.md	[ID:R000007-E001] [I:3] This entry will be archived.
+R000008-E001	fixture.applying	T2	working	agent	active	bimri.md	Crash-recoverable applying proposal.
+R000008-E001		log			detail	.bimri/log/R000008.md	[ID:R000008-E001] [I:3] Crash-recoverable applying proposal.
+R000009-E001		log			detail	.bimri/log/R000009.md	[ID:R000009-E001] [I:3] Resolved conflict first value.
+R000010-E001	fixture.resolved	T2	confirmed	agent	active	bimri.md	Resolved conflict chosen value.
+R000010-E001		log			detail	.bimri/log/R000010.md	[ID:R000010-E001] [I:3] Resolved conflict chosen value.

@@ -1,0 +1,12 @@
+{
+  "accepted_head_hash": "1f6b80475de81e4333c4ac6f27aabb678eec7f428b36c286aa385b7fdc6f1135",
+  "accepted_head_revision": 8,
+  "bimri_md_sha256": "1f6b80475de81e4333c4ac6f27aabb678eec7f428b36c286aa385b7fdc6f1135",
+  "fixture": "populated-v5.0.2",
+  "generator_commit": "dfdd3ccdacdc1e13f34ffd6b1d66b4a73d5373bb",
+  "memory_format": "5.0.2",
+  "notes": "Generated only with the exact public v5.0.2 engine; includes active and closed runs, pending and terminal proposals, accepted, no-op, contested, resolved, and safely reproducible applying authority, open and resolved conflicts, archive, index, unknown files, historical backup/evidence, recovery litter, and an unreferenced revision.",
+  "protected_path_count": 68,
+  "protected_tree_digest": "6de10a90a95331ea026da3feaca879bc013e7499902e32e9a07c8fa388453f0e",
+  "state_sha256": "06333563166d5ec12fcf69fa768d5516888421b4c0b65b63050a15f6414debc7"
+}

@@ -1,0 +1,15 @@
+{
+  "authority": "human-asserted",
+  "bimri_version": "5.0.2",
+  "by": "user",
+  "choice": "R000010-Q001",
+  "conflict_id": "C000002",
+  "proposal_ids": [
+    "R000010-Q001"
+  ],
+  "resolved_at": "2026-08-05T07:01:47Z",
+  "revision_after": 8,
+  "revision_before": 7,
+  "started_at": "2026-08-05T07:01:47Z",
+  "status": "resolved"
+}

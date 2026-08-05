@@ -1,0 +1,85 @@
+{
+  "active_runs": {
+    "R000003": {
+      "actor": "fixture-pending",
+      "base_revision": 1,
+      "last_activity_at": "2026-08-05T07:01:11Z",
+      "session_key": null,
+      "started_at": "2026-08-05T07:01:11Z"
+    },
+    "R000004": {
+      "actor": "fixture-left",
+      "base_revision": 2,
+      "last_activity_at": "2026-08-05T07:01:12Z",
+      "session_key": null,
+      "started_at": "2026-08-05T07:01:12Z"
+    },
+    "R000005": {
+      "actor": "fixture-right",
+      "base_revision": 2,
+      "last_activity_at": "2026-08-05T07:01:12Z",
+      "session_key": null,
+      "started_at": "2026-08-05T07:01:12Z"
+    },
+    "R000008": {
+      "actor": "fixture-applying",
+      "base_revision": 6,
+      "last_activity_at": "2026-08-05T07:01:46Z",
+      "session_key": null,
+      "started_at": "2026-08-05T07:01:13Z"
+    },
+    "R000009": {
+      "actor": "fixture-resolve-left",
+      "base_revision": 7,
+      "last_activity_at": "2026-08-05T07:01:47Z",
+      "session_key": null,
+      "started_at": "2026-08-05T07:01:46Z"
+    },
+    "R000010": {
+      "actor": "fixture-resolve-right",
+      "base_revision": 7,
+      "last_activity_at": "2026-08-05T07:01:47Z",
+      "session_key": null,
+      "started_at": "2026-08-05T07:01:47Z"
+    },
+    "R000011": {
+      "actor": "fixture-applying-final",
+      "base_revision": 8,
+      "last_activity_at": "2026-08-05T07:01:47Z",
+      "session_key": null,
+      "started_at": "2026-08-05T07:01:47Z"
+    }
+  },
+  "bimri_version": "5.0.2",
+  "cadence_class": "interactive",
+  "conflict_count": 2,
+  "entry_max_chars": 500,
+  "flag_threshold": 0.5,
+  "head_hash": "1f6b80475de81e4333c4ac6f27aabb678eec7f428b36c286aa385b7fdc6f1135",
+  "head_revision": 8,
+  "hot_max_bytes": 50000,
+  "last_closed_at": "2026-08-05T07:01:13Z",
+  "last_revision_reason": "accepted R000010-Q001",
+  "last_started_at": "2026-08-05T07:01:47Z",
+  "pattern_count": 0,
+  "project_id": "unset",
+  "prune_policy": "archive_only",
+  "run_count": 11,
+  "run_dates": {
+    "R000001": "2026-08-05",
+    "R000002": "2026-08-05",
+    "R000003": "2026-08-05",
+    "R000004": "2026-08-05",
+    "R000005": "2026-08-05",
+    "R000006": "2026-08-05",
+    "R000007": "2026-08-05",
+    "R000008": "2026-08-05",
+    "R000009": "2026-08-05",
+    "R000010": "2026-08-05",
+    "R000011": "2026-08-05"
+  },
+  "session_runs": {},
+  "tier1_max": 17,
+  "tier2_max": 43,
+  "tier3_max": 13
+}

@@ -11,9 +11,12 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -21,7 +24,88 @@ from pathlib import Path
 REPOSITORY = Path(__file__).resolve().parents[1]
 ENGINE = REPOSITORY / "bimri-engine.py"
 CRASH_WORKER = REPOSITORY / "tests" / "crash_worker.py"
+V5_0_2_FIXTURE = REPOSITORY / "tests" / "fixtures" / "v5.0.2-populated"
+V5_0_2_COMMIT = "dfdd3ccdacdc1e13f34ffd6b1d66b4a73d5373bb"
+V5_0_2_ENGINE_SHA256 = (
+    "acbb26733ce601835edd59f84f4e3daa3359e91bad27d34e31e4b2ce9a23646b"
+)
 PROPOSAL_RE = re.compile(r"\bR\d{6}-Q\d{3}\b")
+PROTECTED_EXCLUSIONS = {
+    ".bimri/engine.lock",
+    ".bimri/runtime.local.json",
+    ".bimri/hooks.claude.local.json",
+}
+CODE_UPDATE_TARGETS = (
+    "bimri-engine.py",
+    "BIMRI-PROTOCOL.md",
+    "BIMRI-MEMORY.template.md",
+    "BIMRI-STATE.template.json",
+    "BIMRI-AGENT-BLOCK.md",
+    "INSTALL.md",
+    "MIGRATION.md",
+    "hooks-example.json",
+    "legacy/README.md",
+    "legacy/v1/BIMRI-global-instructions.md",
+    "legacy/v3/BIMRI-global-instructions.md",
+    "legacy/v3/BIMRI-global-instructions-v3.md",
+    "legacy/v3/README.md",
+    "BIMRI-LICENSE",
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".bimri/runtime.local.json",
+    ".bimri/hooks.claude.local.json",
+)
+
+
+def protected_tree_snapshot(root):
+    root = Path(root)
+    records = {}
+
+    def record(path):
+        metadata = path.lstat()
+        mode = metadata.st_mode
+        reparse = bool(
+            getattr(metadata, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
+        )
+        if stat.S_ISLNK(mode) or reparse:
+            target = os.readlink(path)
+            return {
+                "type": "symlink",
+                "target": target,
+                "target_bytes_hex": os.fsencode(target).hex(),
+            }
+        if stat.S_ISDIR(mode):
+            return {"type": "directory"}
+        if stat.S_ISREG(mode):
+            content = path.read_bytes()
+            return {
+                "type": "file",
+                "bytes": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+            }
+        return {"type": "other", "mode": stat.S_IFMT(mode)}
+
+    hot = root / "bimri.md"
+    records["bimri.md"] = (
+        record(hot)
+        if hot.exists() or hot.is_symlink()
+        else {"type": "missing"}
+    )
+
+    def visit(directory):
+        for entry in sorted(os.scandir(directory), key=lambda item: item.name):
+            path = Path(entry.path)
+            relative = path.relative_to(root).as_posix()
+            if relative in PROTECTED_EXCLUSIONS:
+                continue
+            value = record(path)
+            records[relative] = value
+            if value["type"] == "directory":
+                visit(path)
+
+    visit(root / ".bimri")
+    return records
 
 
 class BimriCliTest(unittest.TestCase):
@@ -141,6 +225,40 @@ class BimriCliTest(unittest.TestCase):
         self.assertIsNotNone(match, result.stdout)
         return match.group(0)
 
+    def stage_concurrent_candidate(
+        self,
+        key,
+        candidate_text,
+        *,
+        root=None,
+        candidate_run=None,
+        candidate_actor="candidate",
+        candidate_source="agent",
+        writer_text=None,
+    ):
+        """Stage one proven v5.0.3 concurrent candidate without syncing it."""
+        candidate_run = candidate_run or self.start(candidate_actor, root=root)
+        writer_run = self.start("concurrent-writer", root=root)
+        candidate = self.propose(
+            candidate_run,
+            key,
+            candidate_text,
+            source=candidate_source,
+            trust="working",
+            root=root,
+        )
+        writer = self.propose(
+            writer_run,
+            key,
+            writer_text or f"Canonical writer for {key}.",
+            source="agent",
+            trust="working",
+            root=root,
+        )
+        self.cli("sync", "--run", writer_run, root=root)
+        self.assertEqual(self.decision(writer, root=root)["outcome"], "accepted")
+        return candidate_run, candidate, writer_run, writer
+
     def state(self, root=None):
         target = root or self.root
         return json.loads((target / ".bimri" / "state.json").read_text("utf-8"))
@@ -152,6 +270,24 @@ class BimriCliTest(unittest.TestCase):
 
     def hot(self, root=None):
         return (root or self.root).joinpath("bimri.md").read_text("utf-8")
+
+    def seed_code_update_targets(self, target):
+        target = Path(target)
+        originals = {}
+        for index, relative in enumerate(CODE_UPDATE_TARGETS, 1):
+            path = target / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if relative == ".bimri/runtime.local.json":
+                content = b'{"owner":"old runtime binding"}\n'
+            elif relative == ".bimri/hooks.claude.local.json":
+                content = b'{"owner":"old hook binding"}\n'
+            else:
+                content = (
+                    f"owner sentinel {index}: {relative}\n".encode("utf-8")
+                )
+            path.write_bytes(content)
+            originals[relative] = content
+        return originals
 
     def assert_installed_runtime_binding(self, target, agents_text=None):
         target = Path(target)
@@ -189,7 +325,7 @@ class BimriCliTest(unittest.TestCase):
             "engine_path": engine_path,
             "host_bound": True,
             "python_executable": python_executable,
-            "version": "5.0.2",
+            "version": "5.0.3",
         })
 
         template = json.loads(
@@ -466,7 +602,13 @@ class BimriCliTest(unittest.TestCase):
 
             def submit(candidate):
                 run_id, text = candidate
-                return self.propose(run_id, key, text)
+                return self.propose(
+                    run_id,
+                    key,
+                    text,
+                    source="agent",
+                    trust="working",
+                )
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                 proposal_ids = list(
@@ -492,6 +634,11 @@ class BimriCliTest(unittest.TestCase):
                     result.stdout + result.stderr for result in sync_results
                 ),
             )
+            notices = sum(
+                result.stdout.count("MEMORY CONFLICT")
+                for result in sync_results
+            )
+            self.assertEqual(notices, 1, sync_results)
 
             decisions = [self.decision(item) for item in proposal_ids]
             self.assertEqual(
@@ -527,10 +674,18 @@ class BimriCliTest(unittest.TestCase):
         first = self.start("codex")
         second = self.start("claude")
         first_proposal = self.propose(
-            first, "product.name", "The product is called Northstar."
+            first,
+            "product.name",
+            "The product is called Northstar.",
+            source="user",
+            trust="working",
         )
         second_proposal = self.propose(
-            second, "product.name", "The product is called Wayfinder."
+            second,
+            "product.name",
+            "The product is called Wayfinder.",
+            source="user",
+            trust="working",
         )
 
         self.cli("sync", "--run", first)
@@ -574,31 +729,874 @@ class BimriCliTest(unittest.TestCase):
         status = self.cli("status")
         self.assertIn("Open conflicts: 0", status.stdout)
 
+    def test_v503_same_run_preflight_is_idempotent_and_write_free(self):
+        run_id = self.start("codex")
+        first = self.propose(
+            run_id,
+            "retry.subject",
+            "Keep this working value.",
+            source="agent",
+            trust="working",
+            extra=("--rationale", "Evidence from the current task."),
+        )
+
+        def snapshot():
+            return {
+                path.relative_to(self.root).as_posix(): path.read_bytes()
+                for path in self.root.rglob("*")
+                if path.is_file() and not path.is_symlink()
+            }
+
+        before_retry = snapshot()
+        retry = self.cli(
+            "propose",
+            "--run",
+            run_id,
+            "--tier",
+            "2",
+            "--key",
+            "retry.subject",
+            "--text",
+            "Keep this working value.",
+            "--source",
+            "agent",
+            "--trust",
+            "working",
+            "--rationale",
+            "Evidence from the current task.",
+        )
+        self.assertEqual(retry.stdout.strip(), first)
+        self.assertEqual(snapshot(), before_retry)
+
+        changed_rationale = self.cli(
+            "propose",
+            "--run",
+            run_id,
+            "--tier",
+            "2",
+            "--key",
+            "retry.subject",
+            "--text",
+            "Keep this working value.",
+            "--source",
+            "agent",
+            "--trust",
+            "working",
+            "--rationale",
+            "A materially different reason.",
+            check=False,
+        )
+        self.assertEqual(changed_rationale.returncode, 2)
+        self.assertIn(first, changed_rationale.stderr)
+        self.assertIn("sync", changed_rationale.stderr)
+        self.assertEqual(snapshot(), before_retry)
+
+    def test_v503_stale_serial_proposal_is_rejected_before_mutation(self):
+        stale_run = self.start("long-lived")
+        writer_run = self.start("writer")
+        committed = self.propose(
+            writer_run,
+            "serial.subject",
+            "The committed value.",
+            source="agent",
+            trust="working",
+        )
+        self.cli("sync", "--run", writer_run)
+        self.assertEqual(self.decision(committed)["outcome"], "accepted")
+        before = {
+            path.relative_to(self.root).as_posix(): path.read_bytes()
+            for path in self.root.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        }
+
+        rejected = self.cli(
+            "propose",
+            "--run",
+            stale_run,
+            "--tier",
+            "2",
+            "--key",
+            "serial.subject",
+            "--text",
+            "A stale serial overwrite.",
+            "--source",
+            "agent",
+            "--trust",
+            "working",
+            check=False,
+        )
+        self.assertEqual(rejected.returncode, 2)
+        self.assertIn(f"sync {stale_run}", rejected.stderr)
+        after = {
+            path.relative_to(self.root).as_posix(): path.read_bytes()
+            for path in self.root.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        }
+        self.assertEqual(after, before)
+        self.assertEqual(list((self.root / ".bimri" / "conflicts").glob("C*.json")), [])
+
+    def test_v503_preflight_receipt_binds_current_head_after_unrelated_change(self):
+        run_id = self.start("candidate")
+        unrelated_run = self.start("unrelated")
+        unrelated = self.propose(
+            unrelated_run,
+            "unrelated.subject",
+            "An unrelated accepted change.",
+            source="agent",
+            trust="working",
+        )
+        self.cli("sync", "--run", unrelated_run)
+        self.assertEqual(self.decision(unrelated)["outcome"], "accepted")
+        state = self.state()
+
+        proposal_id = self.propose(
+            run_id,
+            "receipt.subject",
+            "Bind this proposal to the live head.",
+            source="agent",
+            trust="working",
+        )
+        proposal = json.loads(
+            (
+                self.root / ".bimri" / "proposals" / f"{proposal_id}.json"
+            ).read_text("utf-8")
+        )
+        receipt = proposal["preflight_receipt"]
+        self.assertEqual(proposal["bimri_version"], "5.0.2")
+        self.assertEqual(proposal["base_revision"], state["head_revision"])
+        self.assertEqual(receipt["engine_release"], "5.0.3")
+        self.assertEqual(receipt["observed_head_revision"], state["head_revision"])
+        self.assertEqual(receipt["observed_head_hash"], state["head_hash"])
+        self.assertEqual(receipt["observed_key_hash"], "absent")
+
+    def test_v503_containment_and_capacity_fail_without_conflicts(self):
+        confirmed_run = self.start("owner")
+        confirmed = self.propose(
+            confirmed_run,
+            "confirmed.subject",
+            "Preserve this confirmed value.",
+            source="user",
+            trust="confirmed",
+        )
+        self.cli("sync", "--run", confirmed_run)
+        self.assertEqual(self.decision(confirmed)["outcome"], "accepted")
+        promotable = self.propose(
+            confirmed_run,
+            "working.subject",
+            "Keep this in working memory.",
+            source="agent",
+            trust="working",
+        )
+        self.cli("sync", "--run", confirmed_run)
+        self.assertEqual(self.decision(promotable)["outcome"], "accepted")
+        policy_run = self.start("policy-agent")
+
+        attempts = [
+            (
+                "confirmed replacement",
+                ("--tier", "2", "--key", "confirmed.subject", "--text", "Replace it.",
+                 "--source", "agent", "--trust", "working"),
+            ),
+            (
+                "confirmed removal",
+                ("--operation", "close", "--key", "confirmed.subject",
+                 "--source", "agent", "--trust", "working"),
+            ),
+            (
+                "Tier 1",
+                ("--tier", "1", "--key", "new.core", "--text", "New core.",
+                 "--kind", "fact", "--source", "user", "--trust", "confirmed"),
+            ),
+            (
+                "Tier 1 promotion",
+                ("--tier", "1", "--key", "working.subject", "--text", "Promote it.",
+                 "--kind", "fact", "--source", "agent", "--trust", "working"),
+            ),
+            (
+                "system provenance",
+                ("--tier", "2", "--key", "system.claim", "--text", "System claim.",
+                 "--source", "system", "--trust", "confirmed"),
+            ),
+            (
+                "semantic uncertainty",
+                ("--tier", "2", "--key", "uncertain.claim", "--text", "Maybe.",
+                 "--source", "agent", "--trust", "working", "--needs-human",
+                 "--question", "Which value?"),
+            ),
+        ]
+        for label, arguments in attempts:
+            with self.subTest(label=label):
+                before = {
+                    path.relative_to(self.root).as_posix(): path.read_bytes()
+                    for path in self.root.rglob("*")
+                    if path.is_file() and not path.is_symlink()
+                }
+                result = self.cli(
+                    "propose", "--run", policy_run, *arguments, check=False
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                after = {
+                    path.relative_to(self.root).as_posix(): path.read_bytes()
+                    for path in self.root.rglob("*")
+                    if path.is_file() and not path.is_symlink()
+                }
+                self.assertEqual(after, before)
+
+        before_touch = next(
+            line for line in self.hot().splitlines()
+            if "[K:confirmed.subject]" in line
+        )
+        touch_id = self.cli(
+            "propose", "--run", policy_run, "--operation", "touch",
+            "--key", "confirmed.subject", "--source", "agent", "--trust", "working",
+        ).stdout.strip()
+        self.cli("sync", "--run", policy_run)
+        self.assertEqual(self.decision(touch_id)["outcome"], "accepted")
+        after_touch = next(
+            line for line in self.hot().splitlines()
+            if "[K:confirmed.subject]" in line
+        )
+        for field in (
+            "[T:confirmed]", "[SRC:user]", "[I:3]", "[active]",
+            f"[F:{confirmed_run}]", "Preserve this confirmed value.",
+        ):
+            self.assertIn(field, before_touch)
+            self.assertIn(field, after_touch)
+
+        state_path = self.root / ".bimri" / "state.json"
+        state = self.state()
+        state["tier2_max"] = 2
+        state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", "utf-8")
+        capacity = self.cli(
+            "propose",
+            "--run",
+            policy_run,
+            "--tier",
+            "2",
+            "--key",
+            "over.capacity",
+            "--text",
+            "This cannot fit.",
+            "--source",
+            "agent",
+            "--trust",
+            "working",
+            check=False,
+        )
+        self.assertEqual(capacity.returncode, 2)
+        self.assertIn("Tier 2 exceeds cap", capacity.stderr)
+        self.assertEqual(self.state()["conflict_count"], 0)
+        self.assertEqual(list((self.root / ".bimri" / "conflicts").glob("C*.json")), [])
+
+    def test_v503_pending_proposal_reserves_last_capacity_slot(self):
+        first_run = self.start("first")
+        second_run = self.start("second")
+        state_path = self.root / ".bimri" / "state.json"
+        state = self.state()
+        state["tier2_max"] = 1
+        state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", "utf-8")
+        first = self.propose(
+            first_run,
+            "slot.one",
+            "Reserve the final slot.",
+            source="agent",
+            trust="working",
+        )
+        before = {
+            path.relative_to(self.root).as_posix(): path.read_bytes()
+            for path in self.root.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        }
+        second = self.cli(
+            "propose",
+            "--run",
+            second_run,
+            "--tier",
+            "2",
+            "--key",
+            "slot.two",
+            "--text",
+            "Compete for the final slot.",
+            "--source",
+            "agent",
+            "--trust",
+            "working",
+            check=False,
+        )
+        self.assertEqual(second.returncode, 2)
+        self.assertIn("reserved by pending work", second.stderr)
+        after = {
+            path.relative_to(self.root).as_posix(): path.read_bytes()
+            for path in self.root.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        }
+        self.assertEqual(after, before)
+        self.assertEqual(
+            [path.stem for path in (self.root / ".bimri" / "proposals").glob("*.json")],
+            [first],
+        )
+        self.assertEqual(list((self.root / ".bimri" / "conflicts").glob("C*.json")), [])
+
+    def test_v503_genuine_concurrent_edit_notifies_once(self):
+        first_run = self.start("same-label")
+        second_run = self.start("same-label")
+        first = self.propose(
+            first_run,
+            "concurrent.subject",
+            "Candidate one.",
+            source="agent",
+            trust="working",
+        )
+        second = self.propose(
+            second_run,
+            "concurrent.subject",
+            "Candidate two.",
+            source="agent",
+            trust="working",
+        )
+        self.cli("sync", "--run", first_run)
+        self.assertEqual(self.decision(first)["outcome"], "accepted")
+        created = self.cli("sync", "--run", second_run)
+        self.assertIn("MEMORY CONFLICT C000001", created.stdout)
+        self.assertIn("Subject: concurrent.subject", created.stdout)
+        self.assertEqual(self.decision(second)["outcome"], "contested")
+        self.assertEqual(self.state()["conflict_count"], 1)
+        self.assertEqual(
+            len(list((self.root / ".bimri" / "conflicts").glob("C*.json"))),
+            1,
+        )
+        for _ in range(5):
+            replay = self.cli("sync", "--run", second_run)
+            self.assertNotIn("MEMORY CONFLICT", replay.stdout)
+            self.assertNotIn("C000001", replay.stdout)
+        self.assertEqual(self.state()["conflict_count"], 1)
+
+    def test_v503_compatible_touch_and_close_are_strict_noops(self):
+        first_set_run = self.start("set-a")
+        second_set_run = self.start("set-b")
+        first_set = self.propose(
+            first_set_run,
+            "compatible.set",
+            "The exact shared value.",
+            source="agent",
+            trust="working",
+        )
+        second_set = self.propose(
+            second_set_run,
+            "compatible.set",
+            "The exact shared value.",
+            source="agent",
+            trust="working",
+        )
+        self.cli("sync", "--run", first_set_run)
+        self.cli("sync", "--run", second_set_run)
+        self.assertEqual(self.decision(first_set)["outcome"], "accepted")
+        self.assertEqual(self.decision(second_set)["outcome"], "noop")
+
+        creator = self.start("creator")
+        initial = self.propose(
+            creator,
+            "compatible.subject",
+            "Working memory.",
+            source="agent",
+            trust="working",
+        )
+        self.cli("sync", "--run", creator)
+        self.assertEqual(self.decision(initial)["outcome"], "accepted")
+
+        first_touch_run = self.start("touch-a")
+        second_touch_run = self.start("touch-b")
+        first_touch = self.cli(
+            "propose", "--run", first_touch_run, "--operation", "touch",
+            "--key", "compatible.subject", "--source", "agent", "--trust", "working",
+        ).stdout.strip()
+        second_touch = self.cli(
+            "propose", "--run", second_touch_run, "--operation", "touch",
+            "--key", "compatible.subject", "--source", "agent", "--trust", "working",
+        ).stdout.strip()
+        self.cli("sync", "--run", first_touch_run)
+        second_touch_sync = self.cli("sync", "--run", second_touch_run)
+        self.assertEqual(self.decision(first_touch)["outcome"], "accepted")
+        self.assertEqual(self.decision(second_touch)["outcome"], "noop")
+        self.assertIn("already satisfied/no change 1", second_touch_sync.stdout)
+
+        first_close_run = self.start("close-a")
+        second_close_run = self.start("close-b")
+        first_close = self.cli(
+            "propose", "--run", first_close_run, "--operation", "close",
+            "--key", "compatible.subject", "--source", "agent", "--trust", "working",
+        ).stdout.strip()
+        second_close = self.cli(
+            "propose", "--run", second_close_run, "--operation", "close",
+            "--key", "compatible.subject", "--source", "agent", "--trust", "working",
+        ).stdout.strip()
+        self.cli("sync", "--run", first_close_run)
+        self.cli("sync", "--run", second_close_run)
+        self.assertEqual(self.decision(first_close)["outcome"], "accepted")
+        self.assertEqual(self.decision(second_close)["outcome"], "noop")
+        self.assertEqual(list((self.root / ".bimri" / "conflicts").glob("C*.json")), [])
+
+    def test_v503_unreceipted_stale_proposal_cannot_create_conflict(self):
+        first_run = self.start("first")
+        second_run = self.start("legacy-pending")
+        first = self.propose(
+            first_run,
+            "legacy.concurrent",
+            "Accepted writer.",
+            source="agent",
+            trust="working",
+        )
+        second = self.propose(
+            second_run,
+            "legacy.concurrent",
+            "Unreceipted stale candidate.",
+            source="agent",
+            trust="working",
+        )
+        second_path = self.root / ".bimri" / "proposals" / f"{second}.json"
+        data = json.loads(second_path.read_text("utf-8"))
+        del data["preflight_receipt"]
+        second_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", "utf-8")
+        self.cli("sync", "--run", first_run)
+        self.assertEqual(self.decision(first)["outcome"], "accepted")
+        blocked = self.cli("sync", "--run", second_run, check=False)
+        self.assertEqual(blocked.returncode, 2)
+        self.assertIn("no validated v5.0.3 preflight receipt", blocked.stderr)
+        self.assertFalse(
+            (self.root / ".bimri" / "decisions" / f"{second}.json").exists()
+        )
+        self.assertEqual(self.state()["conflict_count"], 0)
+        self.assertEqual(list((self.root / ".bimri" / "conflicts").glob("C*.json")), [])
+
+    def test_start_is_quiet_and_review_renders_one_time_concurrent_choice(self):
+        first = self.start("quiet-first")
+        second_start = self.cli("start", "--actor", "quiet-second")
+        second = re.search(
+            r"=== BIMRI BRIEF (R\d{6})", second_start.stdout
+        ).group(1)
+        self.assertNotIn("HUMAN DECISION NEEDED", second_start.stdout)
+
+        first_id = self.propose(
+            first,
+            "quiet.subject",
+            "The working live value.",
+            source="agent",
+            trust="working",
+        )
+        candidate = self.propose(
+            second,
+            "quiet.subject",
+            "The incompatible candidate value.",
+        )
+        self.cli("sync", "--run", first)
+        created = self.cli("sync", "--run", second)
+        conflict_id = self.decision(candidate)["conflict_id"]
+        self.assertIn(f"MEMORY CONFLICT {conflict_id}", created.stdout)
+        self.assertIn("Subject: quiet.subject", created.stdout)
+        self.assertIn('Live value: "The working live value."', created.stdout)
+        self.assertIn("Action: replace", created.stdout)
+        self.assertIn(f"Choice {candidate}", created.stdout)
+        self.assertIn("Choose " + candidate, created.stdout)
+        self.assertIn("New conflict notices: total 1", created.stdout)
+        self.assertNotIn("[K:quiet.subject]", created.stdout)
+
+        repeated = self.cli("sync", "--run", second)
+        self.assertNotIn(conflict_id, repeated.stdout)
+        self.assertNotIn("MEMORY CONFLICT", repeated.stdout)
+        self.assertIn("new concurrent conflicts 0", repeated.stdout)
+
+        later_start = self.cli("start", "--actor", "quiet-third")
+        self.assertNotIn("HUMAN DECISION NEEDED", later_start.stdout)
+        self.assertNotIn(conflict_id, later_start.stdout)
+        self.assertNotIn("quiet.subject", later_start.stdout)
+
+        review = self.cli("review")
+        self.assertIn("Actionable concurrent conflicts: 1", review.stdout)
+        self.assertIn("Review records: total 1", review.stdout)
+        self.assertIn(f"MEMORY CONFLICT {conflict_id}", review.stdout)
+        self.assertIn(f"run {second} (quiet-second)", review.stdout)
+        self.assertIn("source user | trust confirmed", review.stdout)
+        self.assertIn("base V000000", review.stdout)
+
+        closed = self.cli(
+            "close",
+            "--run",
+            second,
+            "--summary",
+            "Conflict remains available through pull review.",
+        )
+        self.assertNotIn(conflict_id, closed.stdout)
+        self.assertNotIn("human decisions needed", closed.stdout.lower())
+        self.assertEqual(self.decision(first_id)["outcome"], "accepted")
+
+    def test_review_pagination_and_conflict_enlargement_never_truncate(self):
+        conflicts = []
+        enlarged_candidate = None
+        for index in range(7):
+            live_run = self.start(f"page-live-{index}")
+            candidate_run = self.start(f"page-candidate-{index}")
+            extra_run = self.start("page-enlargement") if index == 0 else None
+            key = f"page.subject-{index}"
+            self.propose(
+                live_run,
+                key,
+                f"Live value {index}.",
+                source="agent",
+                trust="working",
+            )
+            candidate = self.propose(
+                candidate_run,
+                key,
+                f"Candidate value {index}.",
+                source="agent",
+                trust="working",
+            )
+            if extra_run:
+                enlarged_candidate = self.propose(
+                    extra_run,
+                    key,
+                    "A genuinely new candidate for the first conflict.",
+                    source="agent",
+                    trust="working",
+                )
+            self.cli("sync", "--run", live_run)
+            created = self.cli("sync", "--run", candidate_run)
+            conflict_id = self.decision(candidate)["conflict_id"]
+            conflicts.append(conflict_id)
+            self.assertIn(conflict_id, created.stdout)
+            if extra_run:
+                enlarged = self.cli("sync", "--run", extra_run)
+                self.assertEqual(
+                    self.decision(enlarged_candidate)["conflict_id"],
+                    conflict_id,
+                )
+                self.assertIn(conflict_id, enlarged.stdout)
+                self.assertIn(f"Choice {enlarged_candidate}", enlarged.stdout)
+                replayed = self.cli("sync", "--run", extra_run)
+                self.assertNotIn(conflict_id, replayed.stdout)
+
+        first_page = self.cli("review", "--limit", 3)
+        self.assertIn(
+            "Review records: total 7 | displayed 1-3 | remaining 4",
+            first_page.stdout,
+        )
+        for conflict_id in conflicts[:3]:
+            self.assertIn(conflict_id, first_page.stdout)
+        for conflict_id in conflicts[3:]:
+            self.assertNotIn(conflict_id, first_page.stdout)
+        self.assertIn(f"Choice {enlarged_candidate}", first_page.stdout)
+
+        second_page = self.cli("review", "--offset", 3, "--limit", 3)
+        self.assertIn(
+            "Review records: total 7 | displayed 4-6 | remaining 1",
+            second_page.stdout,
+        )
+        for conflict_id in conflicts[3:6]:
+            self.assertIn(conflict_id, second_page.stdout)
+
+        final_page = self.cli("review", "--offset", 6, "--limit", 3)
+        self.assertIn(
+            "Review records: total 7 | displayed 7-7 | remaining 0",
+            final_page.stdout,
+        )
+        self.assertIn(conflicts[6], final_page.stdout)
+
+        no_page = self.cli("review", "--offset", 7, "--limit", 3)
+        self.assertIn(
+            "Review records: total 7 | displayed 0-0 | remaining 0",
+            no_page.stdout,
+        )
+
+    def test_historical_exact_effect_is_derived_without_authority_rewrite(self):
+        first = self.start("historical-first")
+        second = self.start("historical-second")
+        self.propose(
+            first,
+            "history.subject",
+            "The earlier working value.",
+            source="agent",
+            trust="working",
+        )
+        candidate = self.propose(
+            second,
+            "history.subject",
+            "The exact candidate value.",
+        )
+        self.cli("sync", "--run", first)
+        self.cli("sync", "--run", second)
+        decision_before = (
+            self.root / ".bimri" / "decisions" / f"{candidate}.json"
+        ).read_bytes()
+        conflict_id = self.decision(candidate)["conflict_id"]
+        conflict_before = (
+            self.root / ".bimri" / "conflicts" / f"{conflict_id}.json"
+        ).read_bytes()
+
+        later = self.start("historical-later")
+        self.propose(
+            later,
+            "history.subject",
+            "The exact candidate value.",
+        )
+        self.cli("sync", "--run", later)
+        satisfying_revision = self.state()["head_revision"]
+
+        status = self.cli("status")
+        self.assertIn("Actionable concurrent conflicts: 0", status.stdout)
+        self.assertIn("Satisfied historical candidates: 1", status.stdout)
+        review = self.cli("review", "--all")
+        self.assertIn("SATISFIED HISTORICAL CANDIDATE", review.stdout)
+        self.assertIn(
+            f"already satisfied by V{satisfying_revision:06d}",
+            review.stdout,
+        )
+        self.assertEqual(
+            (
+                self.root / ".bimri" / "decisions" / f"{candidate}.json"
+            ).read_bytes(),
+            decision_before,
+        )
+        self.assertEqual(
+            (
+                self.root / ".bimri" / "conflicts" / f"{conflict_id}.json"
+            ).read_bytes(),
+            conflict_before,
+        )
+        self.assertFalse(
+            (
+                self.root / ".bimri" / "resolutions" / f"{conflict_id}.json"
+            ).exists()
+        )
+
+    def test_partial_historical_satisfaction_is_exact_and_never_resurrects(self):
+        first = self.start("partial-live")
+        exact_run = self.start("partial-exact")
+        similar_run = self.start("partial-similar")
+        common = (
+            "--confidence",
+            "developing",
+            "--observations",
+            "3",
+            "--falsifier",
+            "A controlled replay does not reproduce the pattern.",
+        )
+        self.propose(
+            first,
+            "history.pattern",
+            "The initial live pattern.",
+            tier=3,
+            extra=(
+                "--confidence",
+                "emerging",
+                "--observations",
+                "2",
+                "--falsifier",
+                "A later run disproves the initial pattern.",
+            ),
+        )
+        exact = self.propose(
+            exact_run,
+            "history.pattern",
+            "The same candidate prose.",
+            tier=3,
+            extra=common,
+        )
+        similar = self.propose(
+            similar_run,
+            "history.pattern",
+            "The same candidate prose.",
+            tier=3,
+            extra=(
+                "--confidence",
+                "established",
+                "--observations",
+                "3",
+                "--falsifier",
+                "A controlled replay does not reproduce the pattern.",
+            ),
+        )
+        self.cli("sync", "--run", first)
+        created = self.cli("sync", "--run", exact_run)
+        conflict_id = self.decision(exact)["conflict_id"]
+        self.assertIn(conflict_id, created.stdout)
+        enlarged = self.cli("sync", "--run", similar_run)
+        self.assertEqual(self.decision(similar)["conflict_id"], conflict_id)
+        self.assertIn(conflict_id, enlarged.stdout)
+        self.assertIn(f"Choice {similar}", enlarged.stdout)
+        replayed = self.cli("sync", "--run", similar_run)
+        self.assertNotIn(conflict_id, replayed.stdout)
+
+        satisfying = self.start("partial-satisfying")
+        self.propose(
+            satisfying,
+            "history.pattern",
+            "The same candidate prose.",
+            tier=3,
+            extra=(*common, "--evidence", f"{exact_run}-E001"),
+        )
+        self.cli("sync", "--run", satisfying)
+        satisfying_revision = self.state()["head_revision"]
+
+        review = self.cli("review")
+        self.assertIn("Actionable concurrent conflicts: 1", review.stdout)
+        self.assertIn(f"Choice {similar}", review.stdout)
+        self.assertNotIn(f"Choice {exact}", review.stdout)
+        all_review = self.cli("review", "--all")
+        self.assertIn("Satisfied historical candidates: 1", all_review.stdout)
+        self.assertIn(f"Choice {exact}", all_review.stdout)
+        self.assertIn(
+            f"already satisfied by V{satisfying_revision:06d}",
+            all_review.stdout,
+        )
+        self.assertIn(f"Choice {similar}", all_review.stdout)
+
+        moved = self.start("partial-moved")
+        self.propose(
+            moved,
+            "history.pattern",
+            "A later different pattern.",
+            tier=3,
+            extra=(
+                "--confidence",
+                "emerging",
+                "--observations",
+                "1",
+                "--falsifier",
+                "The later pattern does not recur.",
+            ),
+        )
+        self.cli("sync", "--run", moved)
+        after_movement = self.cli("review", "--all")
+        self.assertIn("Satisfied historical candidates: 1", after_movement.stdout)
+        self.assertIn(f"Choice {exact}", after_movement.stdout)
+        self.assertIn(f"Choice {similar}", after_movement.stdout)
+
+    def test_first_resolution_of_currently_reflected_candidate_is_revision_free(self):
+        first = self.start("resolve-first")
+        second = self.start("resolve-second")
+        self.propose(
+            first,
+            "resolve.reflected",
+            "Working value.",
+            source="agent",
+            trust="working",
+        )
+        candidate = self.propose(
+            second,
+            "resolve.reflected",
+            "Chosen value.",
+        )
+        self.cli("sync", "--run", first)
+        self.cli("sync", "--run", second)
+        conflict_id = self.decision(candidate)["conflict_id"]
+        later = self.start("resolve-later")
+        self.propose(later, "resolve.reflected", "Chosen value.")
+        self.cli("sync", "--run", later)
+        revision_before = self.state()["head_revision"]
+
+        resolved = self.cli(
+            "resolve",
+            conflict_id,
+            "--choose",
+            candidate,
+            "--human-approved",
+        )
+        self.assertIn(f"resolved with {candidate}", resolved.stdout)
+        self.assertEqual(self.state()["head_revision"], revision_before)
+        resolution = json.loads(
+            (
+                self.root
+                / ".bimri"
+                / "resolutions"
+                / f"{conflict_id}.json"
+            ).read_text("utf-8")
+        )
+        self.assertEqual(resolution["revision_after"], revision_before)
+        self.assertEqual(resolution["authority"], "human-asserted")
+        self.assertIn("BIMRI doctor: PASSED", self.cli("doctor").stdout)
+
+    def test_archive_marker_must_match_reason_and_exact_removed_line(self):
+        run_id = self.start("archive-hardening")
+        self.propose(
+            run_id,
+            "archive.hardening",
+            "The exact line that will be archived.",
+            source="agent",
+            trust="working",
+        )
+        self.cli("sync", "--run", run_id)
+        current_line = next(
+            line
+            for line in self.hot().splitlines()
+            if "[K:archive.hardening]" in line
+        )
+        target = re.match(r"\[([^\]]+)\]", current_line).group(1)
+        close_result = self.cli(
+            "propose",
+            "--run",
+            run_id,
+            "--operation",
+            "close",
+            "--key",
+            "archive.hardening",
+            "--target",
+            target,
+            "--source",
+            "agent",
+            "--trust",
+            "working",
+        )
+        close_id = PROPOSAL_RE.search(close_result.stdout).group(0)
+        self.cli("sync", "--run", run_id)
+        archive_path = (
+            self.root
+            / ".bimri"
+            / "archive"
+            / f"{dt.date.today():%Y-%m}.md"
+        )
+        archive = archive_path.read_text("utf-8")
+        archive_path.write_text(
+            archive.replace(
+                f"[BY:{close_id}] [closed] {current_line}",
+                f"[BY:{close_id}] [closed] a different raw line",
+            ),
+            "utf-8",
+        )
+        proposal = json.loads(
+            (
+                self.root / ".bimri" / "proposals" / f"{close_id}.json"
+            ).read_text("utf-8")
+        )
+        decision_path = (
+            self.root / ".bimri" / "decisions" / f"{close_id}.json"
+        )
+        decision_path.write_text(
+            json.dumps({
+                "bimri_version": "5.0",
+                "proposal_id": close_id,
+                "outcome": "applying",
+                "recorded_at": self.decision(close_id)["recorded_at"],
+                "base_hash": proposal["base_hash"],
+                "revision_before": proposal["base_revision"],
+            }, indent=2, sort_keys=True) + "\n",
+            "utf-8",
+        )
+        replay = self.cli("sync", "--run", run_id, check=False)
+        self.assertEqual(replay.returncode, 2)
+        self.assertIn("authority recovery is required", replay.stderr)
+        self.assertIn("does not match its required reason", replay.stderr)
+
     def test_resolution_requires_attestation_and_preserves_claim_origin(self):
         for source in ("agent", "external"):
             with self.subTest(source=source):
                 root = self.root / source
-                owner_run = self.start("owner", root=root)
-                original = self.propose(
-                    owner_run,
-                    "authority.claim",
-                    "The owner-confirmed value.",
-                    root=root,
-                )
-                self.cli("sync", "--run", owner_run, root=root)
-                self.assertEqual(
-                    self.decision(original, root=root)["outcome"],
-                    "accepted",
-                )
-
-                candidate_run = self.start(source, root=root)
-                candidate = self.propose(
-                    candidate_run,
+                candidate_run, candidate, _, original = self.stage_concurrent_candidate(
                     "authority.claim",
                     f"The {source}-origin replacement.",
-                    source=source,
-                    trust="working",
                     root=root,
+                    candidate_actor=source,
+                    candidate_source=source,
+                    writer_text="The live working value.",
                 )
                 self.cli("sync", "--run", candidate_run, root=root)
                 contested = self.decision(candidate, root=root)
@@ -657,22 +1655,12 @@ class BimriCliTest(unittest.TestCase):
                 self.assertEqual(immutable["source"], source)
 
     def test_legacy_resolution_without_attestation_keeps_legacy_effect_semantics(self):
-        owner_run = self.start("owner")
-        original = self.propose(
-            owner_run,
-            "legacy.resolution",
-            "The original owner-confirmed value.",
-        )
-        self.cli("sync", "--run", owner_run)
-        self.assertEqual(self.decision(original)["outcome"], "accepted")
-
-        candidate_run = self.start("legacy-agent")
-        candidate = self.propose(
-            candidate_run,
+        candidate_run, candidate, _, original = self.stage_concurrent_candidate(
             "legacy.resolution",
             "The legacy human-approved agent proposal.",
-            source="agent",
-            trust="working",
+            candidate_actor="legacy-agent",
+            candidate_source="agent",
+            writer_text="The live working value.",
         )
         self.cli("sync", "--run", candidate_run)
         contested = self.decision(candidate)
@@ -743,51 +1731,45 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(self.decision(committed)["outcome"], "accepted")
         self.assertEqual(self.state()["head_revision"], 1)
 
-        late = self.propose(
-            earlier_run,
-            "roadmap.priority",
-            "Ship the reporting feature first.",
+        before = {
+            path.relative_to(self.root).as_posix(): path.read_bytes()
+            for path in self.root.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        }
+        late = self.cli(
+            "propose", "--run", earlier_run, "--tier", "2",
+            "--key", "roadmap.priority",
+            "--text", "Ship the reporting feature first.",
+            "--source", "user", "--trust", "confirmed", check=False,
         )
-        proposal = json.loads(
-            (
-                self.root / ".bimri" / "proposals" / f"{late}.json"
-            ).read_text("utf-8")
-        )
-        self.assertEqual(proposal["base_revision"], 0)
-        self.assertEqual(proposal["base_hash"], "absent")
-
-        self.cli("sync", "--run", earlier_run)
-        decision = self.decision(late)
-        self.assertEqual(decision["outcome"], "contested")
-        conflict = json.loads(
-            (
-                self.root
-                / ".bimri"
-                / "conflicts"
-                / f"{decision['conflict_id']}.json"
-            ).read_text("utf-8")
-        )
-        self.assertEqual(conflict["type"], "stale-base")
-        self.assertIn("Ship the search feature first.", conflict["current_line"])
+        self.assertEqual(late.returncode, 2)
+        self.assertIn(f"sync {earlier_run}", late.stderr)
+        after = {
+            path.relative_to(self.root).as_posix(): path.read_bytes()
+            for path in self.root.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        }
+        self.assertEqual(after, before)
+        self.assertEqual(self.state()["conflict_count"], 0)
+        self.assertEqual(list((self.root / ".bimri" / "conflicts").glob("C*.json")), [])
         self.assertIn("Ship the search feature first.", self.hot())
         self.assertNotIn("Ship the reporting feature first.", self.hot())
 
     def test_tampered_proposal_base_hash_cannot_bypass_stale_detection(self):
         stale_run = self.start("stale-agent")
         committer = self.start("committer")
+        candidate = self.propose(
+            stale_run, "optimistic.lock",
+            "A tampered stale overwrite must not land.",
+            source="agent", trust="working",
+        )
         committed = self.propose(
-            committer,
-            "optimistic.lock",
+            committer, "optimistic.lock",
             "The value committed after the stale run began.",
+            source="agent", trust="working",
         )
         self.cli("sync", "--run", committer)
         self.assertEqual(self.decision(committed)["outcome"], "accepted")
-
-        candidate = self.propose(
-            stale_run,
-            "optimistic.lock",
-            "A tampered stale overwrite must not land.",
-        )
         proposal_path = (
             self.root / ".bimri" / "proposals" / f"{candidate}.json"
         )
@@ -810,7 +1792,7 @@ class BimriCliTest(unittest.TestCase):
         status = self.cli("status", check=False)
         self.assertEqual(status.returncode, 1)
         self.assertIn(
-            "proposal base hash does not match its immutable base revision",
+            "proposal preflight key hash does not match proposal base hash",
             status.stdout,
         )
         blocked = self.cli("sync", "--run", stale_run, check=False)
@@ -848,7 +1830,7 @@ class BimriCliTest(unittest.TestCase):
         self.assertNotIn("[K:crash.before-state]", self.hot())
 
         recovered = self.cli("sync", "--run", run_id)
-        self.assertIn("accepted 1, contested 0", recovered.stdout)
+        self.assertIn("applied 1, already satisfied/no change 0", recovered.stdout)
         final = self.decision(proposal_id)
         self.assertEqual(final["outcome"], "accepted")
         self.assertEqual(final["revision"], 2)
@@ -868,6 +1850,8 @@ class BimriCliTest(unittest.TestCase):
             crashed_run,
             "crash.same-key",
             "Value A landed before the child died.",
+            source="agent",
+            trust="working",
         )
 
         crashed = self.worker(
@@ -889,16 +1873,19 @@ class BimriCliTest(unittest.TestCase):
             later_run,
             "crash.same-key",
             "Value B is the later committed update.",
+            source="agent",
+            trust="working",
         )
         self.cli("sync", "--run", later_run)
         self.assertEqual(self.decision(later_proposal)["outcome"], "accepted")
         self.assertEqual(self.state()["head_revision"], 2)
         self.assertIn("Value B is the later committed update.", self.hot())
 
-        retry = self.cli("sync", "--run", crashed_run)
-        self.assertIn("accepted 0, contested 1", retry.stdout)
+        retry = self.cli("sync", "--run", crashed_run, check=False)
+        self.assertEqual(retry.returncode, 2)
+        self.assertIn("later keyed writer cannot be proven", retry.stderr)
         recovered = self.decision(crashed_proposal)
-        self.assertEqual(recovered["outcome"], "contested")
+        self.assertEqual(recovered["outcome"], "applying")
         self.assertEqual(self.state()["head_revision"], 2)
         self.assertIn("Value B is the later committed update.", self.hot())
         self.assertNotIn("Value A landed before the child died.", self.hot())
@@ -907,12 +1894,7 @@ class BimriCliTest(unittest.TestCase):
             for path in (self.root / ".bimri" / "conflicts").glob("C*.json")
             if '"key": "crash.same-key"' in path.read_text("utf-8")
         ]
-        self.assertEqual(len(same_key_conflicts), 1)
-        self.assertEqual(same_key_conflicts[0]["type"], "stale-base")
-        self.assertEqual(
-            same_key_conflicts[0]["proposal_ids"],
-            [crashed_proposal],
-        )
+        self.assertEqual(same_key_conflicts, [])
 
     def test_resolution_and_decision_finalization_are_crash_idempotent(self):
         first_candidate_run = self.start("candidate-one")
@@ -922,21 +1904,26 @@ class BimriCliTest(unittest.TestCase):
             committer_run,
             "shared.choice",
             "Keep the committed value.",
+            source="agent",
+            trust="working",
         )
-        self.cli("sync", "--run", committer_run)
-        self.assertEqual(self.decision(committed)["outcome"], "accepted")
-
         first_candidate = self.propose(
             first_candidate_run,
             "shared.choice",
             "Choose candidate one.",
+            source="agent",
+            trust="working",
         )
-        self.cli("sync", "--run", first_candidate_run)
         second_candidate = self.propose(
             second_candidate_run,
             "shared.choice",
             "Choose candidate two.",
+            source="agent",
+            trust="working",
         )
+        self.cli("sync", "--run", committer_run)
+        self.assertEqual(self.decision(committed)["outcome"], "accepted")
+        self.cli("sync", "--run", first_candidate_run)
         self.cli("sync", "--run", second_candidate_run)
         first_decision = self.decision(first_candidate)
         second_decision = self.decision(second_candidate)
@@ -992,14 +1979,18 @@ class BimriCliTest(unittest.TestCase):
             crash_committer,
             "crash.choice",
             "The pre-conflict value.",
+            source="agent",
+            trust="working",
         )
-        self.cli("sync", "--run", crash_committer)
-        self.assertEqual(self.decision(crash_committed)["outcome"], "accepted")
         crash_candidate = self.propose(
             stale_run,
             "crash.choice",
             "The chosen value already committed before the crash.",
+            source="agent",
+            trust="working",
         )
+        self.cli("sync", "--run", crash_committer)
+        self.assertEqual(self.decision(crash_committed)["outcome"], "accepted")
         self.cli("sync", "--run", stale_run)
         crash_decision = self.decision(crash_candidate)
         self.assertEqual(crash_decision["outcome"], "contested")
@@ -1076,25 +2067,34 @@ class BimriCliTest(unittest.TestCase):
                 root = self.root / damage
                 first_run = self.start("first", root=root)
                 second_run = self.start("second", root=root)
+                writer_run = self.start("writer", root=root)
                 first_id = self.propose(
                     first_run,
                     "resolve.preflight",
                     "First candidate.",
-                    tier=1,
                     source="agent",
                     trust="working",
-                    extra=("--kind", "decision"),
                     root=root,
                 )
                 second_id = self.propose(
                     second_run,
                     "resolve.preflight",
                     "Second candidate.",
-                    tier=1,
                     source="agent",
                     trust="working",
-                    extra=("--kind", "decision"),
                     root=root,
+                )
+                writer_id = self.propose(
+                    writer_run,
+                    "resolve.preflight",
+                    "Accepted competing value.",
+                    source="agent",
+                    trust="working",
+                    root=root,
+                )
+                self.cli("sync", "--run", writer_run, root=root)
+                self.assertEqual(
+                    self.decision(writer_id, root=root)["outcome"], "accepted"
                 )
                 self.cli("sync", "--run", first_run, root=root)
                 self.cli("sync", "--run", second_run, root=root)
@@ -1154,15 +2154,11 @@ class BimriCliTest(unittest.TestCase):
                 )
 
     def test_conflict_creation_crash_can_recreate_missing_decision(self):
-        run_id = self.start("conflict-recovery")
-        proposal_id = self.propose(
-            run_id,
+        run_id, proposal_id, _, _ = self.stage_concurrent_candidate(
             "conflict.recovery",
-            "An approval conflict survives a crash before its decision write.",
-            tier=1,
-            source="agent",
-            trust="working",
-            extra=("--kind", "decision"),
+            "A concurrent conflict survives a missing decision write.",
+            candidate_actor="conflict-recovery",
+            writer_text="The competing accepted value.",
         )
         self.cli("sync", "--run", run_id)
         original = self.decision(proposal_id)
@@ -1175,13 +2171,17 @@ class BimriCliTest(unittest.TestCase):
         )
         decision_path.unlink()
 
-        recovered = self.cli("sync", "--run", run_id)
-        self.assertIn("accepted 0, contested 1", recovered.stdout)
-        recreated = self.decision(proposal_id)
-        self.assertEqual(recreated["outcome"], "contested")
-        self.assertEqual(recreated["conflict_id"], original["conflict_id"])
-        self.assertIn("Open conflicts: 1", self.cli("status").stdout)
-        self.assertIn("BIMRI doctor: PASSED", self.cli("doctor").stdout)
+        recovered = self.cli("sync", "--run", run_id, check=False)
+        self.assertEqual(recovered.returncode, 2)
+        self.assertIn("shared-memory writes are paused", recovered.stderr)
+        self.assertNotIn("MEMORY CONFLICT", recovered.stdout)
+        self.assertFalse(decision_path.exists())
+        conflict_path = (
+            self.root / ".bimri" / "conflicts" / f"{original['conflict_id']}.json"
+        )
+        self.assertTrue(conflict_path.is_file())
+        status = self.cli("status", check=False)
+        self.assertIn("AUTHORITY RECOVERY NEEDED", status.stdout)
 
     def test_stale_close_resolution_archives_removed_current_value_after_retry(self):
         creator = self.start("creator")
@@ -1189,6 +2189,8 @@ class BimriCliTest(unittest.TestCase):
             creator,
             "stale.close",
             "Value A from the stale run base.",
+            source="agent",
+            trust="working",
         )
         self.cli("sync", "--run", creator)
         self.assertEqual(self.decision(created)["outcome"], "accepted")
@@ -1221,6 +2223,8 @@ class BimriCliTest(unittest.TestCase):
             changer,
             "stale.close",
             "Value B that the human ultimately removes.",
+            source="agent",
+            trust="working",
         )
         self.cli("sync", "--run", changer)
         self.assertEqual(self.decision(changed)["outcome"], "accepted")
@@ -1244,6 +2248,12 @@ class BimriCliTest(unittest.TestCase):
         )
         self.assertEqual(conflict["type"], "stale-base")
         self.assertIn("Value B that the human ultimately removes.", conflict["current_line"])
+        review = self.cli("review", conflict_id)
+        self.assertIn("Concurrent removal", review.stdout)
+        self.assertIn("Action: remove/archive", review.stdout)
+        self.assertIn("absent from hot memory", review.stdout)
+        self.assertIn("preserve the exact prior line", review.stdout)
+        self.assertNotIn("promote", review.stdout.lower())
 
         archive_path = (
             self.root
@@ -1351,6 +2361,8 @@ class BimriCliTest(unittest.TestCase):
             first_run,
             "archive.decoy",
             f"Raw memory mentions [BY:{future_close_id}] as ordinary text.",
+            source="agent",
+            trust="working",
         )
         self.cli("sync", "--run", first_run)
         decoy_line = next(
@@ -1383,6 +2395,8 @@ class BimriCliTest(unittest.TestCase):
             second_run,
             "archive.victim",
             "This exact victim line must receive its own archive record.",
+            source="agent",
+            trust="working",
         )
         self.cli("sync", "--run", second_run)
         victim_line = next(
@@ -1436,6 +2450,8 @@ class BimriCliTest(unittest.TestCase):
             creator,
             "replay.close",
             "This item will be closed.",
+            source="agent",
+            trust="working",
         )
         self.cli("sync", "--run", creator)
         self.assertEqual(self.decision(created)["outcome"], "accepted")
@@ -1486,7 +2502,7 @@ class BimriCliTest(unittest.TestCase):
         )
 
         close_replay = self.cli("sync", "--run", closer)
-        self.assertIn("accepted 1, contested 0", close_replay.stdout)
+        self.assertIn("applied 1, already satisfied/no change 0", close_replay.stdout)
         self.assertEqual(self.state()["head_revision"], close_revision)
         replayed_close = self.decision(close_id)
         self.assertEqual(replayed_close["outcome"], "accepted")
@@ -1502,6 +2518,8 @@ class BimriCliTest(unittest.TestCase):
             touch_creator,
             "replay.touch",
             "This item will be touched.",
+            source="agent",
+            trust="working",
         )
         self.cli("sync", "--run", touch_creator)
         self.assertEqual(self.decision(touch_created)["outcome"], "accepted")
@@ -1554,7 +2572,7 @@ class BimriCliTest(unittest.TestCase):
         )
 
         touch_replay = self.cli("sync", "--run", toucher)
-        self.assertIn("accepted 1, contested 0", touch_replay.stdout)
+        self.assertIn("applied 1, already satisfied/no change 0", touch_replay.stdout)
         self.assertEqual(self.state()["head_revision"], touch_revision)
         replayed_touch = self.decision(touch_id)
         self.assertEqual(replayed_touch["outcome"], "accepted")
@@ -1604,41 +2622,41 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(invalid_external.returncode, 2)
         self.assertIn("only directly human-stated", invalid_external.stderr)
 
-        human_core = self.propose(
-            run_id,
-            "owner.preference",
-            "The owner prefers concise status reports.",
-            tier=1,
-            source="user",
-            trust="confirmed",
-            extra=("--kind", "pref"),
+        before = {
+            path.relative_to(self.root).as_posix(): path.read_bytes()
+            for path in self.root.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        }
+        human_core = self.cli(
+            "propose", "--run", run_id, "--tier", "1",
+            "--key", "owner.preference",
+            "--text", "The owner prefers concise status reports.",
+            "--source", "user", "--trust", "confirmed", "--kind", "pref",
+            check=False,
         )
-        self.cli("sync", "--run", run_id)
-        self.assertEqual(self.decision(human_core)["outcome"], "accepted")
-        self.assertIn("[T:confirmed] [SRC:user]", self.hot())
+        self.assertEqual(human_core.returncode, 2)
+        self.assertIn("Tier 1 memory is paused", human_core.stderr)
+        self.assertEqual(
+            {
+                path.relative_to(self.root).as_posix(): path.read_bytes()
+                for path in self.root.rglob("*")
+                if path.is_file() and not path.is_symlink()
+            },
+            before,
+        )
 
         second = self.start("agent")
-        agent_core = self.propose(
-            second,
-            "architecture.assumption",
-            "The service should use a queue.",
-            tier=1,
-            source="agent",
-            trust="working",
-            extra=("--kind", "decision"),
+        agent_core = self.cli(
+            "propose", "--run", second, "--tier", "1",
+            "--key", "architecture.assumption",
+            "--text", "The service should use a queue.",
+            "--source", "agent", "--trust", "working", "--kind", "decision",
+            check=False,
         )
-        self.cli("sync", "--run", second)
-        agent_decision = self.decision(agent_core)
-        self.assertEqual(agent_decision["outcome"], "contested")
-        conflict = json.loads(
-            (
-                self.root
-                / ".bimri"
-                / "conflicts"
-                / f"{agent_decision['conflict_id']}.json"
-            ).read_text("utf-8")
-        )
-        self.assertEqual(conflict["type"], "approval")
+        self.assertEqual(agent_core.returncode, 2)
+        self.assertIn("Tier 1 memory is paused", agent_core.stderr)
+        self.assertEqual(self.state()["conflict_count"], 0)
+        self.assertEqual(list((self.root / ".bimri" / "conflicts").glob("C*.json")), [])
 
     def test_human_can_confirm_identical_working_memory(self):
         agent_run = self.start("agent")
@@ -1682,26 +2700,28 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(self.decision(initial)["outcome"], "accepted")
 
         agent_run = self.start("agent")
-        changed = self.propose(
-            agent_run,
-            "launch.date",
-            "Launch on Tuesday.",
-            source="agent",
-            trust="working",
+        before = {
+            path.relative_to(self.root).as_posix(): path.read_bytes()
+            for path in self.root.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        }
+        changed = self.cli(
+            "propose", "--run", agent_run, "--tier", "2",
+            "--key", "launch.date", "--text", "Launch on Tuesday.",
+            "--source", "agent", "--trust", "working", check=False,
         )
-        self.cli("sync", "--run", agent_run)
-        decision = self.decision(changed)
-        self.assertEqual(decision["outcome"], "contested")
-        conflict = json.loads(
-            (
-                self.root
-                / ".bimri"
-                / "conflicts"
-                / f"{decision['conflict_id']}.json"
-            ).read_text("utf-8")
+        self.assertEqual(changed.returncode, 2)
+        self.assertIn("confirmed memory launch.date is protected", changed.stderr)
+        self.assertEqual(
+            {
+                path.relative_to(self.root).as_posix(): path.read_bytes()
+                for path in self.root.rglob("*")
+                if path.is_file() and not path.is_symlink()
+            },
+            before,
         )
-        self.assertEqual(conflict["type"], "confirmed-change")
-        self.assertIn("Launch on Monday.", conflict["current_line"])
+        self.assertEqual(self.state()["conflict_count"], 0)
+        self.assertEqual(list((self.root / ".bimri" / "conflicts").glob("C*.json")), [])
 
     def test_caps_and_oversize_inputs_fail_without_silent_truncation(self):
         self.cli("migrate")
@@ -1737,14 +2757,13 @@ class BimriCliTest(unittest.TestCase):
         self.cli("sync", "--run", first)
         self.assertEqual(self.decision(first_proposal)["outcome"], "accepted")
         second = self.start("claude")
-        second_proposal = self.propose(second, "second.item", "Second compact item.")
-        self.cli("sync", "--run", second)
-        decision = self.decision(second_proposal)
-        self.assertEqual(decision["outcome"], "contested")
-        self.assertTrue(
-            any("Tier 2 exceeds cap" in error for error in decision["errors"]),
-            decision,
+        second_proposal = self.cli(
+            "propose", "--run", second, "--tier", "2",
+            "--key", "second.item", "--text", "Second compact item.",
+            "--source", "user", "--trust", "confirmed", check=False,
         )
+        self.assertEqual(second_proposal.returncode, 2)
+        self.assertIn("Tier 2 exceeds cap", second_proposal.stderr)
         self.assertEqual(self.hot().count("[K:first.item]"), 1)
         self.assertNotIn("[K:second.item]", self.hot())
 
@@ -1754,14 +2773,14 @@ class BimriCliTest(unittest.TestCase):
         state["hot_max_bytes"] = len(self.hot().encode("utf-8")) + 10
         state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", "utf-8")
         third = self.start("other")
-        byte_cap = self.propose(third, "byte.cap", "This cannot fit.")
-        self.cli("sync", "--run", third)
-        byte_decision = self.decision(byte_cap)
-        self.assertEqual(byte_decision["outcome"], "contested")
-        self.assertTrue(
-            any("hot memory exceeds byte cap" in error for error in byte_decision["errors"]),
-            byte_decision,
+        byte_cap = self.cli(
+            "propose", "--run", third, "--tier", "2",
+            "--key", "byte.cap", "--text", "This cannot fit.",
+            "--source", "user", "--trust", "confirmed", check=False,
         )
+        self.assertEqual(byte_cap.returncode, 2)
+        self.assertIn("hot memory exceeds byte cap", byte_cap.stderr)
+        self.assertEqual(self.state()["conflict_count"], 0)
 
     def test_inherited_cap_overflow_can_be_reduced_three_to_two_to_one(self):
         bdir = self.root / ".bimri"
@@ -1912,15 +2931,11 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(malformed.read_text("utf-8"), "{ definitely not JSON")
 
     def test_corrupt_authority_degrades_reads_blocks_writes_and_can_be_restored(self):
-        run_id = self.start("corruption-fixture")
-        candidate = self.propose(
-            run_id,
+        run_id, candidate, _, _ = self.stage_concurrent_candidate(
             "corruption.choice",
             "This agent-origin claim needs owner review.",
-            tier=1,
-            source="agent",
-            trust="working",
-            extra=("--kind", "decision"),
+            candidate_actor="corruption-fixture",
+            writer_text="The competing live authority value.",
         )
         self.cli("sync", "--run", run_id)
         contested = self.decision(candidate)
@@ -1973,22 +2988,19 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(doctor.returncode, 1)
         self.assertIn(f"{conflict_id}.json", doctor.stdout)
 
-        staged = self.propose(
-            degraded_run,
-            "corruption.unrelated",
-            "This unrelated proposal must remain staged.",
-        )
         head_before_sync = self.state()["head_revision"]
         blocked = self.cli(
-            "sync", "--run", degraded_run, check=False
+            "propose", "--run", degraded_run, "--tier", "2",
+            "--key", "corruption.unrelated",
+            "--text", "This unrelated proposal must not be staged.",
+            "--source", "user", "--trust", "confirmed", check=False,
         )
         self.assertEqual(blocked.returncode, 2)
-        self.assertIn("shared-memory writes are paused", blocked.stderr)
+        self.assertIn("C000001.json is unreadable", blocked.stderr)
         self.assertEqual(self.state()["head_revision"], head_before_sync)
-        self.assertFalse(
-            (
-                self.root / ".bimri" / "decisions" / f"{staged}.json"
-            ).exists()
+        self.assertEqual(
+            list((self.root / ".bimri" / "proposals").glob(f"{degraded_run}-Q*.json")),
+            [],
         )
 
         denied = self.cli(
@@ -2097,6 +3109,11 @@ class BimriCliTest(unittest.TestCase):
             "--choose",
             "current",
             "--human-approved",
+        )
+        staged = self.propose(
+            degraded_run,
+            "corruption.unrelated",
+            "This unrelated proposal is staged after authority recovery.",
         )
         self.cli("sync", "--run", degraded_run)
         self.assertEqual(self.decision(staged)["outcome"], "accepted")
@@ -2217,16 +3234,12 @@ class BimriCliTest(unittest.TestCase):
         )
 
         graph_root = self.root / "multi-quarantine"
-        graph_run = self.start("multi", root=graph_root)
-        candidate = self.propose(
-            graph_run,
+        graph_run, candidate, _, _ = self.stage_concurrent_candidate(
             "multi.graph",
             "This candidate creates linked conflict authority.",
-            tier=1,
-            source="agent",
-            trust="working",
-            extra=("--kind", "decision"),
             root=graph_root,
+            candidate_actor="multi",
+            writer_text="The competing live graph value.",
         )
         self.cli("sync", "--run", graph_run, root=graph_root)
         decision = self.decision(candidate, root=graph_root)
@@ -2332,15 +3345,11 @@ class BimriCliTest(unittest.TestCase):
         )
 
     def test_authority_symlink_quarantine_preserves_link_evidence_and_external_target(self):
-        run_id = self.start("symlink-quarantine")
-        candidate = self.propose(
-            run_id,
+        run_id, candidate, _, _ = self.stage_concurrent_candidate(
             "symlink.quarantine",
             "This candidate creates authority that will be redirected.",
-            tier=1,
-            source="agent",
-            trust="working",
-            extra=("--kind", "decision"),
+            candidate_actor="symlink-quarantine",
+            writer_text="The competing live symlink value.",
         )
         self.cli("sync", "--run", run_id)
         conflict_id = self.decision(candidate)["conflict_id"]
@@ -2443,16 +3452,12 @@ class BimriCliTest(unittest.TestCase):
         for damage in ("deleted", "tampered"):
             with self.subTest(damage=damage):
                 root = self.root / damage
-                run_id = self.start(f"restore-{damage}", root=root)
-                candidate = self.propose(
-                    run_id,
+                run_id, candidate, _, _ = self.stage_concurrent_candidate(
                     f"restore.{damage}",
                     "This candidate creates authority for a restore receipt.",
-                    tier=1,
-                    source="agent",
-                    trust="working",
-                    extra=("--kind", "decision"),
                     root=root,
+                    candidate_actor=f"restore-{damage}",
+                    writer_text=f"The competing live {damage} value.",
                 )
                 self.cli("sync", "--run", run_id, root=root)
                 conflict_id = self.decision(
@@ -2574,16 +3579,12 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(self.state(root=decision_root)["head_revision"], 0)
 
         resolution_root = self.root / "forged-resolution"
-        resolution_run = self.start("resolution-agent", root=resolution_root)
-        contested_id = self.propose(
-            resolution_run,
+        resolution_run, contested_id, _, _ = self.stage_concurrent_candidate(
             "forged.resolution",
-            "An agent-origin Tier 1 proposal needs approval.",
-            tier=1,
-            source="agent",
-            trust="working",
-            extra=("--kind", "decision"),
+            "A concurrent candidate needs resolution.",
             root=resolution_root,
+            candidate_actor="resolution-agent",
+            writer_text="The competing live resolution value.",
         )
         self.cli(
             "sync",
@@ -2613,7 +3614,11 @@ class BimriCliTest(unittest.TestCase):
                     result.stdout + result.stderr,
                 )
         self.assertNotIn(
-            "[K:forged.resolution]",
+            "A concurrent candidate needs resolution.",
+            self.hot(root=resolution_root),
+        )
+        self.assertIn(
+            "The competing live resolution value.",
             self.hot(root=resolution_root),
         )
 
@@ -2664,16 +3669,12 @@ class BimriCliTest(unittest.TestCase):
                 )
 
         resolved_root = self.root / "semantic-resolution"
-        resolved_run = self.start("semantic-resolution", root=resolved_root)
-        proposal_id = self.propose(
-            resolved_run,
+        resolved_run, proposal_id, _, _ = self.stage_concurrent_candidate(
             "semantic.resolution",
             "A resolved candidate must exist in its recorded revision.",
-            tier=1,
-            source="agent",
-            trust="working",
-            extra=("--kind", "decision"),
             root=resolved_root,
+            candidate_actor="semantic-resolution",
+            writer_text="The competing live semantic value.",
         )
         self.cli("sync", "--run", resolved_run, root=resolved_root)
         decision = self.decision(proposal_id, root=resolved_root)
@@ -2723,7 +3724,11 @@ class BimriCliTest(unittest.TestCase):
             self.state(root=resolved_root)["head_revision"], head
         )
         self.assertNotIn(
-            "[K:semantic.resolution]",
+            "A resolved candidate must exist in its recorded revision.",
+            self.hot(root=resolved_root),
+        )
+        self.assertIn(
+            "The competing live semantic value.",
             self.hot(root=resolved_root),
         )
 
@@ -2731,20 +3736,9 @@ class BimriCliTest(unittest.TestCase):
         for resolution_status in ("applying", "failed"):
             with self.subTest(resolution_status=resolution_status):
                 root = self.root / f"snapshot-{resolution_status}"
-                owner_run = self.start("owner", root=root)
-                original = self.propose(
-                    owner_run,
-                    "snapshot.choice",
-                    "Keep the owner-confirmed value.",
-                    root=root,
-                )
-                self.cli("sync", "--run", owner_run, root=root)
-                self.assertEqual(
-                    self.decision(original, root=root)["outcome"],
-                    "accepted",
-                )
-
                 first_run = self.start("first-agent", root=root)
+                second_run = self.start("second-agent", root=root)
+                owner_run = self.start("writer", root=root)
                 first_candidate = self.propose(
                     first_run,
                     "snapshot.choice",
@@ -2753,6 +3747,28 @@ class BimriCliTest(unittest.TestCase):
                     trust="working",
                     root=root,
                 )
+                second_candidate = self.propose(
+                    second_run,
+                    "snapshot.choice",
+                    "Use the later agent candidate.",
+                    source="agent",
+                    trust="working",
+                    root=root,
+                )
+                original = self.propose(
+                    owner_run,
+                    "snapshot.choice",
+                    "Keep the accepted writer value.",
+                    source="agent",
+                    trust="working",
+                    root=root,
+                )
+                self.cli("sync", "--run", owner_run, root=root)
+                self.assertEqual(
+                    self.decision(original, root=root)["outcome"],
+                    "accepted",
+                )
+
                 self.cli("sync", "--run", first_run, root=root)
                 first_decision = self.decision(first_candidate, root=root)
                 self.assertEqual(first_decision["outcome"], "contested")
@@ -2801,15 +3817,6 @@ class BimriCliTest(unittest.TestCase):
                     self.cli("status", root=root).stdout,
                 )
 
-                second_run = self.start("second-agent", root=root)
-                second_candidate = self.propose(
-                    second_run,
-                    "snapshot.choice",
-                    "Use the later agent candidate.",
-                    source="agent",
-                    trust="working",
-                    root=root,
-                )
                 self.cli("sync", "--run", second_run, root=root)
                 second_decision = self.decision(
                     second_candidate, root=root
@@ -2855,6 +3862,8 @@ class BimriCliTest(unittest.TestCase):
                     creator,
                     "forged.base",
                     "The base entry must exist in the recorded revision.",
+                    source="agent",
+                    trust="working",
                     root=root,
                 )
                 self.cli("sync", "--run", creator, root=root)
@@ -2907,7 +3916,8 @@ class BimriCliTest(unittest.TestCase):
                 self.assertIn("AUTHORITY RECOVERY NEEDED", status.stdout)
                 self.assertIn(proposal_id, status.stdout)
                 self.assertIn(
-                    "does not exist in the run's base memory", status.stdout
+                    "proposal preflight revision does not match proposal base revision",
+                    status.stdout,
                 )
                 blocked = self.cli(
                     "sync", "--run", attacker, root=root, check=False
@@ -2971,14 +3981,21 @@ class BimriCliTest(unittest.TestCase):
                 )
 
                 candidate_run = self.start("candidate", root=root)
+                writer_run = self.start("candidate-writer", root=root)
                 candidate = self.propose(
                     candidate_run,
                     "future.approval",
                     "This candidate is based on revision one.",
-                    tier=1,
                     source="agent",
                     trust="working",
-                    extra=("--kind", "decision"),
+                    root=root,
+                )
+                writer = self.propose(
+                    writer_run,
+                    "future.approval",
+                    "The competing value is based on revision one.",
+                    source="agent",
+                    trust="working",
                     root=root,
                 )
                 proposal = json.loads(
@@ -2990,6 +4007,10 @@ class BimriCliTest(unittest.TestCase):
                     ).read_text("utf-8")
                 )
                 self.assertEqual(proposal["base_revision"], 1)
+                self.cli("sync", "--run", writer_run, root=root)
+                self.assertEqual(
+                    self.decision(writer, root=root)["outcome"], "accepted"
+                )
                 self.cli("sync", "--run", candidate_run, root=root)
                 decision = self.decision(candidate, root=root)
                 self.assertEqual(decision["outcome"], "contested")
@@ -3041,13 +4062,20 @@ class BimriCliTest(unittest.TestCase):
                 self.assertNotEqual(status.returncode, 0)
                 self.assertNotEqual(attempted.returncode, 0)
                 self.assertIn(
-                    "precedes a candidate proposal's base revision", combined
+                    "resolution revision_before does not match the conflict's "
+                    "recorded current value",
+                    combined,
                 )
                 self.assertEqual(
                     self.state(root=root)["head_revision"], head_before
                 )
                 self.assertNotIn(
-                    "[K:future.approval]", self.hot(root=root)
+                    "This candidate is based on revision one.",
+                    self.hot(root=root),
+                )
+                self.assertIn(
+                    "The competing value is based on revision one.",
+                    self.hot(root=root),
                 )
 
     def test_path_traversal_proposal_id_cannot_touch_external_file(self):
@@ -3517,7 +4545,7 @@ class BimriCliTest(unittest.TestCase):
         )
 
         first = self.cli("migrate")
-        self.assertIn("complete at v5.0.2.", first.stdout)
+        self.assertIn("complete at memory format v5.0.2", first.stdout)
         state = self.state()
         self.assertEqual(state["bimri_version"], "5.0.2")
         self.assertEqual(state["project_id"], "legacy-project")
@@ -3540,7 +4568,7 @@ class BimriCliTest(unittest.TestCase):
         revisions_before = sorted(path.name for path in (bdir / "revisions").iterdir())
 
         second = self.cli("migrate")
-        self.assertIn("complete at v5.0.2.", second.stdout)
+        self.assertIn("complete at memory format v5.0.2", second.stdout)
         self.assertEqual(marker_path.read_bytes(), marker_before)
         self.assertEqual(
             sorted(path.name for path in (bdir / "backups").iterdir()),
@@ -3684,7 +4712,13 @@ class BimriCliTest(unittest.TestCase):
         (target / "legacy" / "keep.txt").write_text(legacy_keep, "utf-8")
 
         install = subprocess.run(
-            [sys.executable, str(ENGINE), "install", "--target", str(target)],
+            [
+                sys.executable,
+                str(ENGINE),
+                "install",
+                "--target",
+                str(target),
+            ],
             cwd=str(elsewhere),
             text=True,
             capture_output=True,
@@ -3734,7 +4768,14 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(backups[0].read_text("utf-8"), original_protocol)
 
         second_install = subprocess.run(
-            [sys.executable, str(ENGINE), "install", "--target", str(target)],
+            [
+                sys.executable,
+                str(ENGINE),
+                "install",
+                "--target",
+                str(target),
+                "--quiescent",
+            ],
             cwd=str(elsewhere),
             text=True,
             capture_output=True,
@@ -4323,7 +5364,7 @@ class BimriCliTest(unittest.TestCase):
             run_id,
             timeout=45,
         )
-        self.assertIn("accepted 1, contested 0", result.stdout)
+        self.assertIn("applied 1, already satisfied/no change 0", result.stdout)
         self.assertIn(
             "BIMRI WARNING: bimri.md could not be refreshed",
             result.stderr,
@@ -4366,7 +5407,7 @@ class BimriCliTest(unittest.TestCase):
             run_id,
             timeout=30,
         )
-        self.assertIn("accepted 1, contested 0", result.stdout)
+        self.assertIn("applied 1, already satisfied/no change 0", result.stdout)
         self.assertIn(
             "BIMRI WARNING: bimri.md could not be refreshed",
             result.stderr,
@@ -4448,16 +5489,12 @@ class BimriCliTest(unittest.TestCase):
         self.assertIn(f"[CLOSED:{close_run} ", close_log)
 
         resolve_root = self.root / "index-resolve"
-        resolve_run = self.start("index-resolve", root=resolve_root)
-        candidate = self.propose(
-            resolve_run,
+        resolve_run, candidate, _, _ = self.stage_concurrent_candidate(
             "index.resolve",
             "Human approval should survive an index failure.",
-            tier=1,
-            source="agent",
-            trust="working",
-            extra=("--kind", "decision"),
             root=resolve_root,
+            candidate_actor="index-resolve",
+            writer_text="The competing live index value.",
         )
         self.cli(
             "sync",
@@ -4566,7 +5603,7 @@ class BimriCliTest(unittest.TestCase):
         (self.root / "BIMRI-backup.md").write_bytes(rolling)
 
         first = self.cli("migrate")
-        self.assertIn("complete at v5.0.2.", first.stdout)
+        self.assertIn("complete at memory format v5.0.2", first.stdout)
         self.assertNotIn("BIMRI.md", {path.name for path in self.root.iterdir()})
         self.assertNotIn("BIMRI-backup.md", {path.name for path in self.root.iterdir()})
         self.assertTrue((self.root / "bimri.md").exists())
@@ -5507,6 +6544,7 @@ class BimriCliTest(unittest.TestCase):
                 "install",
                 "--target",
                 str(target),
+                "--quiescent",
             ],
             text=True,
             capture_output=True,
@@ -6302,16 +7340,16 @@ class BimriCliTest(unittest.TestCase):
         )
 
         conflict_root = self.root / "missing-conflict"
-        conflict_run = self.start("missing-conflict", root=conflict_root)
-        candidate = self.propose(
-            conflict_run,
-            "missing.conflict",
-            "The durable conflict counter must anchor this record.",
-            tier=1,
-            source="agent",
-            trust="working",
-            extra=("--kind", "decision"),
-            root=conflict_root,
+        conflict_run, candidate, _writer_run, _writer = (
+            self.stage_concurrent_candidate(
+                "missing.conflict",
+                "The durable conflict counter must anchor this record.",
+                root=conflict_root,
+                candidate_actor="missing-conflict",
+                writer_text=(
+                    "A concurrent writer establishes the accepted value."
+                ),
+            )
         )
         self.cli("sync", "--run", conflict_run, root=conflict_root)
         conflict_id = self.decision(candidate, root=conflict_root)["conflict_id"]
@@ -6404,27 +7442,33 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(sync.returncode, 2)
         self.assertIn("authority recovery is required", sync.stderr)
 
-    def test_missing_conflict_decision_requires_active_run_and_safe_log(self):
-        run_id = self.start("candidate-decision")
-        candidate = self.propose(
-            run_id,
-            "candidate.decision",
-            "A conflict candidate decision may be recreated only safely.",
-            tier=1,
-            source="agent",
-            trust="working",
-            extra=("--kind", "decision"),
+    def test_missing_conflict_decision_requires_explicit_recovery(self):
+        run_id, candidate, _writer_run, _writer = (
+            self.stage_concurrent_candidate(
+                "candidate.decision",
+                "A conflict candidate decision may be recreated only safely.",
+                candidate_actor="candidate-decision",
+                writer_text=(
+                    "A concurrent writer establishes the accepted value."
+                ),
+            )
         )
         self.cli("sync", "--run", run_id)
         decision_path = (
             self.root / ".bimri" / "decisions" / f"{candidate}.json"
         )
+        decision_bytes = decision_path.read_bytes()
         decision_path.unlink()
 
-        # Crash recovery may tolerate the missing decision while its writer is
-        # active and the canonical run log is a safe regular file.
+        # A durably processed proposal cannot silently recreate missing
+        # authority, even while its writer is active and its log is safe.
         active = self.cli("status", check=False)
-        self.assertEqual(active.returncode, 0, active.stdout + active.stderr)
+        self.assertEqual(active.returncode, 1, active.stdout + active.stderr)
+        self.assertIn(
+            f"decision {candidate} is missing after its proposal was "
+            "durably processed",
+            active.stdout + active.stderr,
+        )
 
         log_path = self.root / ".bimri" / "log" / f"{run_id}.md"
         saved_log = self.root / f"saved-{run_id}.md"
@@ -6446,8 +7490,37 @@ class BimriCliTest(unittest.TestCase):
         log_path.unlink()
         saved_log.replace(log_path)
 
-        recreated = self.cli("sync", "--run", run_id)
-        self.assertIn("accepted 0, contested 1", recreated.stdout)
+        blocked = self.cli("sync", "--run", run_id, check=False)
+        self.assertEqual(blocked.returncode, 2)
+        self.assertIn(
+            "authority recovery is required",
+            blocked.stdout + blocked.stderr,
+        )
+        self.assertNotIn(
+            "MEMORY CONFLICT",
+            blocked.stdout + blocked.stderr,
+        )
+
+        self.cli(
+            "quarantine-authority",
+            "--kind",
+            "decision",
+            "--id",
+            candidate,
+            "--human-approved",
+        )
+        repair = self.root / "missing-conflict-decision-repair.json"
+        repair.write_bytes(decision_bytes)
+        self.cli(
+            "restore-authority",
+            "--kind",
+            "decision",
+            "--id",
+            candidate,
+            "--from",
+            repair,
+            "--human-approved",
+        )
         self.assertEqual(self.decision(candidate)["outcome"], "contested")
         self.cli(
             "close",
@@ -6468,15 +7541,15 @@ class BimriCliTest(unittest.TestCase):
         )
 
     def test_linked_missing_final_decision_and_resolution_restore_in_any_order(self):
-        run_id = self.start("linked-missing")
-        candidate = self.propose(
-            run_id,
-            "linked.missing",
-            "A human-approved candidate anchors the missing resolution.",
-            tier=1,
-            source="agent",
-            trust="working",
-            extra=("--kind", "decision"),
+        run_id, candidate, _writer_run, _writer = (
+            self.stage_concurrent_candidate(
+                "linked.missing",
+                "A human-approved candidate anchors the missing resolution.",
+                candidate_actor="linked-missing",
+                writer_text=(
+                    "A concurrent writer establishes the accepted value."
+                ),
+            )
         )
         self.cli("sync", "--run", run_id)
         conflict_id = self.decision(candidate)["conflict_id"]
@@ -6649,6 +7722,1300 @@ class BimriCliTest(unittest.TestCase):
             "durably processed",
             status.stdout,
         )
+
+    def test_engine_release_is_separate_from_memory_format(self):
+        self.cli("migrate")
+        state = self.state()
+        self.assertEqual(state["bimri_version"], "5.0.2")
+        self.assertIn("<!-- BIMRI v5.0.2 |", self.hot())
+        status = self.cli("status")
+        self.assertIn(
+            "BIMRI engine v5.0.3 | memory format v5.0.2 | revision V000000",
+            status.stdout,
+        )
+
+    def test_read_only_doctor_never_heals_or_indexes_current_store(self):
+        self.cli("migrate")
+        hot_path = self.root / "bimri.md"
+        edited = hot_path.read_bytes() + b"\nowner direct edit must survive\n"
+        hot_path.write_bytes(edited)
+        index_path = self.root / ".bimri" / "index.tsv"
+        index_path.write_bytes(b"custom index bytes\n")
+        before = protected_tree_snapshot(self.root)
+
+        result = self.cli("doctor", "--read-only", check=False)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("read-only doctor left the file unchanged", result.stdout)
+        self.assertEqual(hot_path.read_bytes(), edited)
+        self.assertEqual(index_path.read_bytes(), b"custom index bytes\n")
+        self.assertEqual(protected_tree_snapshot(self.root), before)
+        self.assertEqual(
+            list((self.root / ".bimri" / "recovery").glob("manual-hot-*")),
+            [],
+        )
+
+    def test_read_only_doctor_and_updater_attempt_zero_protected_mutations(self):
+        self.cli("migrate")
+        protected = protected_tree_snapshot(self.root)
+
+        audit = self.worker(
+            "protected_mutation_monitor",
+            "doctor",
+            "--read-only",
+            root=self.root,
+            timeout=60,
+        )
+
+        self.assertIn("BIMRI doctor (read-only): PASSED", audit.stdout)
+        self.assertNotIn("protected mutation monitor", audit.stderr)
+        self.assertEqual(protected_tree_snapshot(self.root), protected)
+
+        installed = self.worker(
+            "protected_mutation_monitor",
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            engine_root=REPOSITORY,
+            timeout=60,
+        )
+
+        self.assertIn("Memory preservation: PASSED", installed.stdout)
+        self.assertNotIn("protected mutation monitor", installed.stderr)
+        self.assertEqual(protected_tree_snapshot(self.root), protected)
+
+    @unittest.skipIf(os.name == "nt", "symlink creation requires privileges")
+    def test_read_only_audit_rejects_redirected_revision_directory(self):
+        self.cli("migrate")
+        program = self.root / "bimri-engine.py"
+        program.write_bytes(b"old installed engine sentinel\n")
+        with tempfile.TemporaryDirectory(
+            prefix="bimri-external-revisions-"
+        ) as temporary:
+            external = Path(temporary) / "revisions"
+            revisions = self.root / ".bimri" / "revisions"
+            revisions.rename(external)
+            revisions.symlink_to(external, target_is_directory=True)
+            external_before = {
+                path.name: path.read_bytes()
+                for path in external.iterdir()
+                if path.is_file()
+            }
+            protected = protected_tree_snapshot(self.root)
+
+            audit = self.cli("doctor", "--read-only", check=False)
+            self.assertEqual(audit.returncode, 1)
+            self.assertIn(
+                ".bimri/revisions cannot be a symbolic link", audit.stdout
+            )
+            self.assertEqual(protected_tree_snapshot(self.root), protected)
+
+            installed = self.cli(
+                "install",
+                "--target",
+                self.root,
+                "--quiescent",
+                root=REPOSITORY,
+                check=False,
+                timeout=60,
+            )
+            self.assertEqual(installed.returncode, 2)
+            self.assertIn(
+                ".bimri/revisions cannot be a symbolic link", installed.stderr
+            )
+            self.assertEqual(
+                program.read_bytes(), b"old installed engine sentinel\n"
+            )
+            self.assertEqual(protected_tree_snapshot(self.root), protected)
+            self.assertEqual(
+                {
+                    path.name: path.read_bytes()
+                    for path in external.iterdir()
+                    if path.is_file()
+                },
+                external_before,
+            )
+
+    @unittest.skipUnless(os.name == "nt", "NTFS junction regression")
+    def test_code_update_rejects_backup_root_junction_before_write(self):
+        self.cli("migrate")
+        program = self.root / "bimri-engine.py"
+        program.write_bytes(b"old installed engine sentinel\n")
+        recovery = self.root / ".bimri" / "recovery"
+        backup_root = self.root / ".bimri-update-backups"
+        created = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(backup_root), str(recovery)],
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        self.assertEqual(created.returncode, 0, created.stderr)
+        protected = protected_tree_snapshot(self.root)
+        recovery_before = sorted(path.name for path in recovery.iterdir())
+        try:
+            result = self.cli(
+                "install",
+                "--target",
+                self.root,
+                "--quiescent",
+                root=REPOSITORY,
+                check=False,
+                timeout=60,
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("reparse point", result.stderr)
+            self.assertEqual(
+                program.read_bytes(), b"old installed engine sentinel\n"
+            )
+            self.assertEqual(protected_tree_snapshot(self.root), protected)
+            self.assertEqual(
+                sorted(path.name for path in recovery.iterdir()),
+                recovery_before,
+            )
+        finally:
+            os.rmdir(backup_root)
+
+    @unittest.skipIf(os.name == "nt", "covered by the junction regression")
+    def test_code_update_rejects_redirected_backup_root_before_write(self):
+        self.cli("migrate")
+        program = self.root / "bimri-engine.py"
+        program.write_bytes(b"old installed engine sentinel\n")
+        recovery = self.root / ".bimri" / "recovery"
+        backup_root = self.root / ".bimri-update-backups"
+        backup_root.symlink_to(recovery, target_is_directory=True)
+        protected = protected_tree_snapshot(self.root)
+        recovery_before = sorted(path.name for path in recovery.iterdir())
+
+        result = self.cli(
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            root=REPOSITORY,
+            check=False,
+            timeout=60,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("symbolic link or reparse point", result.stderr)
+        self.assertEqual(
+            program.read_bytes(), b"old installed engine sentinel\n"
+        )
+        self.assertEqual(protected_tree_snapshot(self.root), protected)
+        self.assertEqual(
+            sorted(path.name for path in recovery.iterdir()), recovery_before
+        )
+
+    def test_current_store_update_requires_quiescent_attestation(self):
+        self.cli("migrate")
+        program = self.root / "bimri-engine.py"
+        program.write_text("old installed engine sentinel\n", "utf-8")
+        before = protected_tree_snapshot(self.root)
+
+        result = self.cli(
+            "install", "--target", self.root, check=False, root=REPOSITORY
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("requires an externally verified quiescent handoff", result.stderr)
+        self.assertEqual(program.read_text("utf-8"), "old installed engine sentinel\n")
+        self.assertEqual(protected_tree_snapshot(self.root), before)
+        self.assertFalse((self.root / ".bimri-update-backups").exists())
+
+    def test_exact_v5_0_2_waiter_proves_external_quiescence_is_required(self):
+        self.cli("migrate")
+        historical = subprocess.run(
+            [
+                "git",
+                "show",
+                f"{V5_0_2_COMMIT}:bimri-engine.py",
+            ],
+            cwd=str(REPOSITORY),
+            capture_output=True,
+            timeout=30,
+        )
+        self.assertEqual(
+            historical.returncode,
+            0,
+            "the test checkout must include the exact v5.0.2 generator commit",
+        )
+        self.assertEqual(
+            hashlib.sha256(historical.stdout).hexdigest(),
+            V5_0_2_ENGINE_SHA256,
+        )
+        old_engine = self.root / "bimri-engine.py"
+        old_engine.write_bytes(historical.stdout)
+        protected_before = protected_tree_snapshot(self.root)
+        signal = self.root / ".test-candidate-lock-held"
+        release = self.root / ".test-release-candidate-lock"
+        candidate_command = [
+            sys.executable,
+            str(CRASH_WORKER),
+            str(ENGINE),
+            "code_update_hold_lock",
+            str(REPOSITORY),
+            "install",
+            "--target",
+            str(self.root),
+            "--quiescent",
+        ]
+        candidate = subprocess.Popen(
+            candidate_command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        deadline = time.monotonic() + 10
+        while not signal.exists() and candidate.poll() is None:
+            if time.monotonic() >= deadline:
+                candidate.kill()
+                self.fail("candidate updater did not acquire the existing lock")
+            time.sleep(0.01)
+        self.assertTrue(signal.exists())
+
+        old_waiter = subprocess.Popen(
+            [
+                sys.executable,
+                str(old_engine),
+                "--root",
+                str(self.root),
+                "start",
+                "--actor",
+                "exact-v502-waiter",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        time.sleep(0.25)
+        self.assertIsNone(
+            old_waiter.poll(),
+            "the already-loaded v5.0.2 process should be waiting on the lock",
+        )
+        self.assertEqual(
+            protected_tree_snapshot(self.root), protected_before
+        )
+
+        release.write_text("release candidate\n", encoding="utf-8")
+        candidate_stdout, candidate_stderr = candidate.communicate(timeout=60)
+        old_stdout, old_stderr = old_waiter.communicate(timeout=60)
+        self.assertEqual(candidate.returncode, 0, candidate_stderr)
+        self.assertIn("Memory preservation: PASSED", candidate_stdout)
+        self.assertEqual(old_waiter.returncode, 0, old_stderr)
+        self.assertIn("BIMRI RUN HANDLE:", old_stdout)
+        after_old_waiter = protected_tree_snapshot(self.root)
+        self.assertNotEqual(after_old_waiter, protected_before)
+
+        signal.unlink()
+        release.unlink()
+        supported = self.cli(
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            root=REPOSITORY,
+            timeout=60,
+        )
+        self.assertIn("Memory preservation: PASSED", supported.stdout)
+        self.assertEqual(
+            protected_tree_snapshot(self.root), after_old_waiter
+        )
+
+    def test_code_only_update_preserves_complete_current_store_tree(self):
+        self.cli("migrate")
+        run_id = self.start("fixture-writer")
+        self.propose(
+            run_id,
+            "fixture.subject",
+            "Populated v5.0.2 memory remains exact.",
+            source="agent",
+            trust="working",
+        )
+        self.cli("sync", "--run", run_id)
+        bdir = self.root / ".bimri"
+        head = self.state()["head_revision"]
+        shutil.copyfile(
+            bdir / "revisions" / f"V{head:06d}.md",
+            bdir / "revisions" / "V000099.md",
+        )
+        (bdir / "unknown-owner-file.dat").write_bytes(b"unknown bytes\x00\xff")
+        (bdir / "install-backups" / "historical").mkdir(parents=True)
+        (bdir / "install-backups" / "historical" / "receipt.txt").write_text(
+            "protected old installer receipt\n", "utf-8"
+        )
+        (bdir / "recovery" / ".bimri-tmp-recovery-litter").write_bytes(
+            b"recovery litter"
+        )
+        before = protected_tree_snapshot(self.root)
+
+        result = self.cli(
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            root=REPOSITORY,
+            timeout=60,
+        )
+
+        self.assertIn("BIMRI 5.0.3 installed.", result.stdout)
+        self.assertIn("Existing memory format v5.0.2 verified", result.stdout)
+        self.assertIn("Memory preservation: PASSED", result.stdout)
+        self.assertEqual(protected_tree_snapshot(self.root), before)
+        self.assertEqual(self.state()["bimri_version"], "5.0.2")
+        runtime = json.loads(
+            (bdir / "runtime.local.json").read_text("utf-8")
+        )
+        self.assertEqual(runtime["version"], "5.0.3")
+        manifests = list(
+            (self.root / ".bimri-update-backups").glob(
+                "*/install-manifest.json"
+            )
+        )
+        self.assertEqual(len(manifests), 1)
+        manifest = json.loads(manifests[0].read_text("utf-8"))
+        self.assertEqual(manifest["engine_release"], "5.0.3")
+        self.assertEqual(manifest["memory_format"], "5.0.2")
+        self.assertEqual(manifest["mode"], "code-only-update")
+        self.assertEqual(manifest["before_tree_digest"], manifest["after_tree_digest"])
+        self.assertEqual(manifest["preservation"], "passed")
+        self.assertEqual(manifest["protected_write_attempts"], 0)
+
+        repeated = self.cli(
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            root=REPOSITORY,
+            timeout=60,
+        )
+        self.assertIn("Memory preservation: PASSED", repeated.stdout)
+        self.assertEqual(protected_tree_snapshot(self.root), before)
+        agents = (self.root / "AGENTS.md").read_text("utf-8")
+        self.assertEqual(agents.count("<!-- BIMRI:START -->"), 1)
+        self.assertEqual(agents.count("<!-- BIMRI:END -->"), 1)
+
+    def test_code_only_update_preserves_sparse_store_and_direct_hot_edit(self):
+        self.cli("migrate")
+        bdir = self.root / ".bimri"
+        for name in ("inbox", "backups", "recovery"):
+            (bdir / name).rmdir()
+        hot = self.root / "bimri.md"
+        edited = hot.read_bytes() + b"\nmanual owner note\n"
+        hot.write_bytes(edited)
+        before = protected_tree_snapshot(self.root)
+
+        result = self.cli(
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            root=REPOSITORY,
+            timeout=60,
+        )
+
+        self.assertIn("READ-ONLY AUDIT: RECOVERY REQUIRED", result.stdout)
+        self.assertEqual(hot.read_bytes(), edited)
+        self.assertEqual(protected_tree_snapshot(self.root), before)
+        for name in ("inbox", "backups", "recovery"):
+            self.assertFalse((bdir / name).exists())
+
+    @unittest.skipIf(os.name == "nt", "symlink creation requires privileges")
+    def test_code_update_preserves_unknown_protected_directory_symlink(self):
+        self.cli("migrate")
+        with tempfile.TemporaryDirectory(
+            prefix="bimri-external-owner-dir-"
+        ) as temporary:
+            external = Path(temporary)
+            evidence = external / "owner-evidence.bin"
+            evidence.write_bytes(b"external owner evidence\x00\xff")
+            link = self.root / ".bimri" / "owner-directory-link"
+            link.symlink_to(external, target_is_directory=True)
+            protected = protected_tree_snapshot(self.root)
+            target_before = os.readlink(link)
+
+            installed = self.cli(
+                "install",
+                "--target",
+                self.root,
+                "--quiescent",
+                root=REPOSITORY,
+                timeout=60,
+            )
+
+            self.assertIn("Memory preservation: PASSED", installed.stdout)
+            self.assertEqual(protected_tree_snapshot(self.root), protected)
+            self.assertEqual(os.readlink(link), target_before)
+            self.assertEqual(
+                evidence.read_bytes(), b"external owner evidence\x00\xff"
+            )
+
+    def test_completed_update_receipts_remain_valid_after_project_move(self):
+        original = self.root / "original-project"
+        moved = self.root / "moved-project"
+        original.mkdir()
+        self.cli("migrate", root=original)
+        first = self.cli(
+            "install",
+            "--target",
+            original,
+            "--quiescent",
+            root=REPOSITORY,
+            timeout=60,
+        )
+        self.assertIn("Memory preservation: PASSED", first.stdout)
+        original.rename(moved)
+        protected = protected_tree_snapshot(moved)
+
+        repeated = self.cli(
+            "install",
+            "--target",
+            moved,
+            "--quiescent",
+            root=REPOSITORY,
+            timeout=60,
+        )
+
+        self.assertIn("Memory preservation: PASSED", repeated.stdout)
+        self.assertEqual(protected_tree_snapshot(moved), protected)
+        runtime = json.loads(
+            (moved / ".bimri" / "runtime.local.json").read_text("utf-8")
+        )
+        self.assertEqual(
+            runtime["engine_path"], str((moved / "bimri-engine.py").resolve())
+        )
+        manifests = list((
+            moved / ".bimri-update-backups"
+        ).glob("*/install-manifest.json"))
+        self.assertEqual(len(manifests), 2)
+
+    def test_terminal_receipt_accepts_historical_target_from_other_os(self):
+        self.cli("migrate")
+        first = self.cli(
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            root=REPOSITORY,
+            timeout=60,
+        )
+        self.assertIn("Memory preservation: PASSED", first.stdout)
+        protected = protected_tree_snapshot(self.root)
+        manifest_path = next((
+            self.root / ".bimri-update-backups"
+        ).glob("*/install-manifest.json"))
+        manifest = json.loads(manifest_path.read_text("utf-8"))
+        manifest["target"] = (
+            "/home/owner/project"
+            if os.name == "nt"
+            else "C:\\Users\\owner\\project"
+        )
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n", "utf-8"
+        )
+
+        repeated = self.cli(
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            root=REPOSITORY,
+            timeout=60,
+        )
+
+        self.assertIn("Memory preservation: PASSED", repeated.stdout)
+        self.assertEqual(protected_tree_snapshot(self.root), protected)
+
+    def test_committed_v5_0_2_fixture_is_exactly_preserved_by_update(self):
+        shutil.copytree(V5_0_2_FIXTURE, self.root, dirs_exist_ok=True)
+        fixture_manifest = json.loads(
+            (self.root / "FIXTURE-MANIFEST.json").read_text("utf-8")
+        )
+        self.assertEqual(
+            fixture_manifest["generator_commit"],
+            "dfdd3ccdacdc1e13f34ffd6b1d66b4a73d5373bb",
+        )
+        before = protected_tree_snapshot(self.root)
+        digest = hashlib.sha256(json.dumps(
+            before, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
+        self.assertEqual(len(before), fixture_manifest["protected_path_count"])
+        self.assertEqual(digest, fixture_manifest["protected_tree_digest"])
+
+        audit = self.cli("doctor", "--read-only")
+        self.assertIn("BIMRI doctor (read-only): PASSED", audit.stdout)
+        self.assertEqual(protected_tree_snapshot(self.root), before)
+
+        installed = self.cli(
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            root=REPOSITORY,
+            timeout=60,
+        )
+
+        self.assertIn("Memory preservation: PASSED", installed.stdout)
+        self.assertEqual(protected_tree_snapshot(self.root), before)
+        state = self.state()
+        self.assertEqual(state["bimri_version"], "5.0.2")
+        self.assertEqual(
+            state["head_revision"], fixture_manifest["accepted_head_revision"]
+        )
+        self.assertEqual(
+            state["head_hash"], fixture_manifest["accepted_head_hash"]
+        )
+
+    def test_code_update_caught_failure_rolls_back_authorized_files_only(self):
+        self.cli("migrate")
+        program = self.root / "bimri-engine.py"
+        protocol = self.root / "BIMRI-PROTOCOL.md"
+        program.write_text("old engine sentinel\n", "utf-8")
+        protocol.write_text("old protocol sentinel\n", "utf-8")
+        before = protected_tree_snapshot(self.root)
+
+        result = self.worker(
+            "code_update_fail_before_engine",
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            engine_root=REPOSITORY,
+            check=False,
+            timeout=60,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("forced failure before engine replacement", result.stderr)
+        self.assertEqual(program.read_text("utf-8"), "old engine sentinel\n")
+        self.assertEqual(protocol.read_text("utf-8"), "old protocol sentinel\n")
+        self.assertEqual(protected_tree_snapshot(self.root), before)
+        manifests = list((
+            self.root / ".bimri-update-backups"
+        ).glob("*/install-manifest.json"))
+        self.assertEqual(len(manifests), 1)
+        manifest = json.loads(manifests[0].read_text("utf-8"))
+        self.assertEqual(manifest["status"], "rolled-back")
+        self.assertEqual(manifest["preservation"], "passed")
+
+    def test_every_caught_install_replacement_restores_all_authorized_files(self):
+        for fault_index in range(1, len(CODE_UPDATE_TARGETS) + 1):
+            with self.subTest(fault_index=fault_index), tempfile.TemporaryDirectory(
+                prefix="bimri-v503-caught-"
+            ) as temporary:
+                target = Path(temporary)
+                self.cli("migrate", root=target)
+                originals = self.seed_code_update_targets(target)
+                protected = protected_tree_snapshot(target)
+
+                result = self.worker(
+                    f"code_update_caught_install_replace_{fault_index}",
+                    "install",
+                    "--target",
+                    target,
+                    "--quiescent",
+                    engine_root=REPOSITORY,
+                    check=False,
+                    timeout=60,
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(
+                    "forced caught failure after authorized replacement",
+                    result.stderr,
+                )
+                for relative, content in originals.items():
+                    self.assertEqual(
+                        (target / relative).read_bytes(),
+                        content,
+                        relative,
+                    )
+                self.assertEqual(protected_tree_snapshot(target), protected)
+                manifest_path = next((
+                    target / ".bimri-update-backups"
+                ).glob("*/install-manifest.json"))
+                manifest = json.loads(manifest_path.read_text("utf-8"))
+                self.assertEqual(manifest["status"], "rolled-back")
+                self.assertEqual(manifest["preservation"], "passed")
+
+    def test_every_abrupt_install_replacement_is_safely_recoverable(self):
+        for fault_index in range(1, len(CODE_UPDATE_TARGETS) + 1):
+            with self.subTest(fault_index=fault_index), tempfile.TemporaryDirectory(
+                prefix="bimri-v503-abrupt-"
+            ) as temporary:
+                target = Path(temporary)
+                self.cli("migrate", root=target)
+                self.seed_code_update_targets(target)
+                protected = protected_tree_snapshot(target)
+
+                crashed = self.worker(
+                    f"code_update_abrupt_install_replace_{fault_index}",
+                    "install",
+                    "--target",
+                    target,
+                    "--quiescent",
+                    engine_root=REPOSITORY,
+                    check=False,
+                    timeout=60,
+                )
+
+                self.assertEqual(crashed.returncode, 100)
+                self.assertEqual(protected_tree_snapshot(target), protected)
+                resumed = self.cli(
+                    "install",
+                    "--target",
+                    target,
+                    "--quiescent",
+                    root=REPOSITORY,
+                    timeout=60,
+                )
+                self.assertIn("Memory preservation: PASSED", resumed.stdout)
+                self.assertEqual(protected_tree_snapshot(target), protected)
+                statuses = {
+                    json.loads(path.read_text("utf-8"))["status"]
+                    for path in (
+                        target / ".bimri-update-backups"
+                    ).glob("*/install-manifest.json")
+                }
+                self.assertEqual(
+                    statuses, {"restored-before-retry", "installed"}
+                )
+
+    def test_code_update_abrupt_engine_exit_resumes_without_memory_write(self):
+        self.cli("migrate")
+        (self.root / "bimri-engine.py").write_text(
+            "old engine sentinel\n", "utf-8"
+        )
+        before = protected_tree_snapshot(self.root)
+
+        crashed = self.worker(
+            "code_update_crash_after_engine",
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            engine_root=REPOSITORY,
+            check=False,
+            timeout=60,
+        )
+
+        self.assertEqual(crashed.returncode, 96)
+        self.assertEqual(protected_tree_snapshot(self.root), before)
+        prepared = list((
+            self.root / ".bimri-update-backups"
+        ).glob("*/install-manifest.json"))
+        self.assertEqual(len(prepared), 1)
+        self.assertEqual(
+            json.loads(prepared[0].read_text("utf-8"))["status"],
+            "prepared",
+        )
+
+        resumed = self.cli(
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            root=REPOSITORY,
+            timeout=60,
+        )
+        self.assertIn("Memory preservation: PASSED", resumed.stdout)
+        self.assertEqual(protected_tree_snapshot(self.root), before)
+        statuses = {
+            json.loads(path.read_text("utf-8"))["status"]
+            for path in (
+                self.root / ".bimri-update-backups"
+            ).glob("*/install-manifest.json")
+        }
+        self.assertEqual(statuses, {"restored-before-retry", "installed"})
+
+    def test_incomplete_rollback_keeps_recovery_engine_and_can_retry(self):
+        self.cli("migrate")
+        originals = self.seed_code_update_targets(self.root)
+        protected = protected_tree_snapshot(self.root)
+
+        crashed = self.worker(
+            "code_update_crash_after_engine",
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            engine_root=REPOSITORY,
+            check=False,
+            timeout=60,
+        )
+        self.assertEqual(crashed.returncode, 96)
+        candidate_engine = (self.root / "bimri-engine.py").read_bytes()
+        self.assertNotEqual(candidate_engine, originals["bimri-engine.py"])
+
+        incomplete = self.worker(
+            "code_update_fail_one_rollback_restore",
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            engine_root=REPOSITORY,
+            check=False,
+            timeout=60,
+        )
+
+        self.assertEqual(incomplete.returncode, 2)
+        self.assertIn("forced transient rollback restore failure", incomplete.stderr)
+        self.assertEqual(
+            (self.root / "bimri-engine.py").read_bytes(), candidate_engine
+        )
+        self.assertEqual(protected_tree_snapshot(self.root), protected)
+        manifest_path = next((
+            self.root / ".bimri-update-backups"
+        ).glob("*/install-manifest.json"))
+        manifest = json.loads(manifest_path.read_text("utf-8"))
+        self.assertEqual(manifest["status"], "rollback-incomplete")
+
+        restored = self.worker(
+            "code_update_stop_after_recovery",
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            engine_root=REPOSITORY,
+            check=False,
+            timeout=60,
+        )
+
+        self.assertEqual(restored.returncode, 2)
+        self.assertIn("forced stop before fresh update transaction", restored.stderr)
+        for relative, content in originals.items():
+            self.assertEqual((self.root / relative).read_bytes(), content, relative)
+        self.assertEqual(protected_tree_snapshot(self.root), protected)
+        manifest = json.loads(manifest_path.read_text("utf-8"))
+        self.assertEqual(manifest["status"], "restored-before-retry")
+
+        completed = self.cli(
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            root=REPOSITORY,
+            timeout=60,
+        )
+        self.assertIn("Memory preservation: PASSED", completed.stdout)
+        self.assertEqual(protected_tree_snapshot(self.root), protected)
+
+    def test_external_candidate_recovers_death_after_old_engine_restore(self):
+        self.cli("migrate")
+        originals = self.seed_code_update_targets(self.root)
+        protected = protected_tree_snapshot(self.root)
+
+        crashed = self.worker(
+            "code_update_crash_after_rollback_engine_replace",
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            engine_root=REPOSITORY,
+            check=False,
+            timeout=60,
+        )
+
+        self.assertEqual(crashed.returncode, 103)
+        self.assertEqual(
+            (self.root / "bimri-engine.py").read_bytes(),
+            originals["bimri-engine.py"],
+        )
+        self.assertEqual(protected_tree_snapshot(self.root), protected)
+        manifest_path = next((
+            self.root / ".bimri-update-backups"
+        ).glob("*/install-manifest.json"))
+        self.assertEqual(
+            json.loads(manifest_path.read_text("utf-8"))["status"],
+            "prepared",
+        )
+
+        resumed = self.cli(
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            root=REPOSITORY,
+            timeout=60,
+        )
+
+        self.assertIn("Memory preservation: PASSED", resumed.stdout)
+        self.assertEqual(protected_tree_snapshot(self.root), protected)
+        statuses = {
+            json.loads(path.read_text("utf-8"))["status"]
+            for path in (
+                self.root / ".bimri-update-backups"
+            ).glob("*/install-manifest.json")
+        }
+        self.assertEqual(statuses, {"restored-before-retry", "installed"})
+
+    def test_verification_and_final_receipt_boundaries_are_recoverable(self):
+        cases = (
+            ("code_update_caught_installed_verify", 2, True),
+            ("code_update_caught_final_receipt", 2, True),
+            ("code_update_abrupt_installed_verify", 101, False),
+            ("code_update_abrupt_final_receipt", 102, False),
+        )
+        for mode, returncode, caught in cases:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory(
+                prefix="bimri-v503-final-boundary-"
+            ) as temporary:
+                target = Path(temporary)
+                self.cli("migrate", root=target)
+                originals = self.seed_code_update_targets(target)
+                protected = protected_tree_snapshot(target)
+
+                faulted = self.worker(
+                    mode,
+                    "install",
+                    "--target",
+                    target,
+                    "--quiescent",
+                    engine_root=REPOSITORY,
+                    check=False,
+                    timeout=60,
+                )
+
+                self.assertEqual(faulted.returncode, returncode)
+                self.assertEqual(protected_tree_snapshot(target), protected)
+                if caught:
+                    for relative, content in originals.items():
+                        self.assertEqual(
+                            (target / relative).read_bytes(), content, relative
+                        )
+                    manifest_path = next((
+                        target / ".bimri-update-backups"
+                    ).glob("*/install-manifest.json"))
+                    manifest = json.loads(manifest_path.read_text("utf-8"))
+                    self.assertEqual(manifest["status"], "rolled-back")
+                else:
+                    resumed = self.cli(
+                        "install",
+                        "--target",
+                        target,
+                        "--quiescent",
+                        root=REPOSITORY,
+                        timeout=60,
+                    )
+                    self.assertIn(
+                        "Memory preservation: PASSED", resumed.stdout
+                    )
+                    self.assertEqual(
+                        protected_tree_snapshot(target), protected
+                    )
+
+    def test_incomplete_backup_preparation_never_blocks_retry(self):
+        self.cli("migrate")
+        protected = protected_tree_snapshot(self.root)
+        modes = (
+            ("code_update_crash_after_preparing_mkdir", 97),
+            ("code_update_crash_during_first_backup", 98),
+            ("code_update_crash_before_prepared_publish", 99),
+        )
+
+        for mode, returncode in modes:
+            with self.subTest(mode=mode):
+                crashed = self.worker(
+                    mode,
+                    "install",
+                    "--target",
+                    self.root,
+                    "--quiescent",
+                    engine_root=REPOSITORY,
+                    check=False,
+                    timeout=60,
+                )
+                self.assertEqual(crashed.returncode, returncode)
+                self.assertEqual(
+                    protected_tree_snapshot(self.root), protected
+                )
+
+                resumed = self.cli(
+                    "install",
+                    "--target",
+                    self.root,
+                    "--quiescent",
+                    root=REPOSITORY,
+                    timeout=60,
+                )
+                self.assertIn("Memory preservation: PASSED", resumed.stdout)
+                self.assertEqual(
+                    protected_tree_snapshot(self.root), protected
+                )
+
+    def test_code_update_guard_blocks_even_byte_identical_memory_write(self):
+        self.cli("migrate")
+        (self.root / "bimri-engine.py").write_text(
+            "old engine sentinel\n", "utf-8"
+        )
+        before = protected_tree_snapshot(self.root)
+
+        result = self.worker(
+            "code_update_protected_attempt",
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            engine_root=REPOSITORY,
+            check=False,
+            timeout=60,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("blocked a protected write: bimri.md", result.stderr)
+        self.assertEqual(protected_tree_snapshot(self.root), before)
+        manifest_path = next((
+            self.root / ".bimri-update-backups"
+        ).glob("*/install-manifest.json"))
+        manifest = json.loads(manifest_path.read_text("utf-8"))
+        self.assertEqual(manifest["protected_write_attempts"], 1)
+        self.assertEqual(manifest["preservation"], "passed")
+
+    def test_pre_and_post_audits_cannot_rebaseline_same_byte_writes(self):
+        modes = (
+            "code_update_pre_audit_same_byte_attempt",
+            "code_update_post_audit_same_byte_attempt",
+        )
+        for mode in modes:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory(
+                prefix="bimri-v503-audit-guard-"
+            ) as temporary:
+                target = Path(temporary)
+                self.cli("migrate", root=target)
+                originals = self.seed_code_update_targets(target)
+                protected = protected_tree_snapshot(target)
+
+                result = self.worker(
+                    mode,
+                    "install",
+                    "--target",
+                    target,
+                    "--quiescent",
+                    engine_root=REPOSITORY,
+                    check=False,
+                    timeout=60,
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(
+                    "blocked a protected atomic-write: bimri.md",
+                    result.stderr,
+                )
+                self.assertEqual(protected_tree_snapshot(target), protected)
+                backup_root = target / ".bimri-update-backups"
+                if mode == "code_update_pre_audit_same_byte_attempt":
+                    self.assertFalse(backup_root.exists())
+                else:
+                    for relative, content in originals.items():
+                        self.assertEqual(
+                            (target / relative).read_bytes(), content, relative
+                        )
+                    manifest_path = next(
+                        backup_root.glob("*/install-manifest.json")
+                    )
+                    manifest = json.loads(manifest_path.read_text("utf-8"))
+                    self.assertEqual(manifest["status"], "rolled-back")
+                    self.assertEqual(manifest["protected_write_attempts"], 1)
+
+    def test_code_update_never_stages_temporary_files_in_memory_tree(self):
+        self.cli("migrate")
+        bdir = self.root / ".bimri"
+        runtime = bdir / "runtime.local.json"
+        hooks = bdir / "hooks.claude.local.json"
+        runtime_before = b'{"owner":"runtime sentinel"}\n'
+        hooks_before = b'{"owner":"hooks sentinel"}\n'
+        runtime.write_bytes(runtime_before)
+        hooks.write_bytes(hooks_before)
+        (self.root / "bimri-engine.py").write_text(
+            "old engine sentinel\n", "utf-8"
+        )
+        protected_before = protected_tree_snapshot(self.root)
+
+        failed = self.worker(
+            "code_update_fail_before_engine_no_bdir_temp",
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            engine_root=REPOSITORY,
+            check=False,
+            timeout=60,
+        )
+
+        self.assertEqual(failed.returncode, 2)
+        self.assertNotIn("temporary file in .bimri", failed.stderr)
+        self.assertEqual(runtime.read_bytes(), runtime_before)
+        self.assertEqual(hooks.read_bytes(), hooks_before)
+        self.assertEqual(protected_tree_snapshot(self.root), protected_before)
+        self.assertEqual(list(bdir.glob(".bimri-tmp-*")), [])
+
+        installed = self.worker(
+            "code_update_forbid_bdir_temp",
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            engine_root=REPOSITORY,
+            timeout=60,
+        )
+
+        self.assertIn("Memory preservation: PASSED", installed.stdout)
+        self.assertEqual(protected_tree_snapshot(self.root), protected_before)
+        self.assertEqual(list(bdir.glob(".bimri-tmp-*")), [])
+
+    def test_code_update_guard_checks_destructive_source_endpoint(self):
+        self.cli("migrate")
+        before = protected_tree_snapshot(self.root)
+
+        result = self.worker(
+            "code_update_protected_source_attempt",
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            engine_root=REPOSITORY,
+            check=False,
+            timeout=60,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(
+            "blocked a protected replace-source: bimri.md", result.stderr
+        )
+        self.assertEqual(protected_tree_snapshot(self.root), before)
+
+    def test_code_update_rejects_untrusted_prepared_manifest_before_mutation(self):
+        self.cli("migrate")
+        victim = self.root / "victim.txt"
+        victim.write_bytes(b"owner project bytes\n")
+        protected_before = protected_tree_snapshot(self.root)
+
+        crashed = self.worker(
+            "code_update_crash_after_engine",
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            engine_root=REPOSITORY,
+            check=False,
+            timeout=60,
+        )
+        self.assertEqual(crashed.returncode, 96)
+        manifest_path = next((
+            self.root / ".bimri-update-backups"
+        ).glob("*/install-manifest.json"))
+        manifest = json.loads(manifest_path.read_text("utf-8"))
+        manifest["records"]["victim.txt"] = {
+            "existed": False,
+            "backup": None,
+            "sha256": None,
+        }
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n", "utf-8"
+        )
+
+        resumed = self.cli(
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            root=REPOSITORY,
+            check=False,
+            timeout=60,
+        )
+
+        self.assertEqual(resumed.returncode, 2)
+        self.assertIn(
+            "prepared code-update target records are invalid", resumed.stderr
+        )
+        self.assertEqual(victim.read_bytes(), b"owner project bytes\n")
+        self.assertEqual(protected_tree_snapshot(self.root), protected_before)
+
+    def test_code_update_rejects_tampered_prepared_identity_and_status(self):
+        mutations = (
+            ("target", "/tampered-target"),
+            ("status", "installed"),
+            ("status", "unrecognized-status"),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field, value=value), tempfile.TemporaryDirectory(
+                prefix="bimri-v503-receipt-"
+            ) as temporary:
+                target = Path(temporary)
+                self.cli("migrate", root=target)
+                protected = protected_tree_snapshot(target)
+                crashed = self.worker(
+                    "code_update_crash_after_engine",
+                    "install",
+                    "--target",
+                    target,
+                    "--quiescent",
+                    engine_root=REPOSITORY,
+                    check=False,
+                    timeout=60,
+                )
+                self.assertEqual(crashed.returncode, 96)
+                manifest_path = next((
+                    target / ".bimri-update-backups"
+                ).glob("*/install-manifest.json"))
+                manifest = json.loads(manifest_path.read_text("utf-8"))
+                manifest[field] = value
+                manifest_path.write_text(
+                    json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                    "utf-8",
+                )
+                receipts_before = list((
+                    target / ".bimri-update-backups"
+                ).iterdir())
+
+                resumed = self.cli(
+                    "install",
+                    "--target",
+                    target,
+                    "--quiescent",
+                    root=REPOSITORY,
+                    check=False,
+                    timeout=60,
+                )
+
+                self.assertEqual(resumed.returncode, 2)
+                self.assertIn("code-update", resumed.stderr)
+                self.assertEqual(
+                    list((target / ".bimri-update-backups").iterdir()),
+                    receipts_before,
+                )
+                self.assertEqual(protected_tree_snapshot(target), protected)
+
+    @unittest.skipIf(
+        os.name == "nt", "backslash cannot be a filename character on Windows"
+    )
+    def test_code_update_recovers_with_backslash_in_unknown_memory_filename(self):
+        self.cli("migrate")
+        unknown = self.root / ".bimri" / "owner\\unknown.bin"
+        unknown.write_bytes(b"unknown protected bytes\x00\xff")
+        protected = protected_tree_snapshot(self.root)
+
+        crashed = self.worker(
+            "code_update_crash_after_engine",
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            engine_root=REPOSITORY,
+            check=False,
+            timeout=60,
+        )
+        self.assertEqual(crashed.returncode, 96)
+
+        resumed = self.cli(
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            root=REPOSITORY,
+            timeout=60,
+        )
+
+        self.assertIn("Memory preservation: PASSED", resumed.stdout)
+        self.assertEqual(unknown.read_bytes(), b"unknown protected bytes\x00\xff")
+        self.assertEqual(protected_tree_snapshot(self.root), protected)
+
+    def test_code_update_resume_refuses_changed_protected_tree(self):
+        self.cli("migrate")
+        protected_before = protected_tree_snapshot(self.root)
+
+        crashed = self.worker(
+            "code_update_crash_after_engine",
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            engine_root=REPOSITORY,
+            check=False,
+            timeout=60,
+        )
+        self.assertEqual(crashed.returncode, 96)
+        owner_file = self.root / ".bimri" / "owner-created-after-crash.txt"
+        owner_file.write_bytes(b"new protected owner bytes\n")
+        changed = protected_tree_snapshot(self.root)
+        self.assertNotEqual(changed, protected_before)
+
+        resumed = self.cli(
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            root=REPOSITORY,
+            check=False,
+            timeout=60,
+        )
+
+        self.assertEqual(resumed.returncode, 2)
+        self.assertIn(
+            "protected memory differs from its prepared manifest",
+            resumed.stderr,
+        )
+        self.assertIn(
+            "created protected path .bimri/owner-created-after-crash.txt",
+            resumed.stderr,
+        )
+        self.assertEqual(owner_file.read_bytes(), b"new protected owner bytes\n")
+        self.assertEqual(protected_tree_snapshot(self.root), changed)
+
+    def test_code_update_installs_recovery_tools_without_rewriting_governance(self):
+        self.cli("migrate")
+        conflict = self.root / ".bimri" / "conflicts" / "C000001.json"
+        conflict.write_bytes(b"{malformed historical governance")
+        before = protected_tree_snapshot(self.root)
+
+        result = self.cli(
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            root=REPOSITORY,
+            timeout=60,
+        )
+
+        self.assertIn("READ-ONLY AUDIT: RECOVERY REQUIRED", result.stdout)
+        self.assertIn("authority recovery needed", result.stdout)
+        self.assertEqual(conflict.read_bytes(), b"{malformed historical governance")
+        self.assertEqual(protected_tree_snapshot(self.root), before)
+        manifest_path = next((
+            self.root / ".bimri-update-backups"
+        ).glob("*/install-manifest.json"))
+        manifest = json.loads(manifest_path.read_text("utf-8"))
+        self.assertEqual(manifest["status"], "installed-recovery-required")
+        self.assertEqual(manifest["read_only_audit"], "recovery-required")
+
+    def test_code_update_rejects_invalid_head_before_package_replacement(self):
+        self.cli("migrate")
+        program = self.root / "bimri-engine.py"
+        program.write_text("old engine sentinel\n", "utf-8")
+        state_path = self.root / ".bimri" / "state.json"
+        state = json.loads(state_path.read_text("utf-8"))
+        state["head_hash"] = "0" * 64
+        state_path.write_text(
+            json.dumps(state, indent=2, sort_keys=True) + "\n", "utf-8"
+        )
+        before = protected_tree_snapshot(self.root)
+
+        result = self.cli(
+            "install",
+            "--target",
+            self.root,
+            "--quiescent",
+            root=REPOSITORY,
+            check=False,
+            timeout=60,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("state head hash does not match", result.stderr)
+        self.assertEqual(program.read_text("utf-8"), "old engine sentinel\n")
+        self.assertEqual(protected_tree_snapshot(self.root), before)
+        self.assertFalse((self.root / ".bimri-update-backups").exists())
 
 
 if __name__ == "__main__":
