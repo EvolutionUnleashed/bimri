@@ -1,0 +1,2 @@
+# This fixture is exact v5.0.2 authority evidence. Checkout must preserve bytes.
+tests/fixtures/v5.0.2-populated/** -text

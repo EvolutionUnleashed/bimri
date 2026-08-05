@@ -1,0 +1,16 @@
+{
+  "bimri_version": "5.0.2",
+  "conflict_id": "C000001",
+  "created_at": "2026-08-05T07:01:12Z",
+  "current_hash": "b8821f765475b598f974b38cb165e90b8bdb791902c02449a8b3aad4e6bec8cf",
+  "current_line": "[R000004-E001] [K:fixture.concurrent] [I:3] [active] [T:working] [SRC:agent] [F:R000004] [L:R000004] [] First concurrent value. -> .bimri/log/R000004.md",
+  "key": "fixture.concurrent",
+  "proposal_hashes": {
+    "R000005-Q001": "c9f01cbdc81be1758575bdb24097f00995c0a80c8d2bcdf3280179bf679cef6b"
+  },
+  "proposal_ids": [
+    "R000005-Q001"
+  ],
+  "question": "Memory changed while agents were working on fixture.concurrent. Which version should BIMRI remember?",
+  "type": "stale-base"
+}

@@ -1,6 +1,7 @@
 # BIMRI: Portable Memory for Local Agents
 
-**Brief Interaction Memory and Retrieval Intelligence, v5.0.2**
+**Brief Interaction Memory and Retrieval Intelligence, engine v5.0.3. Memory
+and authority-record format: v5.0.2.**
 
 BIMRI gives a project one durable memory that Claude, Codex, and other local
 agents can share without a server, database, account, or model-specific
@@ -35,15 +36,17 @@ files before an agent uses BIMRI.
 do not compete to rewrite it. Each agent instead receives its own run handle,
 writes to its own append-only log, and submits proposals against stable memory
 keys. The engine serializes the short shared commit, checks the proposal's base
-hash, and either creates a new immutable revision or raises a conflict.
+hash, and either creates a new immutable revision or stops with an actionable
+agent error. A human-facing memory conflict is reserved for genuinely
+concurrent, incompatible changes to the same stable key.
 
-The human remains the authority. BIMRI puts unresolved questions into the next
-agent brief. The agent asks the owner in normal conversation and records the
-answer with `resolve --human-approved`; the owner never has to edit a memory
-file or run a command. The flag records the agent's assertion that the owner
+The human remains the authority. Normal starts stay quiet, including when an
+older review record exists. A newly proven concurrent conflict is explained
+once when it is raised and remains available through the pull-based `review`
+command. The agent records an explicit owner choice with
+`resolve --human-approved`; the owner never has to interpret raw record IDs or
+edit a memory file. The flag records the agent's assertion that the owner
 approved that exact choice. It is an auditable attestation, not authentication.
-Direct human statements can enter memory as confirmed. Agent inferences and
-external material remain working claims until the human confirms them.
 
 This design gives BIMRI four useful properties:
 
@@ -53,8 +56,8 @@ This design gives BIMRI four useful properties:
 - **Concurrency-safe in one shared lock domain:** independent run handles, an
   operating-system file lock, atomic replacement, and key-specific base hashes
   prevent one agent from silently overwriting another.
-- **Human-governed:** deterministic conflicts and agent-declared uncertainty
-  become conversational decisions with a durable resolution record.
+- **Human-governed:** exceptional concurrent choices are shown as actions and
+  consequences, with a durable resolution record for an explicit owner choice.
 
 ## Active Memory, Not a Diary
 
@@ -99,6 +102,16 @@ profile expands to the v5.0.1 capacity; custom v5.0 profiles remain custom.
 Every v5.0.1 limit remains unchanged during the v5.0.2 state and generated-view
 header upgrade. Earlier state bytes are backed up, and accepted revisions are
 preserved rather than rewritten.
+
+Updating an existing v5.0.2 store to engine v5.0.3 is a dedicated code-only
+operation. Stop every process running the old engine first, then invoke install
+with the mandatory `--quiescent` handoff attestation. The updater audits
+the accepted head without healing or rebuilding memory, protects `bimri.md`
+and every pre-existing path under `.bimri/`, and verifies that their path set,
+types, symlink targets, and bytes are unchanged before it reports success.
+State and all new authority records remain format v5.0.2; no memory migration,
+header change, limit change, reindex, or open-record rewrite occurs.
+
 The v5 installer serializes with other v5 engine commands in the same lock
 domain. Before upgrading any earlier version, disable the old Claude Cowork
 Global Instructions and stop every agent using that memory. Earlier versions
@@ -207,16 +220,38 @@ edits, and changed conflict candidates; operating-system permissions remain
 the security boundary.
 
 Stable keys make structural conflicts detectable. If two agents propose
-different updates to `checkout.next-step` from the same base, one can commit
-and the stale proposal becomes a conflict. Independent keys can merge.
-Meaning-level contradictions across different keys require judgment, so agents
-raise them with `--needs-human --question "..."`.
+different updates to `checkout.next-step` from the same accepted keyed base,
+one can commit and the later incompatible candidate becomes a concurrent
+conflict. Independent keys and exact compatible effects merge without owner
+involvement. A stale run is told to sync before it can create a proposal.
 
-## Human Resolution
+v5.0.3 temporarily contains the two areas that previously produced most
+routine interruptions. New Tier 1 subjects and promotions into Tier 1 are
+rejected before any proposal or conflict is written. Replacement or removal
+of confirmed Tier 1 or Tier 2 memory is also rejected before mutation. Journal
+the evidence, keep current material in working Tier 2, and ask the owner in the
+current conversation when semantic judgment is needed. A separate pull-based
+core-review model is planned for a minor release.
 
-Open conflicts appear under `HUMAN DECISION NEEDED` in the BIMRI brief. An
-agent explains the alternatives and asks the owner. It then records the
-owner's choice:
+## Pull Review and Human Resolution
+
+`start` and `hook-start` never replay open review records. Ask for actionable
+concurrent choices explicitly:
+
+```text
+<verified-python> bimri-engine.py review
+<verified-python> bimri-engine.py review C000003
+<verified-python> bimri-engine.py review --all --offset 0 --limit 20
+```
+
+The default view contains actionable concurrent conflicts. `--all` also shows
+legacy policy or validation records, recovery reviews, and historical
+candidates whose exact effect is already satisfied. Each choice names the
+stable subject, live value, proposed post-state, run, actor, source, trust,
+base revision, rationale, and exact consequence. Internal IDs remain visible
+only as the tokens needed by `resolve`.
+
+After the owner explicitly chooses an option, the agent records it:
 
 ```text
 <verified-python> bimri-engine.py resolve C000003 \
@@ -229,6 +264,13 @@ while its `source` continues to record its original provenance. Both the
 question and the resolution remain in `.bimri/`. `--human-approved` means the
 agent asserts that the owner explicitly chose that option; it cannot prove who
 ran the command.
+
+`sync` and `close` distinguish applied changes, exact no-ops, newly created
+concurrent conflicts, and agent-action failures. Reprocessing an existing
+contested candidate does not repeat its ID, question, or alternatives. If a
+later accepted revision contains a historical candidate's exact normalized
+effect, BIMRI derives that it is satisfied without rewriting the old proposal,
+decision, conflict, or resolution history.
 
 ## File Map
 
@@ -281,7 +323,9 @@ files carry transparent bookkeeping. All of it stays in the project folder.
 
 ```text
 <verified-python> bimri-engine.py status
+<verified-python> bimri-engine.py review
 <verified-python> bimri-engine.py doctor
+<verified-python> bimri-engine.py doctor --read-only
 <verified-python> bimri-engine.py maintain
 <verified-python> bimri-engine.py index
 <verified-python> bimri-engine.py migrate
@@ -396,7 +440,7 @@ host-bound adapter records explicitly:
 
 ## Author
 
-**Stu Jordan**, Agent Orchestrator
+**Stu Jordan**, Agent Architect
 
 - Community: [Evolution Unleashed](https://evolutionunleashed.com)
 - Patreon: [Evolution Unleashed VIP](https://www.patreon.com/evolutionunleashedvip)

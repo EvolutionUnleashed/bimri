@@ -1,6 +1,7 @@
-# Migrating Earlier BIMRI Versions to v5.0.2
+# BIMRI Migration and the v5.0.3 Code-Only Update
 
-BIMRI v5.0.2 automatically migrates explicitly versioned v1-v3 tiered
+Engine v5.0.3 uses memory format v5.0.2. It automatically migrates explicitly
+versioned v1-v3 tiered
 Markdown and the engine-based v4 format. This canonical repository publicly
 distributed the original v1 and streamlined v3 instructions; the parser also
 accepts a valid v2 header. Migration preserves old material before creating v5
@@ -228,6 +229,31 @@ judgment-first, Tier 2 uses `tier2_max`, and archival requires an explicit
 accepted `close`.
 
 ## v5 Maintenance Upgrades
+
+### v5.0.2 memory + v5.0.3 engine: no migration
+
+An existing v5.0.2 store is already on the current memory and authority-record
+format. Installing engine v5.0.3 performs a code-only update after every old
+engine process has been externally stopped. It does not change state, limits,
+the generated-view header, the accepted head, revisions, proposals, decisions,
+conflicts, resolutions, archives, indexes, backups, migrations, recovery
+evidence, unknown files, or sparse-directory shape.
+
+The updater runs `doctor --read-only`, captures a complete protected manifest
+of `bimri.md` and every pre-existing `.bimri/` path except the lock and two
+host-local binding files, replaces only authorized package/adapter files, and
+requires the same protected manifest and accepted head before success. Its
+backup and receipt live in sibling `.bimri-update-backups/`, outside the memory
+tree. A divergent `bimri.md` or damaged governance is reported without healing
+or rewriting it. See [`INSTALL.md`](INSTALL.md) for the exact guard, rollback,
+and receipt contract.
+
+The old-process shutdown is a real precondition. The file lock cannot stop an
+already-loaded v5.0.2 process that waits during installation and writes after
+the new engine releases the lock. v5.0.3 adds no persisted writer fence and
+does not claim live-update safety.
+
+### v5.0 and v5.0.1 to memory format v5.0.2
 
 Existing v5.0 and v5.0.1 states upgrade automatically to v5.0.2 under the
 engine lock. Before changing state, the engine validates the complete source

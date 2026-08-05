@@ -64,9 +64,10 @@ two paths to its ignore rules explicitly.
 ## Agent Installation Contract
 
 1. Obtain this repository in a temporary local folder.
-2. Inspect the target for BIMRI v1-v4 or v5 files. Before upgrading any
-   earlier version, stop every agent and command using that folder and keep it
-   quiescent until installation completes.
+2. Inspect the target for BIMRI v1-v4 or v5 files. Before every update, stop
+   every process executing the old engine and keep the folder quiescent until
+   installation completes. The lock serializes commands; it cannot fence an
+   already-loaded old process waiting to write after the installer exits.
 3. If Claude Cowork Global Instructions contain a v1-v3 BIMRI block, ask
    the owner to disable or remove it before installation. Those instructions
    directly rewrite the old hot-memory file and must not run alongside v5.
@@ -91,19 +92,24 @@ two paths to its ignore rules explicitly.
    a byte-preserving backup. A v5.0 upgrade adopts the 12,000-token capacity
    profile when its limits are still stock; a v5.0.1 upgrade preserves its
    configured limits.
-7. Run `<verified-python> bimri-engine.py doctor` from the target project if
-   you need to repeat the self-check.
+   An existing v5.0.2 store takes the code-only v5.0.3 path documented below;
+   its memory format and protected memory tree do not migrate.
+7. Run `<verified-python> bimri-engine.py doctor --read-only` from an existing
+   v5.0.2 target when you need to repeat the non-mutating audit. Use normal
+   `doctor` only when repair-capable validation is intended.
 8. Confirm the installer wrote both local binding records above; never commit
    them.
 9. Report only:
-   - BIMRI version installed;
+   - BIMRI engine release and memory-format version;
    - the verified absolute Python executable;
    - whether memory was initialized or migrated;
    - for migration, the detected version and source file, imported counts,
      converted-pattern count, backup location, and validation result;
    - adapters enabled and whether Claude hooks were rebound;
-   - whether the hook smoke test and `doctor` passed, or whether installation
-     completed in authority-recovery mode; and
+   - whether the hook smoke test and audit passed, or whether installation
+     completed in authority-recovery mode;
+   - for a code-only update, the protected-path count, before/after tree
+     digest, accepted head before/after, and preservation result; and
    - any inherited-limit repair warning printed by the installer.
 
 For an existing v5 target, install uses the target's engine lock from before
@@ -115,18 +121,87 @@ Earlier BIMRI versions do not use the v5 engine lock. Quiescence and removal of
 the old Global Instructions are therefore required preconditions, rather than
 steps the installer can enforce across every running agent or Claude setting.
 
-Before changing target files, install writes rollback copies to
-`.bimri/install-backups/<timestamp>/`. If the self-check fails, it restores the
-touched paths and reports that exact backup directory. Do not discard the
-reported backup until the owner confirms the installation is healthy.
+For legacy migrations, install writes rollback copies to
+`.bimri/install-backups/<timestamp>/`. The v5.0.2 code-only path instead stores
+authorized program-file backups and its receipt beside `.bimri`, under
+`.bimri-update-backups/<timestamp>/`; no partial copy of memory is described as
+a complete memory backup.
 
 Malformed canonical authority records do not force the installer to roll back
-the v5.0.2 recovery tools. When the core memory and state are sound, install
+the v5.0.3 recovery tools. When the core memory and state are sound, install
 finishes in `installed-recovery-required` mode, lists every blocker, and keeps
 shared-memory writes paused. `start` remains available with a loud recovery
 brief, while `status` and `doctor` remain nonzero for automation. After the
 owner reviews the evidence, use the human-attested `quarantine-authority` and
 `restore-authority` workflow in `BIMRI-PROTOCOL.md`; never hand-edit `.bimri/`.
+
+## Existing v5.0.2 Store: Code-Only v5.0.3 Update
+
+Engine release v5.0.3 deliberately retains memory and authority-record format
+v5.0.2. Stop every process executing the old engine, then explicitly attest
+that external quiescence when invoking the code-only updater:
+
+```text
+<verified-python> bimri-engine.py install --target /absolute/path/to/the/project --quiescent
+```
+
+The `--quiescent` flag is mandatory for an existing v5.0.2 store; it records
+the caller's handoff attestation and does not claim that the lock can fence an
+already-loaded old process. After that attestation, the installer detects the
+existing state before creating directories or invoking any mutating load,
+migration, view-sync, or index path. It acquires the already-present engine
+lock without filling a sparse layout, rechecks the target under that lock, and
+runs the same validation exposed as:
+
+```text
+<verified-python> bimri-engine.py doctor --read-only
+```
+
+The read-only audit checks state, accepted head and hash, memory grammar,
+pointers, authority records, and the authority graph. It compares `bimri.md`
+with the accepted head without healing it. A direct hot-view edit is reported
+as recovery needed and its exact bytes remain untouched.
+
+Before package replacement, the updater records every pre-existing path under
+`.bimri/`, plus root `bimri.md`: directories, regular files, symbolic links,
+unknown files, recovery litter, unreferenced revisions, backups, and migration
+evidence. It records path type and exact bytes or symlink target. Only these
+host-local files are excluded from the protected manifest:
+
+```text
+.bimri/engine.lock
+.bimri/runtime.local.json
+.bimri/hooks.claude.local.json
+```
+
+The transaction may replace package files, marked BIMRI instruction blocks,
+and the two host-local bindings. A destination guard rejects every attempted
+create, copy, replace, rename, unlink, directory creation, or directory removal
+against `bimri.md` or a protected `.bimri` path. The installed engine is
+replaced last. A caught failure restores every authorized program, adapter,
+and binding path from the sibling update backup. A repeated install resumes or
+restores an interrupted prepared transaction without touching protected
+memory. Repeat with the same verified v5.0.3 source command shown above, not a
+target-side engine that an interruption may already have restored to v5.0.2.
+The sibling prepared receipt is what makes that external candidate retry safe.
+
+Before releasing the lock, the installer recomputes the complete protected
+manifest and requires identical path sets, types, symlink targets, file hashes,
+state bytes, accepted head, and head hash. It then runs the new read-only audit.
+Success is reported only with an explicit receipt equivalent to:
+
+```text
+BIMRI 5.0.3 installed.
+Existing memory format v5.0.2 verified; no migration performed.
+Accepted head unchanged: V...... <sha256>.
+Memory preservation: PASSED (... protected paths unchanged; zero protected writes).
+```
+
+If state or accepted-head authority is invalid, package replacement does not
+begin. Sound state/head with damaged governance may receive the recovery tools
+in explicit `installed-recovery-required` mode. Every protected byte still has
+to match; the updater never repairs, rebuilds, reindexes, truncates, or rewrites
+memory as part of installation or rollback.
 
 ## Claude Code Hooks
 

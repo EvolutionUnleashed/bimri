@@ -3,6 +3,32 @@
 This file records the public BIMRI architecture history. Historical instruction
 files are preserved under [`legacy/`](legacy/) and are not current installers.
 
+## 5.0.3
+
+- Made ordinary operation quiet. `start` and `hook-start` no longer replay
+  review records, and `sync`/`close` announce a concurrent conflict only when
+  that candidate generation is first created.
+- Added pull-based `review`, human-readable add/replace/remove/refresh choices,
+  explicit action consequences, pagination totals, and separate status counts
+  for actionable concurrency, legacy review records, recovery reviews, and
+  satisfied historical candidates.
+- Added proposal preflight against the accepted keyed head, same-run retry
+  idempotency, capacity reservation, and pre-mutation containment for new core
+  memory, confirmed-memory replacement/removal, public system provenance, and
+  semantic uncertainty. Routine policy and validation failures no longer
+  allocate owner-conflict records.
+- Limited new memory conflicts to proven incompatible cross-run writes against
+  the same key. Exact sets, compatible closes, and causally compatible touches
+  resolve deterministically.
+- Derived historical exact-effect satisfaction from accepted revision ancestry
+  without rewriting old authority. Close satisfaction now requires exact
+  archive provenance, and archive replay rejects a proposal marker whose
+  reason or removed line differs.
+- Split engine release `5.0.3` from memory and authority-record format `5.0.2`.
+  Existing v5.0.2 stores use a dedicated code-only update path with a read-only
+  audit and a protected-tree manifest. The accepted head, `bimri.md`, and every
+  pre-existing protected `.bimri/` path must remain byte-identical.
+
 ## 5.0.2
 
 - Made human resolution explicit and provenance-preserving. A new resolution

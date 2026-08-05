@@ -1,10 +1,15 @@
-# BIMRI Protocol v5.0.2
+# BIMRI Protocol Release v5.0.3
 
 Brief Interaction Memory and Retrieval Intelligence.
 
 This document is the normative protocol for a portable, human-governed BIMRI
 memory folder. `AGENTS.md` is the short runtime adapter. `bimri-engine.py` is
 the reference implementation.
+
+The engine release is v5.0.3. The persisted memory, state, and authority-record
+format remains v5.0.2. Unless a section explicitly discusses an older artifact,
+all persisted `bimri_version` fields and the generated-memory format in this
+release are v5.0.2.
 
 The words MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY describe interoperability
 requirements.
@@ -254,6 +259,11 @@ Under the engine lock, `start` MUST:
 7. print the BIMRI brief and explicit run handle; and
 8. attempt to rebuild the derived index.
 
+The normal brief MUST be quiet about open review records. `start` and
+`hook-start` MUST NOT print conflict IDs, choices, questions, open-review
+counts, or `HUMAN DECISION NEEDED`. They MUST continue to print authority
+recovery warnings because those indicate that shared writes are unsafe.
+
 Failure to rebuild the index after step 7 MUST be reported as a warning, not
 as failure to create the run. The run handle is already durable and the index
 can be rebuilt independently.
@@ -303,22 +313,37 @@ Operations are:
 - `close`: remove an existing keyed entry from hot memory and append it to the
   archive with provenance.
 
-Each proposal records at least its proposal ID, run, actor, operation, tier,
-stable key, intended value, base revision, and `base_hash`. `base_hash` is the
-SHA-256 hash of the exact line for that key in the run's observed base
-revision, or the literal `absent` when no entry existed there. `start` sets
-that base; a successful `sync` advances it for subsequent proposals. This
-preserves stale-work detection even when another agent commits before the
-proposal command runs. Proposal records MUST be immutable after creation.
+Before its first durable write, `propose` MUST validate the full rendered
+candidate against the accepted head while holding the engine lock. The run's
+key hash MUST equal the live keyed hash; unrelated head movement is allowed.
+A stale keyed run MUST be told to `sync`, and an effect that already equals the
+live state MUST create no proposal or conflict.
 
-An agent MAY add:
+An admitted proposal binds `base_revision` to that current accepted head and
+`base_hash` to the exact keyed line hash, or literal `absent`. It also carries
+one optional backward-readable `preflight_receipt` containing engine release
+v5.0.3, accepted-head revision and hash, and observed key hash. The receipt
+MUST validate against the named immutable revision before the proposal may
+create a new concurrent conflict. Proposal records remain immutable.
 
-```text
---needs-human --question "Which launch date should future agents use?"
-```
+An exact same-run retry for the same key and normalized caller-authored intent
+MUST return the existing proposal ID without changing any durable file. A
+different pending same-run intent MUST be rejected until `sync` advances that
+run's base.
 
-This is required when the agent sees material semantic uncertainty that the
-engine cannot determine from structure alone.
+v5.0.3 MUST reject before mutation: a new Tier 1 key; promotion into Tier 1;
+`set` or `close` against confirmed Tier 1 or Tier 2; public `source=system`;
+and any `--needs-human` proposal. These are agent actions, not memory
+conflicts. Semantic uncertainty is raised conversationally before an agent
+submits a chosen memory change. Confirmed Tier 2 `touch` remains valid only
+when it preserves every live authority/content field and safely refreshes
+recency.
+
+Preflight MUST dry-run grammar and active caps and reserve positive entry and
+byte capacity for pending proposals and actionable unresolved candidates.
+Pending closes or reductions receive no capacity credit. Reservation remains
+until the effect is accepted, strictly satisfied, or rejected by an existing
+human resolution.
 
 ### 7.4 Sync and Close
 
@@ -338,6 +363,12 @@ that run from `active_runs`:
 
 Outcomes are `success`, `partial`, `overflow`, or `fail`. The log receives one
 `[OUTCOME:...]` line and one `[CLOSED:...]` line.
+
+Command summaries MUST distinguish newly applied effects, already
+satisfied/no-change effects, newly created concurrent-conflict generations,
+and agent-action failures. An existing contested decision MUST NOT be counted
+or announced again. A normal close with no new exceptional event SHOULD remain
+compact.
 
 When more than one run is active, an implementation MUST refuse a close that
 does not identify its target. Closing run A MUST NOT close, stamp, mutate, or
@@ -367,11 +398,13 @@ section. A conforming commit performs these steps:
 2. read the immutable head revision and verify its SHA-256 against
    `head_hash`;
 3. parse and validate the memory grammar;
-4. locate the proposal's entry by stable key or explicit target ID;
-5. compare the proposal's `base_hash` with the exact current line hash;
-6. evaluate authority and capacity rules;
-7. either create a conflict or render the new memory;
-8. validate IDs, keys, caps, entry length, and total byte limit;
+4. validate the immutable proposal and v5.0.3 preflight receipt;
+5. locate the current entry by stable key or explicit target ID;
+6. test the operation's complete exact effect before any policy or conflict
+   gate, including exact archive provenance for an absent `close`;
+7. prove any later same-key writer through accepted decision/revision
+   authority and require a different run handle before creating a conflict;
+8. render and validate IDs, keys, caps, entry length, and total byte limit;
 9. write a durable per-proposal `applying` intent;
 10. for a `close`, durably append the exact removed line to its archive;
 11. exclusively write a new immutable revision;
@@ -393,33 +426,58 @@ final proposal decision MUST return the same effective decision rather than
 applying it twice.
 
 If a later accepted change has replaced the visible effect of an interrupted
-`applying` decision, the engine MUST raise a conservative human-visible
-conflict unless committed ancestry proves that the earlier effect became
-canonical. The presence of an otherwise valid revision file is not sufficient:
-the process may have crashed after creating that file but before advancing
-`state.json`.
+`applying` decision, an unreceipted or unproven candidate MUST fail as
+agent/recovery work rather than allocate a new owner conflict. The presence of
+an otherwise valid revision file is not sufficient: the process may have
+crashed after creating it but before advancing `state.json`.
 
 For any accepted operation that removes an entry from hot memory, the archive
 record MUST be durable before `state.json` can point to a revision where that
 entry is absent. Archive replay MUST be idempotent. If archival fails, the
 accepted head MUST continue to contain the entry.
 
+An existing `[BY:<proposal>]` marker proves replay only when a strict archive
+record parse confirms the required reason and exact removed raw line. A marker
+with the right proposal ID but different reason or bytes is
+authority/recovery corruption.
+
 Independent keys can commit even when the overall head revision has advanced.
-A changed hash for the proposal's own key is what creates a structural
-conflict.
+A later changed hash for the proposal's own key can create a conflict only
+when the immutable preflight receipt and accepted authority prove genuine
+cross-run overlap. Same-run evolution, a run already stale at proposal time,
+capacity, validation, and policy refusal are not owner conflicts.
 
 ## 9. Conflicts
 
-### 9.1 Deterministic Structural Conflicts
+### 9.1 Concurrent Memory Conflicts and Recovery Reviews
 
-The reference engine raises a conflict when:
+A new owner-facing memory conflict may be created only when all of these facts
+validate:
 
-- a proposal's key changed from its recorded base hash;
-- a non-user proposal would change confirmed memory;
-- a non-user proposal would promote a Tier 1 claim;
-- a change would exceed a memory cap or violate the generated-view grammar;
-- an agent explicitly sets `needs_human`; or
-- a direct edit to generated `bimri.md` is detected.
+1. two different run handles observed the same keyed state before either
+   competing effect became canonical;
+2. the candidate's v5.0.3 preflight receipt binds its proposal base, accepted
+   head hash, and keyed hash;
+3. accepted decision and revision authority proves that another run committed
+   a later change to that exact key before the candidate applied;
+4. the candidate's complete normalized effect is not already reflected in
+   accepted history; and
+5. the post-states are incompatible and cannot be reconciled structurally.
+
+The stored type remains `stale-base` for v5.0.2 format compatibility. The
+owner-facing label MUST be **Concurrent edit** or **Concurrent removal**.
+Actor labels and run-number ordering MUST NOT select a winner.
+
+Tier 1 admission, confirmed-memory policy, semantic uncertainty, caps,
+validation, same-run reuse, and stale state detected before proposal creation
+MUST NOT allocate a conflict. Compatible exact sets and closes become strict
+no-ops. A compatible intervening Tier 2 touch becomes a causal no-op only when
+text, source, trust, importance, status, tags, and first-run identity remain
+unchanged; it MUST NOT regress recency.
+
+Direct hot-view edits and damaged authority are recovery events rather than
+concurrent memory conflicts. Their historical `C...` records remain format
+compatible, but the interface MUST label them **Recovery review**.
 
 Direct edits to `bimri.md` MUST NOT become accepted memory silently. Any byte
 difference from the accepted revision, including invalid UTF-8, CRLF-only
@@ -428,7 +486,7 @@ content-addressed path in `.bimri/recovery/`. Repeated detection of the same
 bytes MUST reuse that exact recovery file. The one exception is an exact byte match to a referenced
 immutable revision, which is already preserved and MAY be healed as a stale
 generated view. The detecting command MUST immediately report a new edit,
-create or update a human-visible conflict with the recovery path, and restore
+create or update a recovery review with the recovery path, and restore
 the generated head view even when a different authority record is damaged.
 Every manual-edit recovery path MUST be a direct recovery file whose filename
 hash matches its exact bytes. A conflict with any recorded resolution attempt
@@ -438,15 +496,36 @@ MUST NOT absorb later edit evidence; a later edit receives a new conflict.
 
 The engine cannot reliably prove that differently keyed statements contradict
 one another, refer to the same real-world entity, or reflect a changed human
-preference. Agents MUST raise material meaning-level uncertainty with
-`needs_human` and a concise question. This is a judgment obligation, not a
-deterministic engine feature.
+preference. In v5.0.3 an agent MUST ask the owner conversationally before
+submitting its chosen memory change. Public `--needs-human` proposals are
+rejected before mutation and MUST NOT become memory conflicts.
 
-### 9.3 Human Resolution
+### 9.3 Pull Review and Human Resolution
 
-Open conflicts appear in the next BIMRI brief with a conflict ID, current
-value, proposal IDs, and a human-readable question. The agent asks the human
-and records one of:
+Open review records MUST NOT appear in a start brief. A new concurrent
+candidate generation may render one creation notice; replaying the same
+candidate MUST be silent. Afterwards an agent pulls review explicitly:
+
+```text
+<verified-python> bimri-engine.py review
+<verified-python> bimri-engine.py review C000007
+<verified-python> bimri-engine.py review --all --offset 0 --limit 20
+```
+
+Default output lists actionable concurrent choices. `--all` additionally
+groups legacy policy records, legacy capacity/validation agent actions,
+recovery reviews, and historically satisfied candidates. Output MUST state
+total, displayed range, and remaining count; it MUST NOT silently truncate.
+
+The creation notice and `review` MUST use one structured renderer. It shows
+the stable key, operation as add/replace/remove-archive/refresh, live value and
+metadata, labelled creation snapshot, proposed post-state, run, actor,
+timestamp, source, trust, base revision, rationale, why reconciliation stopped,
+and the consequence of keeping live or choosing each internal proposal ID.
+Raw storage lines MUST NOT be the primary choice. A close always says that it
+removes the key from hot memory and preserves the exact prior line in archive.
+
+After the owner chooses, the agent records one of:
 
 ```text
 <verified-python> bimri-engine.py resolve C000007 --choose R000042-Q002 --human-approved
@@ -466,8 +545,24 @@ the exact choice after the owner re-attests it. Once status becomes `resolved`,
 the record is durable decision authority and repeated resolution is
 idempotent without another write.
 
-If the keyed memory changed after the question was raised, resolution MUST
-stop and ask an agent to review the latest state.
+If the chosen candidate's exact effect is reflected at the current head, a
+first explicit human-approved resolution MAY complete without a new memory
+revision only after the current head, conflict snapshot, every candidate base,
+and all decision revision bounds validate. A candidate satisfied only in an
+older revision remains derived historical state; it MUST NOT force an older
+`revision_after` across later candidates. Otherwise, keyed memory movement
+after the question was raised MUST stop resolution and require a fresh review.
+
+For each unresolved contested candidate, the engine MUST search accepted
+canonical revisions strictly after that candidate's own contested-decision
+revision. If a later revision contains its complete normalized post-state,
+the engine derives `satisfied` with the satisfying revision and canonical line
+hash. A close additionally requires a strictly parsed archive record for the
+exact removed line from an accepted close. This classification is ephemeral:
+the proposal, decision, conflict, and resolution files MUST NOT be rewritten,
+and no synthetic human resolution may be created. Later movement away from the
+satisfying revision MUST NOT resurrect the candidate. In a multi-candidate
+record, only exact candidates are hidden.
 
 ### 9.4 Governance Record Validation
 
@@ -561,8 +656,8 @@ Default limits are:
 | Generated view | 49,152 bytes |
 
 The accepted head MUST satisfy the active tier caps and byte limit. A proposal
-that would violate them becomes a human-visible conflict. A migrated legacy
-head that already exceeds a limit MAY temporarily retain inherited overflow;
+that would violate them MUST fail preflight as an agent action and MUST NOT
+allocate a conflict. A migrated legacy head that already exceeds a limit MAY temporarily retain inherited overflow;
 the engine permits only changes that strictly reduce at least one overflow
 without worsening another until the head is within all limits.
 
@@ -618,6 +713,18 @@ but does not change accepted memory.
 ```text
 <verified-python> bimri-engine.py doctor
 ```
+
+For existing-store verification without mutation:
+
+```text
+<verified-python> bimri-engine.py doctor --read-only
+```
+
+The read-only path MUST NOT create layout, initialize or upgrade state, finish
+a migration, normalize metadata, synchronize or heal `bimri.md`, rebuild the
+index, save state, or write any recovery/governance record. It validates state,
+accepted head/hash, memory grammar, pointer containment, authority records, and
+the authority graph, and reports a divergent generated view in place.
 
 Validation covers strict state parsing, revision grammar, the head hash,
 generated memory grammar and caps, duplicate IDs and keys, proposal and
@@ -678,6 +785,36 @@ uncommitted and MUST be regenerated after the folder moves to another host or
 Python changes. Their absolute paths MUST NOT be copied into shared
 instructions or configuration.
 
+When `.bimri/state.json` declares memory format v5.0.2, installation MUST take
+a dedicated code-only branch before target-directory creation, layout filling,
+or any mutating load. Every process executing the old engine MUST first be
+externally stopped; the lock does not fence an already-loaded old writer and
+v5.0.3 adds no persisted writer-version fence. Under a no-layout lock, the
+installer MUST reclassify the target and run the read-only audit.
+
+The code-only transaction MUST protect root `bimri.md` and every pre-existing
+path below `.bimri/`, including directories, unknown files, symlinks, recovery
+litter, unreferenced revisions, and install backups. Only `engine.lock`,
+`runtime.local.json`, and `hooks.claude.local.json` are excluded. A complete
+manifest records path type and exact file bytes/hash or symlink target, plus
+the accepted head and hash. Every mutation primitive and rollback operation
+MUST pass one destination guard that rejects writes, directory creation,
+replace, rename, unlink, or removal against a protected destination.
+
+Authorized writes are limited to package files, marked BIMRI adapter blocks,
+the two host bindings, and a sibling `.bimri-update-backups/<timestamp>/`
+program backup/manifest. Package files MUST be staged and verified, with the
+engine replaced last. A caught failure restores every authorized path without
+repairing memory. Abrupt interruption MUST be safely resumable or restorable
+on repeat install.
+
+Before lock release, the installer MUST recompute the complete protected
+manifest, require identical path sets/types/targets/hashes and the same state
+bytes and accepted head, run the new read-only audit, and report zero protected
+write attempts. Engine release becomes v5.0.3; state, generated header, and all
+new authority records remain format v5.0.2. No migration, limit change,
+reindex, open-record rewrite, or generated-view healing is permitted.
+
 For an existing v5 target, every installer mutation MUST be serialized by the
 same engine lock used by runtime commands. Before upgrading v1-v4, every old
 writer and command MUST stop because the v5 installer cannot assume that an
@@ -686,12 +823,12 @@ Cowork Global Instructions MUST be disabled before v5 operation begins; they
 directly edit the old hot-memory file and are incompatible with the generated
 v5 view.
 
-Before mutation, the installer MUST preserve existing target files in
+For initialization and memory-format migration, the installer MUST preserve existing target files in
 `.bimri/install-backups/<timestamp>/`. If the self-check fails, it MUST restore
 the touched paths to their pre-install state and report that exact backup
 directory in the error. A canonical state, revision, migration, or runtime
-self-check failure remains rollback-worthy. If an existing v5.0 or v5.0.1
-target has valid core state but damaged governance records, v5.0.2 installation
+self-check failure remains rollback-worthy. If an existing v5 target has
+valid core state but damaged governance records, v5.0.3 installation
 MAY instead complete in an explicit `installed-recovery-required` state so the
 new quarantine and restore commands remain available. It MUST print each
 blocker and MUST NOT claim that doctor passed.
@@ -799,4 +936,14 @@ conflicts, and resolutions remain compatible artifacts. Historical resolutions
 without the v5.0.2 authority field retain legacy source-rewrite semantics;
 new resolutions use v5.0.2 provenance-preserving semantics.
 
-<!-- END BIMRI PROTOCOL v5.0.2 -->
+### 14.5 v5.0.2
+
+Memory format v5.0.2 is current under engine release v5.0.3. Updating from the
+v5.0.2 engine MUST use the code-only preservation contract in Section 13 and
+MUST NOT invoke memory migration. Historical and newly written proposals,
+decisions, conflicts, resolutions, quarantine records, restore records, state,
+and generated-memory headers retain their v5.0.2 format values. The optional
+validated proposal `preflight_receipt` is the only authority-record extension
+in this release.
+
+<!-- END BIMRI PROTOCOL RELEASE v5.0.3 | MEMORY FORMAT v5.0.2 -->

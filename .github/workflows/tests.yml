@@ -23,10 +23,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
       - name: Compile Python sources
-        run: python -m py_compile bimri-engine.py tests/test_bimri_engine.py tests/crash_worker.py
+        run: python -m py_compile bimri-engine.py tests/test_bimri_engine.py tests/test_v503_release.py tests/crash_worker.py
       - name: Run unit tests
         run: python -m unittest discover -s tests -v

@@ -2,7 +2,8 @@
 
 ## Claude Code
 
-Use `BIMRI-PROTOCOL.md` as the normative memory protocol.
+Use BIMRI engine v5.0.3 with memory format v5.0.2.
+`BIMRI-PROTOCOL.md` is the normative memory protocol.
 
 `<verified-python>` in BIMRI instructions means the exact absolute Python 3.8+
 executable verified for this machine according to `INSTALL.md`. Never assume a
@@ -25,8 +26,10 @@ both hooks with one synthetic session ID, require their expected non-empty
 output, confirm the test run closes, and run `doctor`.
 
 `hook-start` uses Claude Code's session ID to allocate or resume the correct
-run and injects the BIMRI brief. `hook-close` closes only that mapped session.
-Other agents may be working in the same folder and must never be treated as
-orphans.
+run and injects the quiet BIMRI brief. It does not replay open reviews. Use the
+pull-based `review` command when a concurrent choice matters to current work or
+the owner asks to inspect pending memory. `hook-close` closes only that mapped
+session. Other agents may be working in the same folder and must never be
+treated as orphans.
 
 Without hooks, use the explicit start and close commands in `AGENTS.md`.
