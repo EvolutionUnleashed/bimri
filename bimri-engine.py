@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BIMRI Engine v5.0.3 (memory format v5.0.2)
+BIMRI Engine v5.1.0 (authority store v5.1.0; hot grammar v5.0.2)
 Portable, human-governed memory for local agents.
 
 The shared memory is a generated Markdown view. Agents work in independent
@@ -13,7 +13,7 @@ Stdlib only. Python 3.8+.
 Common commands:
   start --actor codex
   journal --run R000001 --text "Decision detail"
-  propose --run R000001 --tier 2 --key launch.next-step --text "..."
+  propose --run R000001 --tier 2 --new-subject --key launch.next-step --text "..."
   close --run R000001 --outcome success --summary "..."
   review
   resolve C000001 --choose R000002-Q001 --human-approved
@@ -53,11 +53,17 @@ except ImportError:  # pragma: no cover
     msvcrt = None
 
 
-ENGINE_VERSION = "5.0.3"
-MEMORY_FORMAT_VERSION = "5.0.2"
+ENGINE_VERSION = "5.1.0"
+MEMORY_FORMAT_VERSION = "5.1.0"
+HOT_FORMAT_VERSION = "5.0.2"
 PREVIOUS_V5_VERSION = "5.0"
 V5_0_1_VERSION = "5.0.1"
-LEGACY_V5_FORMATS = {PREVIOUS_V5_VERSION, V5_0_1_VERSION}
+V5_0_2_VERSION = "5.0.2"
+LEGACY_V5_FORMATS = {
+    PREVIOUS_V5_VERSION,
+    V5_0_1_VERSION,
+    V5_0_2_VERSION,
+}
 COMPATIBLE_ARTIFACT_VERSIONS = {
     *LEGACY_V5_FORMATS,
     MEMORY_FORMAT_VERSION,
@@ -117,6 +123,35 @@ TRUSTS = {"working", "confirmed", "contested"}
 SOURCES = {"user", "agent", "external", "system", "legacy"}
 OUTCOMES = {"success", "partial", "overflow", "fail"}
 OPERATIONS = {"set", "touch", "close"}
+HOLD_REASONS = {
+    "classification-required",
+    "confirmed-user-authority-required",
+    "tier1-human-authority-required",
+    "capacity-residency-required",
+    "owner-resolution-in-progress",
+}
+HOLD_MESSAGES = {
+    "classification-required": (
+        "No exact current key matched. Search and reuse the intended key, or "
+        "resubmit with --new-subject if this is genuinely new."
+    ),
+    "confirmed-user-authority-required": (
+        "Current confirmed truth is unchanged. A direct owner statement may "
+        "update or close this subject."
+    ),
+    "tier1-human-authority-required": (
+        "Tier 1 truth is unchanged. A direct owner statement may admit or "
+        "promote this subject."
+    ),
+    "capacity-residency-required": (
+        "The intent is preserved, but no eligible hot resident could cool; "
+        "current truth is unchanged."
+    ),
+    "owner-resolution-in-progress": (
+        "The intent is preserved and current truth is unchanged while an "
+        "earlier owner resolution finishes. Review or resubmit it afterward."
+    ),
+}
 TIER1_KINDS = {"decision", "fact", "pref", "rule"}
 TIER2_STATUSES = {"active", "watch", "closed"}
 PATTERN_CONFIDENCE = {"emerging", "developing", "established"}
@@ -181,6 +216,7 @@ DEFAULT_STATE = {
     "active_runs": {},
     "session_runs": {},
     "run_dates": {},
+    "cold_current": {},
     "last_started_at": None,
     "last_closed_at": None,
     "prune_policy": "archive_only",
@@ -196,11 +232,7 @@ DECAY_DAYS = [
     (1, 1.0), (3, 0.8), (5, 0.5), (10, 0.35),
     (15, 0.2), (20, 0.15), (10**9, 0.1),
 ]
-DECAY_RUNS = {
-    "interactive": [(1, 1.0), (3, 0.8), (5, 0.5), (10, 0.35), (10**9, 0.2)],
-    "daily_cron": [(2, 1.0), (6, 0.8), (12, 0.5), (24, 0.35), (10**9, 0.2)],
-    "hourly_cron": [(24, 1.0), (72, 0.8), (168, 0.5), (336, 0.35), (10**9, 0.2)],
-}
+CADENCE_CLASSES = {"interactive", "daily_cron", "hourly_cron"}
 
 HOT_TEMPLATE = """# BIMRI Memory
 
@@ -209,19 +241,20 @@ HOT_TEMPLATE = """# BIMRI Memory
 
 ## Tier 1: Core Intelligence
 
-<!-- Confirmed facts, decisions, preferences and rules. Capacity: state.json. -->
+<!-- Confirmed facts, decisions, preferences and rules. Soft target: state.json. -->
 
 ## Tier 2: Active Context
 
-<!-- Current work, risks and next actions. Capacity: state.json. -->
+<!-- Current work, risks and next actions. Soft target: state.json. -->
 
 ## Tier 3: Pattern Recognition
 
-<!-- Evidence-backed patterns. Capacity: state.json. -->
+<!-- Evidence-backed patterns. Soft target: state.json. -->
 
 <!-- END BIMRI -->
 """
-V5_0_1_HOT_TEMPLATE = HOT_TEMPLATE.replace("v5.0.2", "v5.0.1")
+V5_0_2_HOT_TEMPLATE = HOT_TEMPLATE.replace("Soft target", "Capacity")
+V5_0_1_HOT_TEMPLATE = V5_0_2_HOT_TEMPLATE.replace("v5.0.2", "v5.0.1")
 
 V5_T1_RE = re.compile(
     r"^\[(?P<id>R\d{6}-E\d{3}|R\d+-E\d+)\]\s+"
@@ -273,6 +306,10 @@ V4_PATTERN_RE = re.compile(
 
 
 class BimriError(RuntimeError):
+    pass
+
+
+class PressureCoolingUnavailable(BimriError):
     pass
 
 
@@ -561,6 +598,26 @@ def atomic_write_text(path, content):
         raise
 
 
+def atomic_write_bytes(path, content):
+    path = Path(path)
+    guard_active_code_update(path, "atomic-write")
+    ensure_directory_durable(path.parent)
+    if path.exists() and path.is_symlink():
+        raise BimriError(f"refusing to replace symbolic link: {path}")
+    fd, temp_name = tempfile.mkstemp(prefix=".bimri-tmp-", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+        fsync_directory(path.parent)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.unlink(temp_name)
+        raise
+
+
 def atomic_write_json(path, data):
     atomic_write_text(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
 
@@ -803,6 +860,61 @@ def record_migration_receipt(paths, action, source_version=None, **details):
     return receipt
 
 
+def validate_cold_current(value):
+    """Validate canonical pointers to current-but-not-hot Tier 2 subjects."""
+    if not isinstance(value, dict):
+        raise BimriError("state cold_current must be an object.")
+    required = {
+        "entry_id", "key", "tier", "raw_line", "line_hash",
+        "archived_by", "archived_on",
+    }
+    normalized = {}
+    for key, record in value.items():
+        if clean_key(key) != key:
+            raise BimriError("state cold_current key must already be normalized.")
+        if not isinstance(record, dict) or set(record) != required:
+            raise BimriError(
+                f"state cold_current record {key} has invalid fields."
+            )
+        if record.get("key") != key or record.get("tier") != 2:
+            raise BimriError(
+                f"state cold_current record {key} has an invalid key or tier."
+            )
+        validate_fixed_id(
+            record.get("entry_id"), LEGACY_ENTRY_RE, "cold entry ID"
+        )
+        validate_fixed_id(
+            record.get("archived_by"), PROPOSAL_RE, "cold archive proposal ID"
+        )
+        try:
+            dt.date.fromisoformat(
+                clean_scalar(record.get("archived_on"), "cold archive date", 10)
+            )
+        except ValueError as exc:
+            raise BimriError(
+                f"state cold_current record {key} has an invalid archive date."
+            ) from exc
+        raw_line = clean_scalar(
+            record.get("raw_line"), "cold raw line", MAX_SERIALIZED_ENTRY_CHARS
+        )
+        entry = parse_entry_line(raw_line)
+        if (
+            entry is None
+            or entry["tier"] != 2
+            or entry.get("key") != key
+            or entry.get("id") != record.get("entry_id")
+        ):
+            raise BimriError(
+                f"state cold_current record {key} does not match its Tier 2 line."
+            )
+        if record.get("line_hash") != line_hash(raw_line):
+            raise BimriError(
+                f"state cold_current record {key} line hash is invalid."
+            )
+        normalized[key] = record
+    return normalized
+
+
 def validate_state(state, accepted_versions=None):
     required_ints = (
         "run_count", "conflict_count", "pattern_count", "head_revision",
@@ -830,7 +942,8 @@ def validate_state(state, accepted_versions=None):
         raise BimriError("state session_runs must be an object.")
     if not isinstance(state.get("run_dates"), dict):
         raise BimriError("state run_dates must be an object.")
-    if state.get("cadence_class") not in DECAY_RUNS:
+    validate_cold_current(state.get("cold_current"))
+    if state.get("cadence_class") not in CADENCE_CLASSES:
         raise BimriError("state cadence_class is invalid.")
     if state.get("prune_policy") != "archive_only":
         raise BimriError("state prune_policy must be archive_only.")
@@ -865,11 +978,68 @@ def validate_state(state, accepted_versions=None):
     return state
 
 
+def current_run_date_references(paths, state):
+    """Return every run whose date still drives current-memory semantics."""
+    referenced = set(state.get("active_runs", {}))
+    referenced.update(state.get("session_runs", {}).values())
+    head = revision_path(paths, state["head_revision"])
+    if head.is_symlink() or not head.is_file():
+        raise BimriError(
+            "cannot retain run dates because the canonical head is missing or unsafe."
+        )
+    try:
+        content = head.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise BimriError(
+            "cannot retain run dates because the canonical head is unreadable."
+        ) from exc
+    _, entries, errors = parse_hot(content)
+    if errors:
+        raise BimriError(
+            "cannot retain run dates from malformed current memory: "
+            + "; ".join(errors)
+        )
+    for entry in entries:
+        if entry.get("tier") == 2:
+            referenced.update(
+                value for value in (entry.get("first"), entry.get("last"))
+                if value
+            )
+    for record in state.get("cold_current", {}).values():
+        entry = parse_entry_line(record["raw_line"])
+        if entry is not None:
+            referenced.update(
+                value for value in (entry.get("first"), entry.get("last"))
+                if value
+            )
+    return referenced
+
+
 def save_state(paths, state):
     validate_state(state)
     if len(state.get("run_dates", {})) > 500:
-        keys = sorted(state["run_dates"], key=lambda value: int(re.search(r"\d+", value).group()))
-        state["run_dates"] = {key: state["run_dates"][key] for key in keys[-500:]}
+        keys = sorted(
+            state["run_dates"],
+            key=lambda value: (
+                int(re.search(r"\d+", value).group()), value
+            ),
+        )
+        try:
+            protected = current_run_date_references(paths, state)
+        except (BimriError, OSError, UnicodeError):
+            # Journals and proposal staging remain durable during authority
+            # recovery. If current references cannot be proven, preserve the
+            # complete date map rather than deleting uncertain ageing data.
+            protected = None
+        if protected is not None:
+            retained = set(keys[-500:])
+            retained.update(
+                key for key in protected if key in state["run_dates"]
+            )
+            state["run_dates"] = {
+                key: state["run_dates"][key]
+                for key in keys if key in retained
+            }
     atomic_write_json(paths.state, state)
 
 
@@ -1441,7 +1611,11 @@ def _validate_legacy_marker(paths, marker, state=None):
         seen_target_keys.add(target_key)
     conversion_version = marker.get("converter_version")
     if conversion_version not in {
-        None, PREVIOUS_V5_VERSION, V5_0_1_VERSION, MEMORY_FORMAT_VERSION
+        None,
+        PREVIOUS_V5_VERSION,
+        V5_0_1_VERSION,
+        V5_0_2_VERSION,
+        MEMORY_FORMAT_VERSION,
     }:
         raise BimriError(
             "legacy migration marker has an unsupported converter version."
@@ -1449,10 +1623,16 @@ def _validate_legacy_marker(paths, marker, state=None):
     templates = {
         PREVIOUS_V5_VERSION: V5_0_HOT_TEMPLATE,
         V5_0_1_VERSION: V5_0_1_HOT_TEMPLATE,
+        V5_0_2_VERSION: V5_0_2_HOT_TEMPLATE,
         MEMORY_FORMAT_VERSION: HOT_TEMPLATE,
     }
     candidate_versions = (
-        (PREVIOUS_V5_VERSION, V5_0_1_VERSION, MEMORY_FORMAT_VERSION)
+        (
+            PREVIOUS_V5_VERSION,
+            V5_0_1_VERSION,
+            V5_0_2_VERSION,
+            MEMORY_FORMAT_VERSION,
+        )
         if conversion_version is None
         else (conversion_version,)
     )
@@ -1716,6 +1896,7 @@ def migrate_legacy(paths, plan):
     save_state(paths, state)
     finalize_legacy_migration(paths, state)
     metadata_revision = finalize_current_v5_metadata(paths, state)
+    validate_cold_archive_bindings(paths, state)
     summary = legacy_import_summary(plan["parsed"])
     record_migration_receipt(
         paths,
@@ -2156,12 +2337,20 @@ V5_0_COMPACT_METADATA_UPDATES = {
         "<!-- BIMRI v5.0.2 | Generated. -->",
     "<!-- BIMRI v5.0.1 | Generated view. Do not edit directly. -->":
         "<!-- BIMRI v5.0.2 | Generated. -->",
+    "<!-- BIMRI v5.0.2 | Generated view. Do not edit directly. -->":
+        "<!-- BIMRI v5.0.2 | Generated. -->",
     "<!-- Confirmed facts, decisions, preferences and rules. Cap: 12. -->":
         "<!-- Tier 1 capacity: state.json. -->",
     "<!-- Current work, risks and next actions. Cap: 20. -->":
         "<!-- Tier 2 capacity: state.json. -->",
     "<!-- Evidence-backed patterns. Cap: 8. -->":
         "<!-- Tier 3 capacity: state.json. -->",
+    "<!-- Confirmed facts, decisions, preferences and rules. Soft target: state.json. -->":
+        "<!-- Tier 1 soft target: state.json. -->",
+    "<!-- Current work, risks and next actions. Soft target: state.json. -->":
+        "<!-- Tier 2 soft target: state.json. -->",
+    "<!-- Evidence-backed patterns. Soft target: state.json. -->":
+        "<!-- Tier 3 soft target: state.json. -->",
 }
 
 
@@ -2438,9 +2627,12 @@ def upgrade_v5_state(paths, state, source_version):
     return upgraded
 
 
-def require_complete_v5_state(raw):
+def require_complete_v5_state(raw, allow_lifecycle_defaults=False):
     """Reject partial structured state instead of guessing authoritative data."""
-    missing = sorted(key for key in DEFAULT_STATE if key not in raw)
+    optional = {"cold_current"} if allow_lifecycle_defaults else set()
+    missing = sorted(
+        key for key in DEFAULT_STATE if key not in raw and key not in optional
+    )
     if missing:
         raise BimriError(
             "state.json is missing required v5 field(s): "
@@ -2473,7 +2665,7 @@ def load_or_initialize(paths):
         return migrate_v4(paths, raw)
     if raw.get("bimri_version") in LEGACY_V5_FORMATS:
         source_version = raw["bimri_version"]
-        require_complete_v5_state(raw)
+        require_complete_v5_state(raw, allow_lifecycle_defaults=True)
         merged = fresh_state()
         if source_version == PREVIOUS_V5_VERSION:
             merged.update(V5_0_DEFAULT_LIMITS)
@@ -2493,9 +2685,16 @@ def load_or_initialize(paths):
     merged = fresh_state()
     merged.update(raw)
     state = validate_state(merged)
+    validate_current_residency(paths, state)
     finalize_legacy_migration(paths, state)
     reject_unclaimed_legacy_roots(paths)
-    metadata_revision = finalize_current_v5_metadata(paths, state)
+    _, recovery_gate_issues = governance_snapshot(
+        paths, state, allow_recoverable_applying=True
+    )
+    metadata_revision = None
+    if not recovery_gate_issues:
+        metadata_revision = finalize_current_v5_metadata(paths, state)
+        recover_interrupted_authority(paths, state)
     record_migration_receipt(
         paths,
         "verified",
@@ -2553,7 +2752,12 @@ def parse_hot(content):
             match = V5_PATTERN_RE.fullmatch(stripped)
         if match:
             data = match.groupdict()
-            data.update({"tier": tier, "line": index, "raw": stripped})
+            data.update({
+                "tier": tier,
+                "line": index,
+                "raw": stripped,
+                "storage": "hot",
+            })
             entries.append(data)
         elif tier:
             errors.append(f"line {index + 1}: malformed Tier {tier} entry: {stripped[:120]}")
@@ -2665,10 +2869,6 @@ def validate_hot_content(content, state, allow_legacy_overflow=False):
                     f"{entry['id']} text contains the reserved pattern delimiter."
                 )
     if not allow_legacy_overflow:
-        limits = {1: state["tier1_max"], 2: state["tier2_max"], 3: state["tier3_max"]}
-        for tier, count in counts.items():
-            if count > limits[tier]:
-                errors.append(f"Tier {tier} exceeds cap: {count}/{limits[tier]}")
         if len(content.encode("utf-8")) > state["hot_max_bytes"]:
             errors.append(
                 f"hot memory exceeds byte cap: "
@@ -2683,11 +2883,6 @@ def overflow_vector(content, state):
     )
     if structural_errors:
         return None
-    limits = {
-        1: state["tier1_max"],
-        2: state["tier2_max"],
-        3: state["tier3_max"],
-    }
     inherited_excess = [
         len(entry.get("text", "")) - state["entry_max_chars"]
         for entry in entries
@@ -2697,9 +2892,9 @@ def overflow_vector(content, state):
         )
     ]
     return (
-        max(0, counts[1] - limits[1]),
-        max(0, counts[2] - limits[2]),
-        max(0, counts[3] - limits[3]),
+        0,
+        0,
+        0,
         max(0, len(content.encode("utf-8")) - state["hot_max_bytes"]),
         len(inherited_excess),
         sum(inherited_excess),
@@ -2736,6 +2931,175 @@ def find_entry(entries, key=None, target_id=None):
         if key and entry.get("key") == key:
             return entry
     return None
+
+
+def cold_entry(state, key=None, target_id=None):
+    """Return one validated cold-current entry with storage metadata."""
+    matches = []
+    for subject_key, record in state.get("cold_current", {}).items():
+        if key and subject_key != key:
+            continue
+        if target_id and record.get("entry_id") != target_id:
+            continue
+        entry = parse_entry_line(record["raw_line"])
+        entry.update({
+            "line": None,
+            "storage": "cold",
+            "archive_proposal_id": record["archived_by"],
+            "archive_date": record["archived_on"],
+        })
+        matches.append(entry)
+    if len(matches) > 1:
+        raise BimriError("cold-current lookup is ambiguous.")
+    return matches[0] if matches else None
+
+
+def find_current_entry(entries, state, key=None, target_id=None):
+    # Resolve canonical key and observed generation independently. A target ID
+    # may legitimately be stale after a concurrent keyed write, but a target
+    # that identifies a different current subject remains an explicit error.
+    key_hot = find_entry(entries, key=key) if key is not None else None
+    key_cold = cold_entry(state, key=key) if key is not None else None
+    target_hot = (
+        find_entry(entries, target_id=target_id)
+        if target_id is not None else None
+    )
+    target_cold = (
+        cold_entry(state, target_id=target_id)
+        if target_id is not None else None
+    )
+    if key_hot and key_cold:
+        raise BimriError(
+            f"memory key {key} exists in both hot and cold-current state."
+        )
+    if target_hot and target_cold:
+        raise BimriError(
+            f"memory ID {target_id} exists in both hot and cold-current state."
+        )
+    by_key = key_hot or key_cold
+    by_target = target_hot or target_cold
+    if (
+        by_key is not None
+        and by_target is not None
+        and by_key.get("key") != by_target.get("key")
+    ):
+        raise BimriError("memory key and target ID identify different current subjects.")
+    return by_key or by_target
+
+
+def residency_evidence(entry, prefix):
+    """Freeze the authority needed to interpret a hot/cold current snapshot."""
+    storage = entry.get("storage", "hot") if entry is not None else "absent"
+    evidence = {f"{prefix}_storage": storage}
+    if storage == "cold":
+        evidence.update({
+            f"{prefix}_archive_proposal_id": validate_fixed_id(
+                entry.get("archive_proposal_id"),
+                PROPOSAL_RE,
+                f"{prefix} archive proposal ID",
+            ),
+            f"{prefix}_archive_date": clean_scalar(
+                entry.get("archive_date"), f"{prefix} archive date", 10
+            ),
+        })
+    return evidence
+
+
+def decision_effect_evidence(entry):
+    evidence = residency_evidence(entry, "effect")
+    raw_line = entry.get("raw") if entry is not None else None
+    evidence.update({
+        "effect_line": raw_line,
+        "effect_hash": line_hash(raw_line) if raw_line is not None else "absent",
+    })
+    return evidence
+
+
+def decision_base_evidence(entry):
+    evidence = residency_evidence(entry, "base")
+    evidence["base_line"] = entry.get("raw") if entry is not None else None
+    return evidence
+
+
+def entry_from_residency_evidence(paths, record, prefix, raw_line, label):
+    """Validate and reconstruct an immutable current-residency snapshot."""
+    storage = record.get(f"{prefix}_storage")
+    if storage not in {"absent", "hot", "cold"}:
+        raise BimriError(f"{label} storage is invalid.")
+    if storage == "absent":
+        if raw_line is not None:
+            raise BimriError(f"{label} cannot be absent when a line is recorded.")
+        return None
+    if raw_line is None:
+        raise BimriError(f"{label} requires its exact recorded line.")
+    raw_line = clean_scalar(raw_line, f"{label} line", MAX_SERIALIZED_ENTRY_CHARS)
+    entry = parse_entry_line(raw_line)
+    if entry is None:
+        raise BimriError(f"{label} line is not valid BIMRI memory.")
+    entry["storage"] = storage
+    entry["line"] = None
+    if storage == "cold":
+        proposal_id = validate_fixed_id(
+            record.get(f"{prefix}_archive_proposal_id"),
+            PROPOSAL_RE,
+            f"{label} archive proposal ID",
+        )
+        archive_date = clean_scalar(
+            record.get(f"{prefix}_archive_date"), f"{label} archive date", 10
+        )
+        validate_cold_archive_snapshot(
+            paths, raw_line, proposal_id, archive_date, label
+        )
+        if entry.get("tier") != 2:
+            raise BimriError(f"{label} cold line must be Tier 2.")
+        entry["archive_proposal_id"] = proposal_id
+        entry["archive_date"] = archive_date
+    return entry
+
+
+def validate_cold_snapshot_revision(paths, state, entry, revision, label):
+    """Prove the cooling authority existed no later than a snapshot revision."""
+    proposal_id = entry.get("archive_proposal_id")
+    path = decision_path(paths, proposal_id)
+    if path.is_symlink() or not path.is_file():
+        raise BimriError(f"{label} cooling decision is missing or unsafe.")
+    decision = validate_decision(read_json_strict(path, path.name), proposal_id)
+    if (
+        decision["outcome"] != "accepted"
+        or decision["revision"] > revision
+        or decision["revision"] > state["head_revision"]
+    ):
+        raise BimriError(
+            f"{label} cooling authority does not precede its recorded revision."
+        )
+    authority_proposal(paths, state, proposal_id)
+    return entry
+
+
+def make_cold_record(entry, proposal_id, archived_on):
+    if entry.get("tier") != 2:
+        raise BimriError("only Tier 2 entries may become cold-current.")
+    raw_line = clean_scalar(
+        entry.get("raw"), "cold raw line", MAX_SERIALIZED_ENTRY_CHARS
+    )
+    archived_on = clean_scalar(archived_on, "cold archive date", 10)
+    try:
+        dt.date.fromisoformat(archived_on)
+    except ValueError as exc:
+        raise BimriError("cold archive date is invalid.") from exc
+    return {
+        "entry_id": validate_fixed_id(
+            entry.get("id"), LEGACY_ENTRY_RE, "cold entry ID"
+        ),
+        "key": clean_key(entry.get("key")),
+        "tier": 2,
+        "raw_line": raw_line,
+        "line_hash": line_hash(raw_line),
+        "archived_by": validate_fixed_id(
+            proposal_id, PROPOSAL_RE, "cold archive proposal ID"
+        ),
+        "archived_on": archived_on,
+    }
 
 
 def resolve_entry(entries, key, target_id=None, require_target=False):
@@ -2956,17 +3320,23 @@ def record_manual_edit_conflict(paths, state, relative_recovery):
     return conflict_id
 
 
-def commit_revision(paths, state, content, reason, allow_legacy_overflow=False):
-    _, _, errors, _ = validate_hot_content(
-        content, state, allow_legacy_overflow=allow_legacy_overflow
-    )
-    if errors:
-        raise BimriError("cannot commit invalid hot memory: " + "; ".join(errors))
+def next_commit_revision_number(paths, state):
     number = state["head_revision"] + 1
     while revision_path(paths, number).exists():
         number += 1
     if number > 999999:
         raise BimriError("BIMRI has exhausted its six-digit revision ID space.")
+    return number
+
+
+def commit_revision(paths, state, content, reason, allow_legacy_overflow=False):
+    _, entries, errors, _ = validate_hot_content(
+        content, state, allow_legacy_overflow=allow_legacy_overflow
+    )
+    if errors:
+        raise BimriError("cannot commit invalid hot memory: " + "; ".join(errors))
+    validate_current_residency(paths, state, hot_entries=entries)
+    number = next_commit_revision_number(paths, state)
     exclusive_write_text(revision_path(paths, number), content)
     state["head_revision"] = number
     state["head_hash"] = sha256_text(content)
@@ -3391,7 +3761,9 @@ def expected_missing_authority_ids(paths, state):
                 and isinstance(data.get("key"), str)
                 and isinstance(data.get("current_hash"), str)
             ):
-                head_current = find_entry(head_entries, data["key"])
+                head_current = find_current_entry(
+                    head_entries, state, key=data["key"]
+                )
                 head_hash = (
                     line_hash(head_current["raw"])
                     if head_current is not None
@@ -3438,7 +3810,9 @@ def expected_missing_authority_ids(paths, state):
     return expected
 
 
-def authority_storage_issues(paths, state):
+def authority_storage_issues(
+    paths, state, allow_recoverable_applying=False
+):
     issues = []
     for kind, directory in authority_directories(paths).items():
         regex = PROPOSAL_RE if kind in {"proposal", "decision"} else CONFLICT_RE
@@ -3466,6 +3840,7 @@ def authority_storage_issues(paths, state):
                     record_id,
                     data,
                     verify_dependencies=True,
+                    allow_recoverable_applying=allow_recoverable_applying,
                 )
             except (BimriError, OSError, UnicodeError) as exc:
                 issues.append(f"{kind} {path.stem} ({relative}): {exc}")
@@ -3527,10 +3902,15 @@ def scan_open_conflicts(paths, state):
     return items, issues
 
 
-def governance_snapshot(paths, state):
+def governance_snapshot(paths, state, allow_recoverable_applying=False):
     conflicts, conflict_issues = scan_open_conflicts(paths, state)
     issues = list(dict.fromkeys(
-        authority_storage_issues(paths, state) + conflict_issues
+        authority_storage_issues(
+            paths,
+            state,
+            allow_recoverable_applying=allow_recoverable_applying,
+        )
+        + conflict_issues
     ))
     return conflicts, issues
 
@@ -3720,6 +4100,26 @@ def validate_conflict_record(
                     raise BimriError(
                         "manual recovery filename does not match its exact bytes."
                     )
+    elif artifact_version == MEMORY_FORMAT_VERSION:
+        storage = extra.get("current_storage")
+        expected_extra = {"current_storage"}
+        if storage == "cold":
+            expected_extra.update({
+                "current_archive_proposal_id", "current_archive_date"
+            })
+        if set(extra) != expected_extra:
+            raise BimriError(
+                "current-version proposal conflict residency evidence is invalid."
+            )
+        snapshot = entry_from_residency_evidence(
+            paths,
+            extra,
+            "current",
+            current_line,
+            f"conflict {conflict_id} current snapshot",
+        )
+        if snapshot is not None and snapshot.get("key") != key:
+            raise BimriError("conflict current snapshot names the wrong subject.")
     return conflict
 
 
@@ -3764,6 +4164,19 @@ def validate_resolution_record(
     revision_before = validate_revision_number(
         resolution.get("revision_before"), "resolution revision_before"
     )
+    intended_revision_after = resolution.get("intended_revision_after")
+    if artifact_version == MEMORY_FORMAT_VERSION and status in {"applying", "failed"}:
+        intended_revision_after = validate_revision_number(
+            intended_revision_after, "resolution intended_revision_after"
+        )
+        if intended_revision_after < revision_before:
+            raise BimriError(
+                "resolution intended revision cannot precede revision_before."
+            )
+    elif intended_revision_after is not None:
+        intended_revision_after = validate_revision_number(
+            intended_revision_after, "resolution intended_revision_after"
+        )
     if status == "failed":
         parse_timestamp(resolution.get("failed_at"), "resolution failure timestamp")
         clean_scalar(resolution.get("error"), "resolution error", 1000)
@@ -3777,6 +4190,13 @@ def validate_resolution_record(
         if revision_after < revision_before:
             raise BimriError(
                 "resolution revision_after cannot precede revision_before."
+            )
+        if (
+            intended_revision_after is not None
+            and intended_revision_after != revision_after
+        ):
+            raise BimriError(
+                "resolved revision must match its precommitted intended revision."
             )
     if "archived_raw" in resolution:
         clean_scalar(
@@ -3893,6 +4313,7 @@ def create_proposal_conflict(paths, state, conflict_type, proposal, current, que
         "current_line": current["raw"] if current else None,
         "current_hash": current_hash,
         "question": clean_scalar(question, "conflict question", 1000),
+        "extra": residency_evidence(current, "current"),
     }
     exclusive_write_text(
         conflict_path(paths, conflict_id),
@@ -4032,6 +4453,7 @@ def render_proposed_line(proposal, state):
 
 PROPOSAL_INTENT_FIELDS = (
     "operation",
+    "new_subject",
     "tier",
     "key",
     "target_id",
@@ -4054,10 +4476,12 @@ PROPOSAL_INTENT_FIELDS = (
 
 def normalized_proposal_intent(proposal):
     """Return only caller-authored intent, excluding allocated/observed fields."""
-    return {
+    normalized = {
         field: copy.deepcopy(proposal.get(field))
         for field in PROPOSAL_INTENT_FIELDS
     }
+    normalized["new_subject"] = bool(proposal.get("new_subject", False))
+    return normalized
 
 
 def proposal_effect_content(content, state, proposal, current):
@@ -4076,7 +4500,8 @@ def proposal_effect_content(content, state, proposal, current):
         if current is None:
             return content, None
         archived_raw = current["raw"]
-        del new_lines[current["line"]]
+        if current.get("storage", "hot") == "hot":
+            del new_lines[current["line"]]
     elif proposal["operation"] == "touch":
         if current is None or current["tier"] != 2:
             raise BimriError("touch requires an existing Tier 2 entry.")
@@ -4093,10 +4518,14 @@ def proposal_effect_content(content, state, proposal, current):
             "text": current["text"],
             "first_run": current["first"],
         })
-        new_lines[current["line"]] = render_proposed_line(data, state)
+        touched_line = render_proposed_line(data, state)
+        if current.get("storage", "hot") == "cold":
+            new_lines = insert_in_tier(new_lines, 2, touched_line)
+        else:
+            new_lines[current["line"]] = touched_line
     else:
         new_line = render_proposed_line(proposal, state)
-        if current:
+        if current and current.get("storage", "hot") == "hot":
             if current["tier"] == proposal["tier"]:
                 new_lines[current["line"]] = new_line
             else:
@@ -4105,6 +4534,67 @@ def proposal_effect_content(content, state, proposal, current):
         else:
             new_lines = insert_in_tier(new_lines, proposal["tier"], new_line)
     return render_content(new_lines), archived_raw
+
+
+def pressure_cooling_plan(paths, state, proposal, content):
+    """Deterministically cool safe Tier 2 residents until hot bytes fit."""
+    if len(content.encode("utf-8")) <= state["hot_max_bytes"]:
+        return content, []
+    compacted = normalize_v5_0_hot_metadata(content, compact=True)
+    if len(compacted.encode("utf-8")) < len(content.encode("utf-8")):
+        content = compacted
+        if len(content.encode("utf-8")) <= state["hot_max_bytes"]:
+            return content, []
+    _, entries, errors, _ = validate_hot_content(
+        content, state, allow_legacy_overflow=True
+    )
+    if errors:
+        raise BimriError(
+            "cannot plan pressure cooling for malformed memory: "
+            + "; ".join(errors)
+        )
+    incoming_key = proposal["key"]
+
+    candidates = sorted(
+        (
+            entry for entry in entries
+            if entry["tier"] == 2 and entry.get("key") != incoming_key
+        ),
+        key=lambda entry: retention_order(entry, state),
+    )
+    cooled = []
+    current_content = content
+    for candidate in candidates:
+        lines, current_entries, parse_errors = parse_hot(current_content)
+        if parse_errors:
+            raise BimriError(
+                "pressure cooling encountered malformed memory: "
+                + "; ".join(parse_errors)
+            )
+        live = find_entry(current_entries, key=candidate["key"])
+        if live is None or live["tier"] != 2:
+            continue
+        del lines[live["line"]]
+        current_content = render_content(lines)
+        cooled.append(live)
+        if len(current_content.encode("utf-8")) <= state["hot_max_bytes"]:
+            return current_content, cooled
+    # If the incoming generation itself is Tier 2, accepting it as
+    # cold-current is safer than rejecting or losing the intent. It remains
+    # the one current value and is immediately retrievable.
+    lines, current_entries, parse_errors = parse_hot(current_content)
+    if not parse_errors:
+        incoming = find_entry(current_entries, key=incoming_key)
+        if incoming is not None and incoming["tier"] == 2:
+            del lines[incoming["line"]]
+            current_content = render_content(lines)
+            cooled.append(incoming)
+            if len(current_content.encode("utf-8")) <= state["hot_max_bytes"]:
+                return current_content, cooled
+    raise PressureCoolingUnavailable(
+        "hot memory exceeds its global byte ceiling and no safe Tier 2 "
+        "resident can be cooled; close or shorten a current subject."
+    )
 
 
 def _same_tier2_authority(left, right):
@@ -4116,32 +4606,12 @@ def _same_tier2_authority(left, right):
     )
 
 
-def archive_contains_exact_effect(paths, raw_line, reason="closed"):
-    expected_reason = clean_scalar(reason, "archive reason", 100)
-    expected_raw = clean_scalar(
-        raw_line, "archived line", MAX_SERIALIZED_ENTRY_CHARS
-    )
-    pattern = re.compile(
-        r"^\[ARCHIVED:\d{4}-\d{2}-\d{2}\] "
-        r"\[BY:(R\d{6}-Q\d{3})\] "
-        r"\[(?P<reason>[^\]]+)\] (?P<raw>.+)$"
-    )
-    for target in sorted(paths.archive.glob("*.md")):
-        if target.is_symlink() or not target.is_file():
-            raise BimriError("archive contains an unsafe monthly record.")
-        for line in target.read_text(encoding="utf-8").splitlines():
-            match = pattern.fullmatch(line)
-            if (
-                match
-                and match.group("reason") == expected_reason
-                and match.group("raw") == expected_raw
-            ):
-                return True
-    return False
-
-
-def accepted_key_writer_after(paths, state, proposal, operation=None):
+def accepted_key_writer_after(
+    paths, state, proposal, operation=None, max_revision=None
+):
     """Return validated accepted writer evidence after the candidate base."""
+    if max_revision is None:
+        max_revision = state["head_revision"]
     candidates = []
     for path in sorted(paths.decisions.glob("R*-Q*.json")):
         if path.is_symlink() or not path.is_file():
@@ -4153,7 +4623,7 @@ def accepted_key_writer_after(paths, state, proposal, operation=None):
             if decision["outcome"] != "accepted":
                 continue
             revision = decision["revision"]
-            if not (proposal["base_revision"] < revision <= state["head_revision"]):
+            if not (proposal["base_revision"] < revision <= max_revision):
                 continue
             writer = authority_proposal(paths, state, decision["proposal_id"])
             if writer["key"] != proposal["key"]:
@@ -4179,7 +4649,12 @@ def exact_effect_reflected_at_head(paths, state, proposal, current):
         return bool(
             current is None
             and base_entry is not None
-            and archive_contains_exact_effect(paths, base_entry["raw"], "closed")
+            and accepted_archive_effect_by_revision(
+                paths,
+                state,
+                base_entry["raw"],
+                state["head_revision"],
+            )
         )
     if proposal["operation"] == "touch":
         if not _same_tier2_authority(base_entry, current):
@@ -4190,75 +4665,6 @@ def exact_effect_reflected_at_head(paths, state, proposal, current):
             paths, state, proposal, operation="touch"
         ) is not None
     return False
-
-
-def _proposal_reserves_capacity(paths, state, proposal):
-    path = decision_path(paths, proposal["proposal_id"])
-    if not path.exists():
-        return proposal["run_id"] in state["active_runs"]
-    if path.is_symlink():
-        raise BimriError(
-            f"pending proposal decision is unsafe: {proposal['proposal_id']}."
-        )
-    decision = validate_decision(read_json_strict(path, path.name), proposal["proposal_id"])
-    validate_decision_effect(paths, state, decision)
-    if decision["outcome"] == "applying":
-        return True
-    if decision["outcome"] != "contested":
-        return False
-    resolution = resolution_file_path(paths, decision["conflict_id"])
-    if not resolution.exists():
-        return True
-    if resolution.is_symlink():
-        raise BimriError(
-            f"pending proposal resolution is unsafe: {decision['conflict_id']}."
-        )
-    conflict_file = conflict_path(paths, decision["conflict_id"])
-    if conflict_file.is_symlink() or not conflict_file.is_file():
-        raise BimriError(
-            f"pending proposal conflict is missing or unsafe: "
-            f"{decision['conflict_id']}."
-        )
-    conflict = validate_conflict_record(
-        paths,
-        read_json_strict(conflict_file, conflict_file.name),
-        expected_conflict_id=decision["conflict_id"],
-    )
-    data = validate_resolution_record(
-        read_json_strict(resolution, resolution.name),
-        conflict=conflict,
-        expected_conflict_id=decision["conflict_id"],
-    )
-    validate_resolution_effect(paths, state, conflict, data)
-    return data["status"] != "resolved"
-
-
-def pending_capacity_reservations(paths, state, head_content, head_entries):
-    reserved_counts = {1: 0, 2: 0, 3: 0}
-    reserved_bytes = 0
-    for path in sorted(paths.proposals.glob("R*-Q*.json")):
-        proposal = authority_proposal(paths, state, path.stem)
-        if not _proposal_reserves_capacity(paths, state, proposal):
-            continue
-        current = find_entry(head_entries, proposal["key"])
-        if proposal["operation"] == "set" and (
-            current is None or current["tier"] != proposal["tier"]
-        ):
-            reserved_counts[proposal["tier"]] += 1
-        try:
-            reserved_content, _ = proposal_effect_content(
-                head_content, state, proposal, current
-            )
-        except BimriError as exc:
-            raise BimriError(
-                f"pending proposal {proposal['proposal_id']} is invalid: {exc}"
-            ) from exc
-        reserved_bytes += max(
-            0,
-            len(reserved_content.encode("utf-8"))
-            - len(head_content.encode("utf-8")),
-        )
-    return reserved_counts, reserved_bytes
 
 
 def _same_run_proposal_preflight(paths, state, run_meta, candidate):
@@ -4305,8 +4711,49 @@ def _same_run_proposal_preflight(paths, state, run_meta, candidate):
     return None
 
 
+def uncommitted_owner_resolution(paths, state, key):
+    """Return an applying candidate resolution whose keyed effect is not committed."""
+    for path in sorted(paths.resolutions.glob("C*.json")):
+        if path.is_symlink() or not path.is_file() or not CONFLICT_RE.fullmatch(path.stem):
+            continue
+        resolution = validate_resolution_record(
+            read_json_strict(path, path.name), expected_conflict_id=path.stem
+        )
+        if (
+            resolution["status"] != "applying"
+            or resolution["choice"] not in resolution["proposal_ids"]
+            or "intended_revision_after" not in resolution
+        ):
+            continue
+        cpath = conflict_path(paths, path.stem)
+        if cpath.is_symlink() or not cpath.is_file():
+            raise BimriError("applying owner resolution conflict is missing or unsafe.")
+        conflict = validate_conflict_record(
+            paths,
+            read_json_strict(cpath, cpath.name),
+            expected_conflict_id=path.stem,
+        )
+        if conflict["key"] != key:
+            continue
+        proposal = human_confirmed_proposal(
+            authority_proposal(paths, state, resolution["choice"]),
+            preserve_source=(
+                resolution["bimri_version"]
+                in {V5_0_2_VERSION, MEMORY_FORMAT_VERSION}
+            ),
+        )
+        intended = resolution["intended_revision_after"]
+        if intended <= state["head_revision"]:
+            if resolution_candidate_reflected_at_revision(
+                paths, state, conflict, proposal, intended
+            ):
+                continue
+        return resolution["conflict_id"]
+    return None
+
+
 def preflight_proposal(paths, state, run_meta, proposal):
-    """Validate and reserve a complete proposal before its first durable write."""
+    """Validate a complete proposal before its first durable write."""
     duplicate = _same_run_proposal_preflight(
         paths, state, run_meta, proposal
     )
@@ -4324,7 +4771,7 @@ def preflight_proposal(paths, state, run_meta, proposal):
         head_content = head_bytes.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise BimriError("accepted head is not valid UTF-8.") from exc
-    _, head_entries, head_errors, head_counts = validate_hot_content(
+    _, head_entries, head_errors, _head_counts = validate_hot_content(
         head_content, state, allow_legacy_overflow=True
     )
     if head_errors:
@@ -4332,7 +4779,7 @@ def preflight_proposal(paths, state, run_meta, proposal):
             "accepted head must be repaired before proposing: "
             + "; ".join(head_errors)
         )
-    live = find_entry(head_entries, proposal["key"])
+    live = find_current_entry(head_entries, state, proposal["key"])
     live_hash = line_hash(live["raw"]) if live else "absent"
     if proposal["base_hash"] != live_hash:
         if proposal["operation"] == "set" and proposal_equivalent(proposal, live):
@@ -4355,25 +4802,47 @@ def preflight_proposal(paths, state, run_meta, proposal):
             "semantic uncertainty is not a memory conflict; ask the owner "
             "conversationally, then submit the chosen memory change."
         )
-    if proposal["tier"] == 1 and (live is None or live["tier"] != 1):
+    direct_user_confirmed = (
+        proposal["source"] == "user" and proposal["trust"] == "confirmed"
+    )
+    hold_reason = None
+    if proposal.get("new_subject", False) and live is not None:
         raise BimriError(
-            "new or promoted Tier 1 memory is paused; journal the evidence "
-            "and keep current material in Tier 2 pending deliberate core review."
+            f"{proposal['key']} already exists; omit --new-subject to update it."
         )
+    if (
+        proposal["operation"] == "set"
+        and live is None
+        and not proposal.get("new_subject", False)
+    ):
+        hold_reason = "classification-required"
+    if (
+        proposal["tier"] == 1
+        and (live is None or live["tier"] != 1)
+        and not direct_user_confirmed
+    ):
+        hold_reason = "tier1-human-authority-required"
     if (
         live
         and live["tier"] in {1, 2}
         and live.get("trust") == "confirmed"
         and proposal["operation"] in {"set", "close"}
+        and not direct_user_confirmed
     ):
-        raise BimriError(
-            f"confirmed memory {proposal['key']} is protected from automatic "
-            "replacement or removal; preserve it and record the requested "
-            "change for deliberate review."
-        )
+        hold_reason = "confirmed-user-authority-required"
+    if uncommitted_owner_resolution(paths, state, proposal["key"]):
+        hold_reason = "owner-resolution-in-progress"
 
     proposal["base_revision"] = state["head_revision"]
     proposal["base_hash"] = live_hash
+    proposal["base_storage"] = (
+        live.get("storage", "hot") if live else "absent"
+    )
+    proposal["base_archive_proposal_id"] = (
+        live.get("archive_proposal_id")
+        if live and live.get("storage") == "cold"
+        else None
+    )
     if live is not None:
         proposal["target_id"] = live["id"]
     proposal["preflight_receipt"] = {
@@ -4382,13 +4851,29 @@ def preflight_proposal(paths, state, run_meta, proposal):
         "observed_head_hash": head_hash,
         "observed_key_hash": live_hash,
     }
+    proposal["hold_reason"] = hold_reason
     validate_proposal(proposal, state)
     validate_proposal_base_snapshot(paths, state, proposal)
+
+    if hold_reason is not None:
+        return None, proposal
 
     proposed_content, _ = proposal_effect_content(
         head_content, state, proposal, live
     )
-    _, _, validation_errors, proposed_counts = validate_hot_content(
+    legacy_reduction = strictly_reduces_overflow(
+        head_content, proposed_content, state
+    )
+    if not legacy_reduction:
+        try:
+            proposed_content, _ = pressure_cooling_plan(
+                paths, state, proposal, proposed_content
+            )
+        except PressureCoolingUnavailable:
+            proposal["hold_reason"] = "capacity-residency-required"
+            validate_proposal(proposal, state)
+            return None, proposal
+    _, _, validation_errors, _proposed_counts = validate_hot_content(
         proposed_content, state
     )
     legacy_reduction = strictly_reduces_overflow(
@@ -4400,44 +4885,6 @@ def preflight_proposal(paths, state, run_meta, proposal):
             + "; ".join(validation_errors)
         )
 
-    reserved_counts, reserved_bytes = pending_capacity_reservations(
-        paths, state, head_content, head_entries
-    )
-    for tier in (1, 2, 3):
-        projected_count = proposed_counts[tier] + reserved_counts[tier]
-        reduction_remains_safe = (
-            legacy_reduction and projected_count <= head_counts[tier]
-        )
-        if (
-            projected_count > state[f"tier{tier}_max"]
-            and not reduction_remains_safe
-        ):
-            raise BimriError(
-                f"proposal capacity is reserved by pending work: Tier {tier} "
-                f"would reach {projected_count}/"
-                f"{state[f'tier{tier}_max']}."
-            )
-    candidate_delta = max(
-        0,
-        len(proposed_content.encode("utf-8"))
-        - len(head_content.encode("utf-8")),
-    )
-    head_bytes_length = len(head_content.encode("utf-8"))
-    if legacy_reduction:
-        projected_bytes = len(proposed_content.encode("utf-8")) + reserved_bytes
-    else:
-        projected_bytes = head_bytes_length + candidate_delta + reserved_bytes
-    byte_reduction_remains_safe = (
-        legacy_reduction and projected_bytes <= head_bytes_length
-    )
-    if (
-        projected_bytes > state["hot_max_bytes"]
-        and not byte_reduction_remains_safe
-    ):
-        raise BimriError(
-            "proposal capacity is reserved by pending work: hot memory would "
-            f"reach {projected_bytes}/{state['hot_max_bytes']} bytes."
-        )
     return None, proposal
 
 
@@ -4473,6 +4920,19 @@ def validate_proposal(
         raise BimriError("proposal base hash is invalid.")
     if proposal.get("operation") not in OPERATIONS:
         raise BimriError("proposal operation is invalid.")
+    new_subject = proposal.get("new_subject", False)
+    if not isinstance(new_subject, bool):
+        raise BimriError("proposal new_subject must be true or false.")
+    if new_subject and proposal.get("operation") != "set":
+        raise BimriError("only set proposals may admit a new subject.")
+    if (
+        proposal.get("bimri_version") == MEMORY_FORMAT_VERSION
+        and "new_subject" not in proposal
+    ):
+        raise BimriError("v5.1 proposals must record new_subject explicitly.")
+    hold_reason = proposal.get("hold_reason")
+    if hold_reason is not None and hold_reason not in HOLD_REASONS:
+        raise BimriError("proposal hold_reason is invalid.")
     if proposal.get("tier") not in {1, 2, 3}:
         raise BimriError("proposal tier is invalid.")
     key = clean_key(proposal.get("key"))
@@ -4481,6 +4941,20 @@ def validate_proposal(
     target_id = proposal.get("target_id")
     if target_id is not None:
         validate_fixed_id(target_id, MEMORY_ID_RE, "proposal target ID")
+    base_storage = proposal.get("base_storage", "hot")
+    if base_storage not in {"absent", "hot", "cold"}:
+        raise BimriError("proposal base storage is invalid.")
+    base_archive_proposal_id = proposal.get("base_archive_proposal_id")
+    if base_storage == "cold":
+        validate_fixed_id(
+            base_archive_proposal_id,
+            PROPOSAL_RE,
+            "proposal cold base archive ID",
+        )
+    elif base_archive_proposal_id is not None:
+        raise BimriError(
+            "proposal cold base archive ID requires cold base storage."
+        )
     entry_id = validate_fixed_id(
         proposal.get("entry_id"), ENTRY_RE, "proposal entry ID"
     )
@@ -4581,7 +5055,10 @@ def validate_proposal(
             "observed_key_hash",
         }:
             raise BimriError("proposal preflight receipt fields are invalid.")
-        if receipt.get("engine_release") != ENGINE_VERSION:
+        accepted_receipt_engines = {ENGINE_VERSION}
+        if proposal.get("bimri_version") == V5_0_2_VERSION:
+            accepted_receipt_engines.add("5.0.3")
+        if receipt.get("engine_release") not in accepted_receipt_engines:
             raise BimriError("proposal preflight receipt engine release is invalid.")
         observed_revision = validate_revision_number(
             receipt.get("observed_head_revision"),
@@ -4618,7 +5095,7 @@ def validate_decision(decision, proposal_id):
     if decision.get("proposal_id") != proposal_id:
         raise BimriError("decision proposal ID mismatch.")
     if decision.get("outcome") not in {
-        "applying", "accepted", "noop", "contested"
+        "applying", "accepted", "noop", "contested", "held"
     }:
         raise BimriError("decision outcome is invalid.")
     parse_timestamp(decision.get("recorded_at"), "decision timestamp")
@@ -4633,6 +5110,48 @@ def validate_decision(decision, proposal_id):
             decision.get("revision_before"),
             "applying decision revision_before",
         )
+        if decision.get("bimri_version") == MEMORY_FORMAT_VERSION:
+            storage = decision.get("base_storage")
+            if storage not in {"absent", "hot", "cold"}:
+                raise BimriError("applying decision base storage is invalid.")
+            base_line = decision.get("base_line")
+            if storage == "absent":
+                if base_line is not None or base_hash != "absent":
+                    raise BimriError(
+                        "absent applying-decision base evidence is inconsistent."
+                    )
+            else:
+                base_line = clean_scalar(
+                    base_line,
+                    "applying decision base line",
+                    MAX_SERIALIZED_ENTRY_CHARS,
+                )
+                if (
+                    not isinstance(base_hash, str)
+                    or not HASH_RE.fullmatch(base_hash)
+                    or line_hash(base_line) != base_hash
+                    or parse_entry_line(base_line) is None
+                ):
+                    raise BimriError(
+                        "applying decision base line/hash is invalid."
+                    )
+            if storage == "cold":
+                validate_fixed_id(
+                    decision.get("base_archive_proposal_id"),
+                    PROPOSAL_RE,
+                    "applying base archive proposal ID",
+                )
+                archive_date = clean_scalar(
+                    decision.get("base_archive_date"),
+                    "applying base archive date",
+                    10,
+                )
+                try:
+                    dt.date.fromisoformat(archive_date)
+                except ValueError as exc:
+                    raise BimriError(
+                        "applying base archive date is invalid."
+                    ) from exc
     else:
         validate_revision_number(
             decision.get("revision"), f"{outcome} decision revision"
@@ -4649,6 +5168,48 @@ def validate_decision(decision, proposal_id):
         )
         if reason != decision.get("reason"):
             raise BimriError("noop decision reason must already be normalized.")
+        if decision.get("bimri_version") == MEMORY_FORMAT_VERSION:
+            storage = decision.get("effect_storage")
+            if storage not in {"absent", "hot", "cold"}:
+                raise BimriError("noop decision effect storage is invalid.")
+            effect_line = decision.get("effect_line")
+            effect_hash = decision.get("effect_hash")
+            if storage == "absent":
+                if effect_line is not None or effect_hash != "absent":
+                    raise BimriError("absent noop effect evidence is inconsistent.")
+            else:
+                effect_line = clean_scalar(
+                    effect_line,
+                    "noop decision effect line",
+                    MAX_SERIALIZED_ENTRY_CHARS,
+                )
+                if (
+                    not isinstance(effect_hash, str)
+                    or not HASH_RE.fullmatch(effect_hash)
+                    or line_hash(effect_line) != effect_hash
+                    or parse_entry_line(effect_line) is None
+                ):
+                    raise BimriError("noop decision effect line/hash is invalid.")
+            if storage == "cold":
+                validate_fixed_id(
+                    decision.get("effect_archive_proposal_id"),
+                    PROPOSAL_RE,
+                    "noop effect archive proposal ID",
+                )
+                archive_date = clean_scalar(
+                    decision.get("effect_archive_date"),
+                    "noop effect archive date",
+                    10,
+                )
+                try:
+                    dt.date.fromisoformat(archive_date)
+                except ValueError as exc:
+                    raise BimriError(
+                        "noop effect archive date is invalid."
+                    ) from exc
+    if outcome == "held":
+        if decision.get("reason") not in HOLD_REASONS:
+            raise BimriError("held decision reason is invalid.")
     if "resolution_id" in decision:
         validate_fixed_id(
             decision.get("resolution_id"),
@@ -4664,7 +5225,7 @@ def validate_decision(decision, proposal_id):
             80,
         )
     if "initial_outcome" in decision and decision["initial_outcome"] not in {
-        "applying", "accepted", "noop", "contested"
+        "applying", "accepted", "noop", "contested", "held"
     }:
         raise BimriError("decision initial outcome is invalid.")
     return decision
@@ -4718,6 +5279,97 @@ def proposal_effect_reflected(proposal, current):
     return proposal_equivalent(proposal, current)
 
 
+def proposal_effect_line(paths, state, proposal):
+    """Return the exact set/touch line a proposal would make authoritative."""
+    if proposal["operation"] == "set":
+        return render_proposed_line(proposal, state)
+    if proposal["operation"] != "touch":
+        return None
+    base = proposal_base_entry(paths, proposal)
+    if base is None or base.get("tier") != 2:
+        return None
+    touch_data = dict(proposal)
+    touch_data.update({
+        "tier": 2,
+        "entry_id": base["id"],
+        "key": base["key"],
+        "importance": int(base["imp"]),
+        "status": base["status"],
+        "trust": base["trust"],
+        "source": base["source"],
+        "tags": clean_tags(base.get("tags", "")),
+        "text": base["text"],
+        "first_run": base["first"],
+    })
+    return render_proposed_line(touch_data, state)
+
+
+def proposal_cooled_effect(paths, state, proposal, revision=None):
+    if revision is None:
+        raise BimriError("cooled proposal evidence requires an exact revision.")
+    effect_line = proposal_effect_line(paths, state, proposal)
+    reflected = bool(
+        effect_line
+        and exact_archive_effect(
+            paths,
+            effect_line,
+            reason="cooled",
+            proposal_id=proposal["proposal_id"],
+        )
+    )
+    if not reflected:
+        return False
+    path = decision_path(paths, proposal["proposal_id"])
+    if path.is_symlink() or not path.is_file():
+        return False
+    decision = validate_decision(
+        read_json_strict(path, path.name), proposal["proposal_id"]
+    )
+    return bool(
+        decision["outcome"] == "accepted"
+        and decision["revision"] == revision
+    )
+
+
+def committed_proposal_effect_at_head(paths, state, proposal, revision):
+    """Prove an interrupted proposal committed through the atomic state head."""
+    if (
+        revision != state["head_revision"]
+        or state.get("last_revision_reason")
+        != f"accepted {proposal['proposal_id']}"
+    ):
+        return False
+    entries = authority_revision_entries(
+        paths, state, revision, f"committed effect {proposal['proposal_id']}"
+    )
+    current = find_current_entry(entries, state, key=proposal["key"])
+    if proposal["operation"] == "close":
+        base = proposal_base_entry(paths, proposal)
+        return bool(
+            current is None
+            and base is not None
+            and exact_archive_effect(
+                paths,
+                base["raw"],
+                reason="closed",
+                proposal_id=proposal["proposal_id"],
+            )
+        )
+    if not proposal_effect_reflected(proposal, current):
+        return False
+    if current.get("storage") == "cold":
+        return bool(
+            current.get("archive_proposal_id") == proposal["proposal_id"]
+            and exact_archive_effect(
+                paths,
+                current["raw"],
+                reason="cooled",
+                proposal_id=proposal["proposal_id"],
+            )
+        )
+    return True
+
+
 def validate_proposal_base_snapshot(paths, state, proposal):
     entries = authority_revision_entries(
         paths,
@@ -4725,12 +5377,41 @@ def validate_proposal_base_snapshot(paths, state, proposal):
         proposal["base_revision"],
         f"proposal {proposal['proposal_id']} base",
     )
-    current = resolve_entry(
-        entries,
-        proposal["key"],
-        proposal.get("target_id"),
-        require_target=bool(proposal.get("target_id")),
-    )
+    base_storage = proposal.get("base_storage", "hot")
+    if base_storage == "cold":
+        records = [
+            record for record in archive_records(paths)
+            if (
+                record["proposal_id"]
+                == proposal.get("base_archive_proposal_id")
+                and record["reason"] == "cooled"
+                and line_hash(record["raw_line"]) == proposal["base_hash"]
+            )
+        ]
+        if len(records) != 1:
+            raise BimriError(
+                "proposal cold base does not identify one immutable cooled record."
+            )
+        current = parse_entry_line(records[0]["raw_line"])
+        current.update({
+            "storage": "cold",
+            "line": None,
+            "archive_proposal_id": records[0]["proposal_id"],
+        })
+        if (
+            current.get("key") != proposal["key"]
+            or current.get("id") != proposal.get("target_id")
+        ):
+            raise BimriError(
+                "proposal cold base record does not match its key and target."
+            )
+    else:
+        current = resolve_entry(
+            entries,
+            proposal["key"],
+            proposal.get("target_id"),
+            require_target=bool(proposal.get("target_id")),
+        )
     actual_hash = line_hash(current["raw"]) if current else "absent"
     if actual_hash != proposal["base_hash"]:
         raise BimriError(
@@ -4747,7 +5428,11 @@ def validate_proposal_base_snapshot(paths, state, proposal):
             raise BimriError(
                 "proposal preflight head hash does not match its immutable revision."
             )
-        keyed = find_entry(entries, proposal["key"])
+        keyed = (
+            current
+            if base_storage == "cold"
+            else find_entry(entries, proposal["key"])
+        )
         keyed_hash = line_hash(keyed["raw"]) if keyed else "absent"
         if keyed_hash != receipt["observed_key_hash"]:
             raise BimriError(
@@ -4818,11 +5503,59 @@ def authority_revision_entries(paths, state, number, label):
     return entries
 
 
+def conflict_current_at_revision(paths, state, conflict, revision, label):
+    """Resolve a conflict's frozen live generation across hot/cold residency."""
+    entries = authority_revision_entries(paths, state, revision, label)
+    hot = find_entry(entries, conflict["key"])
+    if (
+        conflict.get("bimri_version") != MEMORY_FORMAT_VERSION
+        or conflict.get("type") == "manual-edit"
+    ):
+        return hot
+    snapshot = entry_from_residency_evidence(
+        paths,
+        conflict.get("extra", {}),
+        "current",
+        conflict.get("current_line"),
+        f"conflict {conflict['conflict_id']} current snapshot",
+    )
+    storage = conflict.get("extra", {}).get("current_storage")
+    if storage == "hot":
+        if hot is None or hot.get("raw") != snapshot.get("raw"):
+            raise BimriError(
+                "conflict hot snapshot is not present in its recorded revision."
+            )
+        return hot
+    if hot is not None:
+        raise BimriError(
+            "conflict cold/absent snapshot overlaps hot memory in its recorded revision."
+        )
+    if storage == "cold":
+        validate_cold_snapshot_revision(
+            paths,
+            state,
+            snapshot,
+            revision,
+            f"conflict {conflict['conflict_id']} current snapshot",
+        )
+    return snapshot
+
+
 def validate_resolution_state_bounds(paths, state, resolution):
     revision_before = resolution["revision_before"]
     if revision_before > state["head_revision"]:
         raise BimriError(
             "resolution revision_before is beyond the canonical head."
+        )
+    intended = resolution.get("intended_revision_after")
+    if (
+        intended is not None
+        and intended > state["head_revision"]
+        and intended > next_commit_revision_number(paths, state)
+    ):
+        raise BimriError(
+            "resolution intended revision is beyond the next available "
+            "canonical revision."
         )
     authority_revision_entries(
         paths,
@@ -4849,13 +5582,13 @@ def validate_resolution_state_bounds(paths, state, resolution):
 
 def validate_resolution_effect(paths, state, conflict, resolution):
     validate_resolution_state_bounds(paths, state, resolution)
-    starting_entries = authority_revision_entries(
+    starting_current = conflict_current_at_revision(
         paths,
         state,
+        conflict,
         resolution["revision_before"],
         f"resolution {resolution['conflict_id']} conflict snapshot",
     )
-    starting_current = find_entry(starting_entries, conflict["key"])
     starting_hash = (
         line_hash(starting_current["raw"])
         if starting_current is not None
@@ -4894,21 +5627,72 @@ def validate_resolution_effect(paths, state, conflict, resolution):
         f"resolution {resolution['conflict_id']}",
     )
     choice = resolution["choice"]
-    current = find_entry(entries, conflict["key"])
     if choice in conflict["proposal_ids"]:
+        current = find_entry(entries, conflict["key"])
+        if current is None:
+            current = accepted_cold_current_at_revision(
+                paths,
+                state,
+                conflict["key"],
+                resolution["revision_after"],
+            )
         proposal = human_confirmed_proposal(
             authority_proposal(paths, state, choice),
             preserve_source=(
-                resolution["bimri_version"] == MEMORY_FORMAT_VERSION
+                resolution["bimri_version"]
+                in {V5_0_2_VERSION, MEMORY_FORMAT_VERSION}
             ),
         )
-        if not proposal_effect_reflected(proposal, current):
+        reflected = proposal_effect_reflected(proposal, current)
+        if not reflected and proposal["operation"] in {"set", "touch"}:
+            reflected = bool(
+                proposal_cooled_effect(
+                    paths,
+                    state,
+                    proposal,
+                    revision=resolution["revision_after"],
+                )
+                or committed_proposal_effect_at_head(
+                    paths, state, proposal, resolution["revision_after"]
+                )
+            )
+        if reflected and proposal["operation"] == "close":
+            removed_raw = conflict.get("current_line")
+            if resolution.get("archived_raw") != removed_raw:
+                raise BimriError(
+                    "chosen close resolution archived_raw does not match its "
+                    "conflict snapshot."
+                )
+            reflected = bool(
+                removed_raw
+                and (
+                    accepted_archive_effect_by_revision(
+                        paths,
+                        state,
+                        removed_raw,
+                        resolution["revision_after"],
+                        candidate_id=proposal["proposal_id"],
+                        skip_validation_id=proposal["proposal_id"],
+                    )
+                    or committed_proposal_effect_at_head(
+                        paths, state, proposal, resolution["revision_after"]
+                    )
+                )
+            )
+        if not reflected:
             raise BimriError(
                 f"resolved conflict {conflict['conflict_id']} names revision "
                 f"V{resolution['revision_after']:06d}, but that revision does "
                 f"not contain the chosen proposal's effect."
             )
     else:
+        current = conflict_current_at_revision(
+            paths,
+            state,
+            conflict,
+            resolution["revision_after"],
+            f"resolution {resolution['conflict_id']} preserved current",
+        )
         actual_hash = line_hash(current["raw"]) if current else "absent"
         if actual_hash != conflict["current_hash"]:
             raise BimriError(
@@ -4932,6 +5716,29 @@ def validate_decision_effect(paths, state, decision):
         raise BimriError(
             "decision revision precedes the proposal's base revision."
         )
+    if outcome == "held":
+        recorded_reason = decision.get("reason")
+        proposal_reason = proposal.get("hold_reason")
+        if not (
+            recorded_reason == proposal_reason
+            or (
+                recorded_reason in {
+                    "capacity-residency-required",
+                    "owner-resolution-in-progress",
+                }
+                and proposal_reason is None
+            )
+        ):
+            raise BimriError(
+                "held decision reason disagrees with its proposal."
+            )
+        authority_revision_entries(
+            paths,
+            state,
+            decision_revision,
+            f"held decision {proposal_id}",
+        )
+        return decision
     if outcome == "applying":
         if decision["base_hash"] != proposal["base_hash"]:
             raise BimriError(
@@ -4948,9 +5755,40 @@ def validate_decision_effect(paths, state, decision):
             revision_before,
             f"applying decision {proposal_id}",
         )
-        current = resolve_entry(
-            entries, proposal["key"], proposal.get("target_id")
-        )
+        if decision.get("bimri_version") == MEMORY_FORMAT_VERSION:
+            current = entry_from_residency_evidence(
+                paths,
+                decision,
+                "base",
+                decision.get("base_line"),
+                f"applying decision {proposal_id} base",
+            )
+            if current is not None and current.get("key") != proposal["key"]:
+                raise BimriError(
+                    "applying decision base evidence names the wrong subject."
+                )
+            hot = find_entry(entries, proposal["key"])
+            if decision["base_storage"] == "hot":
+                if hot is None or hot.get("raw") != current.get("raw"):
+                    raise BimriError(
+                        "applying hot base is not present in revision_before."
+                    )
+            elif hot is not None:
+                raise BimriError(
+                    "applying cold/absent base overlaps hot revision_before."
+                )
+            if decision["base_storage"] == "cold":
+                validate_cold_snapshot_revision(
+                    paths,
+                    state,
+                    current,
+                    revision_before,
+                    f"applying decision {proposal_id} base",
+                )
+        else:
+            current = resolve_entry(
+                entries, proposal["key"], proposal.get("target_id")
+            )
         actual_hash = line_hash(current["raw"]) if current else "absent"
         if actual_hash != decision["base_hash"]:
             raise BimriError(
@@ -4976,13 +5814,13 @@ def validate_decision_effect(paths, state, decision):
             raise BimriError(
                 "contested decision is not a candidate in its conflict."
             )
-        entries = authority_revision_entries(
+        recorded_current = conflict_current_at_revision(
             paths,
             state,
+            conflict,
             decision["revision"],
             f"contested decision {proposal_id}",
         )
-        recorded_current = find_entry(entries, conflict["key"])
         recorded_hash = (
             line_hash(recorded_current["raw"])
             if recorded_current is not None
@@ -5058,20 +5896,80 @@ def validate_decision_effect(paths, state, decision):
         f"decision {proposal_id}",
     )
     current = find_entry(entries, proposal["key"])
+    if (
+        outcome == "noop"
+        and decision.get("bimri_version") == MEMORY_FORMAT_VERSION
+        and "resolution_id" not in decision
+    ):
+        evidenced = entry_from_residency_evidence(
+            paths,
+            decision,
+            "effect",
+            decision.get("effect_line"),
+            f"noop decision {proposal_id} effect",
+        )
+        if evidenced is not None and evidenced.get("key") != proposal["key"]:
+            raise BimriError("noop decision effect names the wrong subject.")
+        if decision.get("effect_storage") == "hot":
+            if current is None or current.get("raw") != evidenced.get("raw"):
+                raise BimriError(
+                    "noop hot effect is not present in its recorded revision."
+                )
+        elif current is not None:
+            raise BimriError(
+                "noop cold/absent effect overlaps hot memory in its recorded revision."
+            )
+        if decision.get("effect_storage") == "cold":
+            validate_cold_snapshot_revision(
+                paths,
+                state,
+                evidenced,
+                decision["revision"],
+                f"noop decision {proposal_id} effect",
+            )
+        current = evidenced
     reflected = proposal_effect_reflected(proposal, current)
+    if (
+        not reflected
+        and proposal["operation"] in {"set", "touch"}
+        and proposal_cooled_effect(
+            paths, state, proposal, revision=decision["revision"]
+        )
+    ):
+        reflected = True
     if proposal["operation"] == "close" and reflected:
         base_entry = proposal_base_entry(paths, proposal)
-        reflected = bool(
-            base_entry
-            and archive_contains_exact_effect(paths, base_entry["raw"], "closed")
-        )
+        if outcome == "accepted":
+            reflected = bool(
+                base_entry
+                and exact_archive_effect(
+                    paths,
+                    base_entry["raw"],
+                    reason="closed",
+                    proposal_id=proposal_id,
+                )
+            )
+        else:
+            reflected = bool(
+                base_entry
+                and accepted_archive_effect_by_revision(
+                    paths,
+                    state,
+                    base_entry["raw"],
+                    decision["revision"],
+                )
+            )
     if (
         not reflected
         and proposal["operation"] == "touch"
         and _same_tier2_authority(proposal_base_entry(paths, proposal), current)
     ):
         reflected = accepted_key_writer_after(
-            paths, state, proposal, operation="touch"
+            paths,
+            state,
+            proposal,
+            operation="touch",
+            max_revision=decision["revision"],
         ) is not None
     if not reflected:
         raise BimriError(
@@ -5083,7 +5981,12 @@ def validate_decision_effect(paths, state, decision):
 
 
 def validate_conflict_candidate_decisions(
-    paths, conflict, resolution=None, allow_missing=False, state=None
+    paths,
+    conflict,
+    resolution=None,
+    allow_missing=False,
+    state=None,
+    allow_recoverable_applying=False,
 ):
     for proposal_id in conflict["proposal_ids"]:
         path = decision_path(paths, proposal_id)
@@ -5115,6 +6018,21 @@ def validate_conflict_candidate_decisions(
                     f"candidate {proposal_id} points to the wrong conflict."
                 )
             continue
+        if (
+            allow_recoverable_applying
+            and resolution
+            and resolution["status"] == "applying"
+            and resolution["choice"] == proposal_id
+            and decision["outcome"] in {"applying", "accepted"}
+            and decision.get("resolution_id") is None
+        ):
+            # The chosen proposal may have crossed its atomic commit boundary
+            # before the resolution metadata was finalized. The decision's
+            # own validator proves either its immutable base (applying) or its
+            # exact committed effect (accepted); recovery will reconcile the
+            # cluster only after every authority record passes this read-only
+            # scan.
+            continue
         if not (
             resolution
             and resolution["status"] == "resolved"
@@ -5142,6 +6060,27 @@ def validate_conflict_candidate_decisions(
 
 
 def proposal_base_entry(paths, proposal):
+    if proposal.get("base_storage") == "cold":
+        records = [
+            record for record in archive_records(paths)
+            if (
+                record["proposal_id"]
+                == proposal.get("base_archive_proposal_id")
+                and record["reason"] == "cooled"
+                and line_hash(record["raw_line"]) == proposal["base_hash"]
+            )
+        ]
+        if len(records) != 1:
+            raise BimriError(
+                "proposal cold base does not identify one immutable cooled record."
+            )
+        entry = parse_entry_line(records[0]["raw_line"])
+        entry.update({
+            "storage": "cold",
+            "line": None,
+            "archive_proposal_id": records[0]["proposal_id"],
+        })
+        return entry
     path = revision_path(paths, proposal["base_revision"])
     if not path.exists() or path.is_symlink():
         raise BimriError("proposal base revision is missing or unsafe.")
@@ -5175,6 +6114,43 @@ def parse_archive_record(line):
     return data
 
 
+def validate_cold_archive_snapshot(
+    paths, raw_line, proposal_id, archive_date, label="cold snapshot"
+):
+    """Bind one frozen cold snapshot to exactly one monthly archive receipt."""
+    try:
+        parsed_date = dt.date.fromisoformat(archive_date)
+    except (TypeError, ValueError) as exc:
+        raise BimriError(f"{label} archive date is invalid.") from exc
+    target = paths.archive / f"{parsed_date:%Y-%m}.md"
+    if target.is_symlink() or not target.is_file():
+        raise BimriError(f"{label} archive month is missing or unsafe.")
+    exact = []
+    for number, line in enumerate(
+        target.read_text(encoding="utf-8").splitlines(), 1
+    ):
+        if not line.startswith("[ARCHIVED:"):
+            continue
+        try:
+            record = parse_archive_record(line)
+        except BimriError as exc:
+            raise BimriError(
+                f"{label} archive {target.name}:{number} is invalid: {exc}"
+            ) from exc
+        if (
+            record["date"] == archive_date
+            and record["proposal_id"] == proposal_id
+            and record["reason"] == "cooled"
+            and record["raw_line"] == raw_line
+        ):
+            exact.append(record)
+    if len(exact) != 1:
+        raise BimriError(
+            f"{label} is not bound to exactly one immutable cooled archive record."
+        )
+    return exact[0]
+
+
 def archive_records(paths):
     records = []
     for target in sorted(paths.archive.glob("*.md")):
@@ -5204,6 +6180,91 @@ def archive_records(paths):
     return records
 
 
+def validate_cold_archive_bindings(paths, state):
+    """Bind every mutable cold-current pointer to one immutable cooled record."""
+    grouped = {}
+    for key, cold in state.get("cold_current", {}).items():
+        grouped.setdefault(cold["archived_on"][:7], []).append((key, cold))
+    for month, subjects in grouped.items():
+        target = paths.archive / f"{month}.md"
+        if target.is_symlink() or not target.is_file():
+            raise BimriError(
+                f"cold-current archive month {month} is missing or unsafe."
+            )
+        records = []
+        for number, line in enumerate(
+            target.read_text(encoding="utf-8").splitlines(), 1
+        ):
+            if not line.startswith("[ARCHIVED:"):
+                continue
+            try:
+                records.append(parse_archive_record(line))
+            except BimriError as exc:
+                raise BimriError(
+                    f"cold-current archive {target.name}:{number} is invalid: {exc}"
+                ) from exc
+        for key, cold in subjects:
+            exact = [
+                record for record in records
+                if (
+                    record["proposal_id"] == cold["archived_by"]
+                    and record["reason"] == "cooled"
+                    and record["raw_line"] == cold["raw_line"]
+                )
+            ]
+            if len(exact) != 1:
+                raise BimriError(
+                    f"cold-current subject {key} is not bound to exactly one "
+                    "immutable cooled archive record."
+                )
+    return True
+
+
+def validate_current_residency(paths, state, hot_entries=None):
+    """Validate one unambiguous current generation across hot and cold."""
+    head_bytes = None
+    if hot_entries is None:
+        head = revision_path(paths, state["head_revision"])
+        if head.is_symlink() or not head.is_file():
+            raise BimriError("accepted head is missing or unsafe.")
+        head_bytes = head.read_bytes()
+        try:
+            content = head_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise BimriError("accepted head is not valid UTF-8.") from exc
+        _, hot_entries, errors, _ = validate_hot_content(
+            content, state, allow_legacy_overflow=True
+        )
+        if errors:
+            raise BimriError(
+                "accepted head memory grammar is invalid: " + "; ".join(errors)
+            )
+    validate_cold_archive_bindings(paths, state)
+    hot_keys = {entry.get("key") for entry in hot_entries if entry.get("key")}
+    overlap = sorted(hot_keys.intersection(state.get("cold_current", {})))
+    if overlap:
+        raise BimriError(
+            "subjects exist in both hot and cold-current authority: "
+            + ", ".join(overlap)
+        )
+    seen_ids = {entry["id"] for entry in hot_entries}
+    for key, record in state.get("cold_current", {}).items():
+        entry = parse_entry_line(record["raw_line"])
+        if entry["id"] in seen_ids:
+            raise BimriError(
+                f"current memory ID {entry['id']} is duplicated across residency."
+            )
+        seen_ids.add(entry["id"])
+        pointer_error = pointer_validation_error(paths, entry)
+        if pointer_error:
+            raise BimriError(
+                f"cold-current subject {key} pointer is invalid: {pointer_error}"
+            )
+    if head_bytes is not None and sha256_bytes(head_bytes) != state["head_hash"]:
+        raise BimriError("state head hash does not match the accepted head revision.")
+    return True
+
+
 def exact_archive_effect(paths, raw_line, reason="closed", proposal_id=None):
     raw_line = clean_scalar(
         raw_line, "archived line", MAX_SERIALIZED_ENTRY_CHARS
@@ -5211,25 +6272,13 @@ def exact_archive_effect(paths, raw_line, reason="closed", proposal_id=None):
     reason = clean_scalar(reason, "archive reason", 100)
     exact = []
     for record in archive_records(paths):
-        if proposal_id and record["proposal_id"] == proposal_id:
-            if (
-                record["reason"] != reason
-                or record["raw_line"] != raw_line
-            ):
-                raise BimriError(
-                    f"archive marker for {proposal_id} does not match its "
-                    "required reason and exact removed line; authority "
-                    "recovery is required."
-                )
         if record["reason"] == reason and record["raw_line"] == raw_line:
-            exact.append(record)
+            if proposal_id is None or record["proposal_id"] == proposal_id:
+                exact.append(record)
     return exact
 
 
 def append_archive(paths, proposal_id, raw_line, reason):
-    target = paths.archive / f"{dt.date.today():%Y-%m}.md"
-    if target.is_symlink():
-        raise BimriError("monthly archive file cannot be a symbolic link.")
     proposal_id = validate_fixed_id(
         proposal_id, PROPOSAL_RE, "archive proposal ID"
     )
@@ -5237,18 +6286,23 @@ def append_archive(paths, proposal_id, raw_line, reason):
         raw_line, "archived line", MAX_SERIALIZED_ENTRY_CHARS
     )
     reason = clean_scalar(reason, "archive reason", 100)
-    if any(
-        record["proposal_id"] == proposal_id
-        for record in exact_archive_effect(
-            paths, raw_line, reason=reason, proposal_id=proposal_id
-        )
-    ):
-        return
+    existing = exact_archive_effect(
+        paths, raw_line, reason=reason, proposal_id=proposal_id
+    )
+    if len(existing) > 1:
+        raise BimriError("archive contains duplicate exact proposal effects.")
+    if existing:
+        return existing[0]["date"]
+    archive_date = today()
+    target = paths.archive / f"{archive_date[:7]}.md"
+    if target.is_symlink():
+        raise BimriError("monthly archive file cannot be a symbolic link.")
     append_line(
         target,
-        f"[ARCHIVED:{today()}] [BY:{proposal_id}] "
+        f"[ARCHIVED:{archive_date}] [BY:{proposal_id}] "
         f"[{reason}] {raw_line}",
     )
+    return archive_date
 
 
 def apply_proposal(
@@ -5280,9 +6334,30 @@ def apply_proposal(
     if parse_errors:
         raise BimriError("hot memory must be repaired before applying proposals: "
                          + "; ".join(parse_errors))
-    current = resolve_entry(
-        entries, proposal.get("key"), proposal.get("target_id")
+    current = find_current_entry(
+        entries, state, proposal.get("key"), proposal.get("target_id")
     )
+
+    runtime_hold_reason = proposal.get("hold_reason")
+    if (
+        runtime_hold_reason is None
+        and not force
+        and uncommitted_owner_resolution(paths, state, proposal["key"])
+    ):
+        runtime_hold_reason = "owner-resolution-in-progress"
+    if runtime_hold_reason is not None:
+        decision = write_decision(
+            paths,
+            proposal["proposal_id"],
+            "held",
+            replace_applying=True,
+            reason=runtime_hold_reason,
+            revision=state["head_revision"],
+        )
+        result = dict(decision)
+        result["_held"] = True
+        result["_generation_changed"] = False
+        return result
 
     if existing_decision and exact_effect_reflected_at_head(
         paths, state, proposal, current
@@ -5313,7 +6388,9 @@ def apply_proposal(
         decision = write_decision(
             paths, proposal["proposal_id"], "noop",
             replace_applying=True,
-            reason=reason, revision=state["head_revision"],
+            reason=reason,
+            revision=state["head_revision"],
+            **decision_effect_evidence(current),
         )
         result = dict(decision)
         result["_generation_changed"] = False
@@ -5325,25 +6402,6 @@ def apply_proposal(
             "semantic uncertainty requires an agent conversation, not a "
             "memory conflict."
         )
-    if not force and proposal["tier"] == 1 and (
-        current is None or current["tier"] != 1
-    ):
-        raise BimriError(
-            "new or promoted Tier 1 memory requires deliberate core review; "
-            "no owner conflict was created."
-        )
-    if (
-        not force
-        and current
-        and current["tier"] in {1, 2}
-        and current.get("trust") == "confirmed"
-        and proposal["operation"] in {"set", "close"}
-    ):
-        raise BimriError(
-            "confirmed memory replacement or removal requires deliberate "
-            "review; no owner conflict was created."
-        )
-
     if not force and proposal["operation"] in {"set", "touch", "close"}:
         expected = proposal.get("base_hash", "absent")
         actual = line_hash(current["raw"]) if current else "absent"
@@ -5364,7 +6422,7 @@ def apply_proposal(
             if proposal.get("preflight_receipt") is None:
                 raise BimriError(
                     f"legacy proposal {proposal['proposal_id']} has no validated "
-                    "v5.0.3 preflight receipt; sync and restage it instead of "
+                    "versioned preflight receipt; sync and restage it instead of "
                     "creating an owner conflict."
                 )
             writer_evidence = accepted_key_writer_after(paths, state, proposal)
@@ -5404,12 +6462,39 @@ def apply_proposal(
     new_content, archived_raw = proposal_effect_content(
         content, state, proposal, current
     )
-    if new_content == content:
+    legacy_reduction = strictly_reduces_overflow(content, new_content, state)
+    cooled_entries = []
+    if not legacy_reduction:
+        try:
+            new_content, cooled_entries = pressure_cooling_plan(
+                paths, state, proposal, new_content
+            )
+        except PressureCoolingUnavailable:
+            if force:
+                raise
+            decision = write_decision(
+                paths,
+                proposal["proposal_id"],
+                "held",
+                replace_applying=True,
+                reason="capacity-residency-required",
+                revision=state["head_revision"],
+            )
+            result = dict(decision)
+            result["_held"] = True
+            result["_generation_changed"] = False
+            return result
+    current_was_cold = bool(
+        current and current.get("storage") == "cold"
+    )
+    residency_changed = current_was_cold or bool(cooled_entries)
+    if new_content == content and not residency_changed:
         decision = write_decision(
             paths, proposal["proposal_id"], "noop",
             replace_applying=True,
             reason="proposal produced no memory change",
             revision=state["head_revision"],
+            **decision_effect_evidence(current),
         )
         result = dict(decision)
         result["_generation_changed"] = False
@@ -5429,10 +6514,30 @@ def apply_proposal(
             paths, proposal["proposal_id"], "applying",
             base_hash=proposal["base_hash"],
             revision_before=state["head_revision"],
+            **decision_base_evidence(current),
         )
     if archived_raw:
         append_archive(
-            paths, proposal["proposal_id"], archived_raw, "closed"
+            paths,
+            proposal["proposal_id"],
+            archived_raw,
+            "closed" if proposal["operation"] == "close" else "replaced",
+        )
+    elif proposal["operation"] == "set" and current is not None:
+        append_archive(
+            paths, proposal["proposal_id"], current["raw"], "replaced"
+        )
+    cooled_archive_dates = []
+    for cooled in cooled_entries:
+        archive_date = append_archive(
+            paths, proposal["proposal_id"], cooled["raw"], "cooled"
+        )
+        cooled_archive_dates.append((cooled, archive_date))
+    if current_was_cold:
+        state["cold_current"].pop(proposal["key"], None)
+    for cooled, archive_date in cooled_archive_dates:
+        state["cold_current"][cooled["key"]] = make_cold_record(
+            cooled, proposal["proposal_id"], archive_date
         )
     revision = commit_revision(
         paths, state, new_content, f"accepted {proposal['proposal_id']}",
@@ -5493,6 +6598,14 @@ def build_index(paths, state):
             entry.get("status") or entry.get("kind") or entry.get("conf", ""),
             "bimri.md", entry.get("text", "")[:160],
         ])
+    for key, record in sorted(state.get("cold_current", {}).items()):
+        entry = parse_entry_line(record["raw_line"])
+        rows.append([
+            entry["id"], key, "cold", entry.get("trust", ""),
+            entry.get("source", ""), entry.get("status", "current"),
+            paths.state.relative_to(paths.root).as_posix(),
+            entry.get("text", "")[:160],
+        ])
     for log in sorted(paths.logs.glob("R*.md")):
         if log.is_symlink():
             raise BimriError(f"run log cannot be a symbolic link: {log.name}")
@@ -5503,18 +6616,33 @@ def build_index(paths, state):
                     match.group(1), "", "log", "", "", "detail",
                     log.relative_to(paths.root).as_posix(), line.strip()[:160],
                 ])
-    for archive in sorted(paths.archive.glob("*.md")):
-        if archive.is_symlink():
-            raise BimriError(
-                f"archive file cannot be a symbolic link: {archive.name}"
-            )
-        for line in archive.read_text(encoding="utf-8").splitlines():
-            match = re.search(r"\[(R\d+-E\d+|P\d+)\]", line)
-            if match:
-                rows.append([
-                    match.group(1), "", "archive", "", "", "archived",
-                    archive.relative_to(paths.root).as_posix(), line[:160],
-                ])
+    current_cold_effects = {
+        (record["archived_by"], record["raw_line"], "cooled")
+        for record in state.get("cold_current", {}).values()
+    }
+    indexed_history = {}
+    reason_rank = {"cooled": 0, "replaced": 1, "closed": 2}
+    for record in archive_records(paths):
+        if (
+            record["proposal_id"], record["raw_line"], record["reason"]
+        ) in current_cold_effects:
+            continue
+        existing = indexed_history.get(record["raw_line"])
+        if (
+            existing is None
+            or reason_rank.get(record["reason"], 1)
+            > reason_rank.get(existing["reason"], 1)
+        ):
+            indexed_history[record["raw_line"]] = record
+    for record in indexed_history.values():
+        entry = parse_entry_line(record["raw_line"])
+        rows.append([
+            entry["id"], entry.get("key", ""), "archive",
+            entry.get("trust", ""), entry.get("source", ""),
+            record["reason"],
+            record["path"].relative_to(paths.root).as_posix(),
+            record["raw_line"][:160],
+        ])
     safe_rows = []
     for row in rows:
         safe_rows.append([
@@ -5728,7 +6856,7 @@ def render_conflict_review(
     head_entries = authority_revision_entries(
         paths, state, state["head_revision"], "review current head"
     )
-    live = find_entry(head_entries, conflict["key"])
+    live = find_current_entry(head_entries, state, key=conflict["key"])
     title = conflict_title(conflict, proposals)
     heading = (
         "MEMORY CONFLICT"
@@ -5745,16 +6873,22 @@ def render_conflict_review(
         lines.extend([
             f'Live value: "{entry_value(live)}"',
             f"Live metadata: {entry_metadata(live)}",
+            "Live residency: "
+            + (
+                "cold-current (active and retrievable)"
+                if live.get("storage") == "cold"
+                else "hot-current"
+            ),
         ])
     else:
-        lines.append("Live value: absent from hot memory")
+        lines.append("Live value: absent from current memory")
     if snapshot:
         lines.extend([
             f'Snapshot when raised: "{entry_value(snapshot)}"',
             f"Snapshot metadata: {entry_metadata(snapshot)}",
         ])
     else:
-        lines.append("Snapshot when raised: absent from hot memory")
+        lines.append("Snapshot when raised: absent from current memory")
     lines.append("Why BIMRI stopped: " + conflict_stop_reason(
         conflict, proposals[0] if proposals else None
     ))
@@ -5763,7 +6897,7 @@ def render_conflict_review(
             f'Keep live: "{entry_value(live)}" remains unchanged.'
         )
     else:
-        lines.append("Keep live: this subject remains absent from hot memory.")
+        lines.append("Keep live: this subject remains absent from current memory.")
 
     if conflict["type"] == "manual-edit":
         recovery_files = conflict.get("extra", {}).get("recovery_files", [])
@@ -5817,7 +6951,7 @@ def render_conflict_review(
             )
         if proposal["operation"] == "close":
             proposed_state_line = (
-                "Proposed post-state: absent from hot memory; preserve the "
+                "Proposed post-state: absent from current memory; preserve the "
                 "exact removed line in the archive."
             )
         elif proposal["operation"] == "touch":
@@ -5874,6 +7008,7 @@ def render_conflict_review(
 def command_result_counts(results):
     categories = {
         "applied": 0,
+        "held": 0,
         "already-satisfied": 0,
         "new-conflict": 0,
         "agent-action": 0,
@@ -5881,7 +7016,9 @@ def command_result_counts(results):
     for result in results:
         if result.get("_replayed"):
             continue
-        if result.get("_generation_changed"):
+        if result.get("_held") or result.get("outcome") == "held":
+            categories["held"] += 1
+        elif result.get("_generation_changed"):
             categories["new-conflict"] += 1
         elif result.get("_agent_action"):
             categories["agent-action"] += 1
@@ -5890,6 +7027,20 @@ def command_result_counts(results):
         elif result.get("outcome") == "accepted":
             categories["applied"] += 1
     return categories
+
+
+def new_held_notices(results):
+    notices = []
+    for result in results:
+        if result.get("_replayed") or not result.get("_held"):
+            continue
+        reason = result.get("reason")
+        notices.append(
+            "BIMRI HELD: " + HOLD_MESSAGES.get(
+                reason, "The candidate is preserved and current truth is unchanged."
+            )
+        )
+    return notices
 
 
 def new_conflict_notices(paths, state, results):
@@ -5939,9 +7090,9 @@ def print_brief(
     print(
         f"Memory revision V{state['head_revision']:06d} | "
         f"~{len(content) // 4} tokens | "
-        f"T1 {counts[1]}/{state['tier1_max']} "
-        f"T2 {counts[2]}/{state['tier2_max']} "
-        f"T3 {counts[3]}/{state['tier3_max']}"
+        f"T1 {counts[1]} (soft target {state['tier1_max']}) | "
+        f"T2 {counts[2]} (soft target {state['tier2_max']}) | "
+        f"T3 {counts[3]} (soft target {state['tier3_max']})"
     )
     if reused:
         print("Resumed existing run handle for this harness session.")
@@ -6121,8 +7272,36 @@ def cmd_propose(paths, args):
                 + "; ".join(errors)
             )
         base_entry = resolve_entry(
-            base_entries, key, args.target, require_target=bool(args.target)
+            base_entries, key, args.target, require_target=False
         )
+        cold_base = (
+            cold_entry(state, key=key, target_id=args.target)
+            if base_revision == state["head_revision"]
+            else accepted_cold_current_at_revision(
+                paths, state, key, base_revision
+            )
+        )
+        if (
+            cold_base is not None
+            and args.target
+            and cold_base.get("id") != args.target
+        ):
+            cold_base = None
+        if base_entry and cold_base:
+            raise BimriError(
+                f"memory key {key} exists in both hot and cold-current state."
+            )
+        base_entry = base_entry or cold_base
+        if args.target and not base_entry:
+            raise BimriError(
+                f"target {args.target} does not exist in the run's base memory."
+            )
+        if args.new_subject and operation != "set":
+            raise BimriError("--new-subject is valid only with set.")
+        if args.new_subject and base_entry:
+            raise BimriError(
+                f"{key} already exists; omit --new-subject to update it."
+            )
         if operation in {"touch", "close"} and not base_entry:
             raise BimriError(f"{operation} requires an existing key or target.")
         if operation == "touch" and base_entry["tier"] != 2:
@@ -6133,9 +7312,43 @@ def cmd_propose(paths, args):
         tier = args.tier or (base_entry["tier"] if base_entry else None)
         if tier not in {1, 2, 3}:
             raise BimriError("tier must be 1, 2 or 3.")
-        if tier == 1 and args.kind not in TIER1_KINDS:
+        kind = args.kind or (
+            base_entry.get("kind")
+            if base_entry and base_entry["tier"] == 1
+            else "fact"
+        )
+        importance = args.importance if args.importance is not None else (
+            int(base_entry["imp"])
+            if base_entry and base_entry["tier"] == 2
+            else 3
+        )
+        status = args.status or (
+            base_entry.get("status")
+            if base_entry and base_entry["tier"] == 2
+            else "active"
+        )
+        tags = (
+            clean_tags(args.tags)
+            if args.tags is not None
+            else clean_tags(base_entry.get("tags", "") if base_entry else "")
+        )
+        confidence = args.confidence or (
+            base_entry.get("conf")
+            if base_entry and base_entry["tier"] == 3
+            else "emerging"
+        )
+        observations = (
+            args.observations
+            if args.observations is not None
+            else (
+                int(base_entry["obs"])
+                if base_entry and base_entry["tier"] == 3
+                else 1
+            )
+        )
+        if tier == 1 and kind not in TIER1_KINDS:
             raise BimriError("Tier 1 requires a valid --kind.")
-        if tier == 2 and args.status not in TIER2_STATUSES:
+        if tier == 2 and status not in TIER2_STATUSES:
             raise BimriError("Tier 2 requires a valid --status.")
         if operation in {"touch", "close"}:
             text = base_entry["text"]
@@ -6158,15 +7371,25 @@ def cmd_propose(paths, args):
         if tier == 3:
             if operation != "set":
                 raise BimriError("Tier 3 currently supports set proposals only.")
-            if args.confidence not in PATTERN_CONFIDENCE:
+            if confidence not in PATTERN_CONFIDENCE:
                 raise BimriError("Tier 3 requires a valid --confidence.")
-            if not isinstance(args.observations, int) or args.observations < 1:
+            if not isinstance(observations, int) or observations < 1:
                 raise BimriError("--observations must be a positive integer.")
-            if not args.falsifier:
+            falsifier_input = args.falsifier or (
+                base_entry.get("falsifier")
+                if base_entry and base_entry["tier"] == 3
+                else None
+            )
+            if not falsifier_input:
                 raise BimriError("Tier 3 requires --falsifier.")
+            evidence_input = args.evidence or (
+                base_entry.get("ev")
+                if base_entry and base_entry["tier"] == 3
+                else entry_id
+            )
             evidence = [
                 validate_fixed_id(item.strip(), LEGACY_ENTRY_RE, "evidence ID")
-                for item in (args.evidence or entry_id).split(",")
+                for item in evidence_input.split(",")
             ]
             pattern_id = (
                 base_entry["id"]
@@ -6176,6 +7399,7 @@ def cmd_propose(paths, args):
         else:
             evidence = []
             pattern_id = None
+            falsifier_input = args.falsifier
 
         proposal = {
             "bimri_version": MEMORY_FORMAT_VERSION,
@@ -6185,28 +7409,37 @@ def cmd_propose(paths, args):
             "created_at": now_iso(),
             "base_revision": base_revision,
             "base_hash": line_hash(base_entry["raw"]) if base_entry else "absent",
+            "base_storage": (
+                base_entry.get("storage", "hot") if base_entry else "absent"
+            ),
+            "base_archive_proposal_id": (
+                base_entry.get("archive_proposal_id")
+                if base_entry and base_entry.get("storage") == "cold"
+                else None
+            ),
             "operation": operation,
+            "new_subject": bool(args.new_subject),
             "tier": tier,
             "key": key,
             "target_id": base_entry["id"] if base_entry else args.target,
             "entry_id": entry_id,
-            "kind": args.kind,
-            "importance": args.importance,
-            "status": args.status,
+            "kind": kind,
+            "importance": importance,
+            "status": status,
             "trust": trust,
             "source": source,
-            "tags": clean_tags(args.tags),
+            "tags": tags,
             "text": text,
             "rationale": rationale,
             "needs_human": bool(args.needs_human),
             "question": clean_scalar(
                 args.question or "", "question", 1000, allow_empty=True
             ),
-            "confidence": args.confidence,
-            "observations": args.observations,
+            "confidence": confidence,
+            "observations": observations,
             "evidence": evidence,
             "falsifier": clean_scalar(
-                args.falsifier or "", "falsifier", 500, allow_empty=True
+                falsifier_input or "", "falsifier", 500, allow_empty=True
             ),
             "pattern_id": pattern_id,
             "first_run": (
@@ -6223,9 +7456,9 @@ def cmd_propose(paths, args):
             proposal = None
         # A proposal becomes authority as soon as its immutable file exists.
         # Preflight validates the complete current-head binding, exact effect,
-        # containment policy, and pending capacity before any durable write.
+        # authority policy, and deterministic residency before any durable write.
         if proposal is not None:
-            append_line(log, f"[ID:{entry_id}] [I:{args.importance}] {rationale}")
+            append_line(log, f"[ID:{entry_id}] [I:{importance}] {rationale}")
             exclusive_write_text(
                 proposal_path(paths, proposal_id),
                 json.dumps(proposal, indent=2, sort_keys=True) + "\n",
@@ -6285,11 +7518,15 @@ def cmd_sync(paths, run_id):
         save_state(paths, state)
         rebuild_index_best_effort(paths, state)
         notices = new_conflict_notices(paths, state, results)
+        held_notices = new_held_notices(results)
     for notice in notices:
+        print(notice)
+    for notice in held_notices:
         print(notice)
     counts = command_result_counts(results)
     print(
         f"BIMRI: synced {run_id}; applied {counts['applied']}, "
+        f"held candidates {counts['held']}, "
         f"already satisfied/no change {counts['already-satisfied']}, "
         f"new concurrent conflicts {counts['new-conflict']}, "
         f"agent-action failures {counts['agent-action']}."
@@ -6335,12 +7572,17 @@ def cmd_close(paths, run_id=None, actor=None, session=None,
         save_state(paths, state)
         rebuild_index_best_effort(paths, state)
         notices = new_conflict_notices(paths, state, results)
+        held_notices = new_held_notices(results)
     for notice in notices:
+        print(notice)
+    for notice in held_notices:
         print(notice)
     counts = command_result_counts(results)
     detail = []
     if counts["applied"]:
         detail.append(f"applied {counts['applied']}")
+    if counts["held"]:
+        detail.append(f"held candidates {counts['held']}")
     if counts["already-satisfied"]:
         detail.append(
             f"already satisfied/no change {counts['already-satisfied']}"
@@ -6432,6 +7674,102 @@ def finalize_conflict_decisions(paths, resolution):
         atomic_write_json(path, updated)
 
 
+def recover_interrupted_authority(paths, state):
+    """Silently finalize effects already committed by the atomic state head."""
+    changed = False
+    for path in sorted(paths.resolutions.glob("C*.json")):
+        if path.is_symlink() or not path.is_file() or not CONFLICT_RE.fullmatch(path.stem):
+            continue
+        resolution = validate_resolution_record(
+            read_json_strict(path, path.name), expected_conflict_id=path.stem
+        )
+        if (
+            resolution["status"] != "applying"
+            or "intended_revision_after" not in resolution
+        ):
+            continue
+        cpath = conflict_path(paths, path.stem)
+        if cpath.is_symlink() or not cpath.is_file():
+            raise BimriError("applying resolution conflict is missing or unsafe.")
+        conflict = validate_conflict_record(
+            paths,
+            read_json_strict(cpath, cpath.name),
+            expected_conflict_id=path.stem,
+        )
+        validate_resolution_effect(paths, state, conflict, resolution)
+        intended = resolution["intended_revision_after"]
+        committed = False
+        if resolution["choice"] in {"current", "dismiss"}:
+            recorded = conflict_current_at_revision(
+                paths,
+                state,
+                conflict,
+                intended,
+                f"resolution {path.stem} intended preserved current",
+            )
+            recorded_hash = line_hash(recorded["raw"]) if recorded else "absent"
+            committed = recorded_hash == conflict["current_hash"]
+        elif intended == state["head_revision"]:
+            proposal = human_confirmed_proposal(
+                authority_proposal(paths, state, resolution["choice"]),
+                preserve_source=(
+                    resolution["bimri_version"]
+                    in {V5_0_2_VERSION, MEMORY_FORMAT_VERSION}
+                ),
+            )
+            committed = committed_proposal_effect_at_head(
+                paths, state, proposal, intended
+            )
+        if not committed:
+            continue
+        completed = dict(resolution)
+        completed.update({
+            "status": "resolved",
+            "resolved_at": now_iso(),
+            "revision_after": intended,
+        })
+        completed.pop("failed_at", None)
+        completed.pop("error", None)
+        validate_resolution_record(
+            completed,
+            conflict=conflict,
+            expected_conflict_id=path.stem,
+        )
+        validate_resolution_effect(paths, state, conflict, completed)
+        atomic_write_json(path, completed)
+        finalize_conflict_decisions(paths, completed)
+        changed = True
+
+    for path in sorted(paths.decisions.glob("R*-Q*.json")):
+        if path.is_symlink() or not path.is_file() or not PROPOSAL_RE.fullmatch(path.stem):
+            continue
+        decision = validate_decision(
+            read_json_strict(path, path.name), path.stem
+        )
+        if decision["outcome"] != "applying":
+            continue
+        validate_decision_effect(paths, state, decision)
+        proposal = authority_proposal(paths, state, path.stem)
+        revision = state["head_revision"]
+        if not committed_proposal_effect_at_head(
+            paths, state, proposal, revision
+        ):
+            continue
+        accepted = write_decision(
+            paths,
+            path.stem,
+            "accepted",
+            replace_applying=True,
+            revision=revision,
+            recovered_from_intent=True,
+        )
+        validate_decision_effect(paths, state, accepted)
+        changed = True
+    if changed:
+        rebuild_index_best_effort(paths, state)
+    return changed
+
+
 def touch_authority_fields_match(base, current):
     if not base or not current or base.get("tier") != 2 or current.get("tier") != 2:
         return False
@@ -6478,7 +7816,12 @@ def accepted_touch_between(paths, state, proposal, revision_number):
 
 
 def accepted_archive_effect_by_revision(
-    paths, state, raw_line, revision_number, candidate_id=None
+    paths,
+    state,
+    raw_line,
+    revision_number,
+    candidate_id=None,
+    skip_validation_id=None,
 ):
     records = exact_archive_effect(
         paths,
@@ -6489,7 +7832,13 @@ def accepted_archive_effect_by_revision(
     for record in records:
         proposal_id = record["proposal_id"]
         proposal = authority_proposal(paths, state, proposal_id)
-        if proposal["operation"] != "close":
+        archived_entry = parse_entry_line(raw_line)
+        if (
+            proposal["operation"] != "close"
+            or proposal["base_hash"] != line_hash(raw_line)
+            or archived_entry is None
+            or proposal["key"] != archived_entry.get("key")
+        ):
             continue
         path = decision_path(paths, proposal_id)
         if path.is_symlink() or not path.is_file():
@@ -6501,9 +7850,136 @@ def accepted_archive_effect_by_revision(
             decision["outcome"] == "accepted"
             and decision["revision"] <= revision_number
         ):
-            validate_decision_effect(paths, state, decision)
+            if proposal_id != skip_validation_id:
+                validate_decision_effect(paths, state, decision)
             return True
     return False
+
+
+def accepted_writer_effect(paths, state, decision, proposal):
+    """Render the semantic effect authorized by one accepted writer."""
+    if decision.get("resolution_id"):
+        rpath = resolution_file_path(paths, decision["resolution_id"])
+        if rpath.is_symlink() or not rpath.is_file():
+            raise BimriError("accepted writer resolution is missing or unsafe.")
+        resolution = validate_resolution_record(
+            read_json_strict(rpath, rpath.name),
+            expected_conflict_id=decision["resolution_id"],
+        )
+        proposal = human_confirmed_proposal(
+            proposal,
+            preserve_source=(
+                resolution["bimri_version"]
+                in {V5_0_2_VERSION, MEMORY_FORMAT_VERSION}
+            ),
+        )
+    return proposal
+
+
+def inherited_cold_current_at_revision(paths, state, key, revision_number):
+    """Bind a genesis/migrated hot generation to its accepted cooling commit."""
+    candidates = []
+    for record in archive_records(paths):
+        if record["reason"] != "cooled":
+            continue
+        entry = parse_entry_line(record["raw_line"])
+        if entry is None or entry.get("key") != key:
+            continue
+        cooling_id = record["proposal_id"]
+        dpath = decision_path(paths, cooling_id)
+        if dpath.is_symlink() or not dpath.is_file():
+            continue
+        decision = validate_decision(
+            read_json_strict(dpath, dpath.name), cooling_id
+        )
+        if (
+            decision["outcome"] != "accepted"
+            or decision["revision"] > revision_number
+        ):
+            continue
+        cooling = authority_proposal(paths, state, cooling_id)
+        if decision["revision"] <= cooling["base_revision"]:
+            continue
+        base_entries = authority_revision_entries(
+            paths,
+            state,
+            cooling["base_revision"],
+            f"inherited cold base for {key}",
+        )
+        base = find_entry(base_entries, key)
+        if base is None or base.get("raw") != record["raw_line"]:
+            continue
+        committed_entries = authority_revision_entries(
+            paths,
+            state,
+            decision["revision"],
+            f"inherited cold commit for {key}",
+        )
+        if find_entry(committed_entries, key) is not None:
+            # An archive append that preceded a failed/orphan commit cannot
+            # prove that this generation actually left hot memory.
+            continue
+        candidates.append((decision["revision"], cooling_id, record, entry))
+    if not candidates:
+        return None
+    _revision, cooling_id, record, entry = max(
+        candidates, key=lambda item: (item[0], item[1])
+    )
+    entry.update({
+        "line": None,
+        "storage": "cold",
+        "archive_proposal_id": cooling_id,
+        "archive_date": record["date"],
+    })
+    return entry
+
+
+def accepted_cold_current_at_revision(paths, state, key, revision_number):
+    """Derive the latest accepted keyed generation when it was current-cold."""
+    writers = []
+    for path in sorted(paths.decisions.glob("R*-Q*.json")):
+        if path.is_symlink() or not path.is_file() or not PROPOSAL_RE.fullmatch(path.stem):
+            continue
+        decision = validate_decision(
+            read_json_strict(path, path.name), path.stem
+        )
+        if decision["outcome"] != "accepted" or decision["revision"] > revision_number:
+            continue
+        proposal = authority_proposal(paths, state, path.stem)
+        if proposal["key"] == key:
+            writers.append((decision["revision"], path.stem, decision, proposal))
+    if not writers:
+        return inherited_cold_current_at_revision(
+            paths, state, key, revision_number
+        )
+    writer_revision, _proposal_id, decision, proposal = max(writers)
+    proposal = accepted_writer_effect(paths, state, decision, proposal)
+    if proposal["operation"] == "close":
+        return None
+    raw_line = proposal_effect_line(paths, state, proposal)
+    if raw_line is None:
+        return None
+    for record in exact_archive_effect(paths, raw_line, reason="cooled"):
+        cooling_id = record["proposal_id"]
+        dpath = decision_path(paths, cooling_id)
+        if dpath.is_symlink() or not dpath.is_file():
+            continue
+        cooling = validate_decision(
+            read_json_strict(dpath, dpath.name), cooling_id
+        )
+        if (
+            cooling["outcome"] == "accepted"
+            and writer_revision <= cooling["revision"] <= revision_number
+        ):
+            entry = parse_entry_line(raw_line)
+            entry.update({
+                "line": None,
+                "storage": "cold",
+                "archive_proposal_id": cooling_id,
+                "archive_date": record["date"],
+            })
+            return entry
+    return None
 
 
 def candidate_effect_at_revision(
@@ -6528,7 +8004,7 @@ def candidate_effect_at_revision(
         )
     if proposal["operation"] == "touch":
         base = proposal_base_entry(paths, proposal)
-        return bool(
+        hot_reflected = bool(
             touch_authority_fields_match(base, current)
             and (
                 current.get("last") == proposal["run_id"]
@@ -6537,7 +8013,10 @@ def candidate_effect_at_revision(
                 )
             )
         )
-    preserve_source = conflict.get("bimri_version") == MEMORY_FORMAT_VERSION
+        return hot_reflected
+    preserve_source = conflict.get("bimri_version") in {
+        V5_0_2_VERSION, MEMORY_FORMAT_VERSION
+    }
     candidate = human_confirmed_proposal(
         proposal, preserve_source=preserve_source
     )
@@ -6560,6 +8039,10 @@ def derive_contested_satisfaction(paths, state, decision, conflict):
             f"historical satisfaction for {proposal['proposal_id']}",
         )
         current = find_entry(entries, proposal["key"])
+        if current is None:
+            current = accepted_cold_current_at_revision(
+                paths, state, proposal["key"], revision_number
+            )
         if candidate_effect_at_revision(
             paths,
             state,
@@ -6693,6 +8176,36 @@ def resolution_candidate_reflected(
     return proposal_equivalent(proposal, current)
 
 
+def resolution_candidate_reflected_at_revision(
+    paths, state, conflict, proposal, revision_number
+):
+    """Bind crash recovery to the exact precommitted effect revision."""
+    entries = authority_revision_entries(
+        paths,
+        state,
+        revision_number,
+        f"resolution {conflict['conflict_id']} intended effect",
+    )
+    current = find_entry(entries, conflict["key"])
+    if current is None:
+        current = accepted_cold_current_at_revision(
+            paths, state, conflict["key"], revision_number
+        )
+    if proposal["operation"] == "close":
+        return bool(
+            current is None
+            and committed_proposal_effect_at_head(
+                paths, state, proposal, revision_number
+            )
+        )
+    return bool(
+        proposal_effect_reflected(proposal, current)
+        or committed_proposal_effect_at_head(
+            paths, state, proposal, revision_number
+        )
+    )
+
+
 def cmd_resolve(paths, conflict_id, choice, human_approved=False):
     conflict_id = validate_fixed_id(conflict_id, CONFLICT_RE, "conflict ID")
     choice = clean_scalar(choice, "resolution choice", 80)
@@ -6760,7 +8273,9 @@ def cmd_resolve(paths, conflict_id, choice, human_approved=False):
         _, entries, errors = parse_hot(content)
         if errors:
             raise BimriError("repair hot memory before resolving conflicts.")
-        current = find_entry(entries, conflict["key"])
+        current = find_current_entry(
+            entries, state, key=conflict["key"]
+        )
         actual_hash = line_hash(current["raw"]) if current else "absent"
 
         proposal = None
@@ -6769,12 +8284,55 @@ def cmd_resolve(paths, conflict_id, choice, human_approved=False):
             and existing["bimri_version"] in LEGACY_V5_FORMATS
             and existing.get("choice") == choice
         )
-        preserve_source = not legacy_resume
+        preserve_source = (
+            not legacy_resume
+            or existing.get("bimri_version") == V5_0_2_VERSION
+        )
         resolution_version = (
             existing["bimri_version"]
             if legacy_resume
             else MEMORY_FORMAT_VERSION
         )
+        if (
+            existing
+            and existing["status"] == "applying"
+            and "intended_revision_after" in existing
+            and choice in {"current", "dismiss"}
+        ):
+            intended = existing["intended_revision_after"]
+            recorded = conflict_current_at_revision(
+                paths,
+                state,
+                conflict,
+                intended,
+                f"resolution {conflict_id} intended preserved current",
+            )
+            recorded_hash = line_hash(recorded["raw"]) if recorded else "absent"
+            if recorded_hash != conflict["current_hash"]:
+                raise BimriError(
+                    "applying resolution intended revision does not preserve "
+                    "the owner's recorded current choice."
+                )
+            resolution = dict(existing)
+            resolution.update({
+                "bimri_version": resolution_version,
+                "status": "resolved",
+                "resolved_at": now_iso(),
+                "revision_after": intended,
+            })
+            resolution.pop("failed_at", None)
+            resolution.pop("error", None)
+            validate_resolution_record(
+                resolution,
+                conflict=conflict,
+                expected_conflict_id=conflict_id,
+            )
+            validate_resolution_effect(paths, state, conflict, resolution)
+            atomic_write_json(resolution_path, resolution)
+            finalize_conflict_decisions(paths, resolution)
+            rebuild_index_best_effort(paths, state)
+            print(f"BIMRI: {conflict_id} resolved with {choice}.")
+            return resolution
         if choice in proposal_ids:
             proposal = validate_proposal(
                 read_json_strict(
@@ -6785,9 +8343,22 @@ def cmd_resolve(paths, conflict_id, choice, human_approved=False):
             proposal = human_confirmed_proposal(
                 proposal, preserve_source=preserve_source
             )
-            if resolution_candidate_reflected(
-                paths, state, conflict, proposal, current
-            ):
+            recovered_revision = None
+            if existing and existing["status"] == "applying":
+                intended = existing["intended_revision_after"]
+                if (
+                    intended <= state["head_revision"]
+                    and resolution_candidate_reflected_at_revision(
+                        paths, state, conflict, proposal, intended
+                    )
+                ):
+                    recovered_revision = intended
+                candidate_reflected = recovered_revision is not None
+            else:
+                candidate_reflected = resolution_candidate_reflected(
+                    paths, state, conflict, proposal, current
+                )
+            if candidate_reflected:
                 revision_before = (
                     existing.get("revision_before")
                     if existing
@@ -6808,10 +8379,16 @@ def cmd_resolve(paths, conflict_id, choice, human_approved=False):
                     "by": "user",
                     "revision_before": revision_before,
                     "resolved_at": now_iso(),
-                    "revision_after": state["head_revision"],
+                    "revision_after": (
+                        recovered_revision
+                        if recovered_revision is not None
+                        else state["head_revision"]
+                    ),
                 })
                 resolution.pop("failed_at", None)
                 resolution.pop("error", None)
+                if recovered_revision is None:
+                    resolution.pop("intended_revision_after", None)
                 if preserve_source:
                     resolution["authority"] = "human-asserted"
                 else:
@@ -6855,6 +8432,11 @@ def cmd_resolve(paths, conflict_id, choice, human_approved=False):
             "revision_before": (
                 existing.get("revision_before")
                 if existing else state["head_revision"]
+            ),
+            "intended_revision_after": (
+                state["head_revision"]
+                if choice in {"current", "dismiss"}
+                else next_commit_revision_number(paths, state)
             ),
         }
         if preserve_source:
@@ -6926,7 +8508,13 @@ def cmd_resolve(paths, conflict_id, choice, human_approved=False):
 
 
 def validate_authority_record_data(
-    paths, state, kind, record_id, data, verify_dependencies=True
+    paths,
+    state,
+    kind,
+    record_id,
+    data,
+    verify_dependencies=True,
+    allow_recoverable_applying=False,
 ):
     if is_quarantine_stub(data):
         raise BimriError("a quarantine stub is not restored authority.")
@@ -6982,6 +8570,7 @@ def validate_authority_record_data(
                 resolution,
                 allow_missing=(resolution is None),
                 state=state,
+                allow_recoverable_applying=allow_recoverable_applying,
             )
         return conflict
     if kind == "resolution":
@@ -7012,6 +8601,7 @@ def validate_authority_record_data(
                 paths,
                 conflict,
                 resolution,
+                allow_recoverable_applying=allow_recoverable_applying,
             )
         return resolution
     raise BimriError("unsupported authority kind.")
@@ -7417,29 +9007,198 @@ def lookup(table, value):
     return table[-1][1]
 
 
-def run_number(run_id):
-    match = re.search(r"\d+", run_id or "")
-    return int(match.group()) if match else 0
-
-
 def composite(entry, state):
     importance = int(entry.get("imp", 3))
-    current_run = state["run_count"]
-    runs_since = max(0, current_run - run_number(entry.get("last")))
-    run_mult = lookup(
-        DECAY_RUNS.get(state["cadence_class"], DECAY_RUNS["interactive"]),
-        runs_since,
-    )
     last_date = state.get("run_dates", {}).get(entry.get("last"))
     if last_date:
         try:
             days = max(0, (dt.date.today() - dt.date.fromisoformat(last_date)).days)
             day_mult = lookup(DECAY_DAYS, days)
         except ValueError:
-            day_mult = run_mult
+            day_mult = DECAY_DAYS[-1][1]
     else:
-        day_mult = run_mult
-    return importance * min(day_mult, run_mult)
+        # Older releases could prune dates still referenced by current memory.
+        # Unknown age must be conservatively coolable, never treated as fresh.
+        day_mult = DECAY_DAYS[-1][1]
+    return importance * day_mult
+
+
+def retention_order(entry, state):
+    """One wall-clock retention order for forecast and actual cooling."""
+    status_rank = {"closed": 0, "watch": 1, "active": 2}
+    activity = state.get("run_dates", {}).get(
+        entry.get("last"), "0001-01-01"
+    )
+    return (
+        composite(entry, state),
+        status_rank.get(entry.get("status"), 3),
+        activity,
+        entry.get("key", ""),
+        entry.get("id", ""),
+    )
+
+
+def recall_records(paths, state):
+    content = revision_path(
+        paths, state["head_revision"]
+    ).read_text(encoding="utf-8")
+    _, hot_entries, errors = parse_hot(content)
+    if errors:
+        raise BimriError("cannot recall malformed hot memory: " + "; ".join(errors))
+    records = []
+    current_by_key = {}
+    for entry in hot_entries:
+        if entry.get("key"):
+            current_by_key[entry["key"]] = entry
+        records.append({
+            "location": "HOT",
+            "key": entry.get("key", ""),
+            "id": entry["id"],
+            "detail": entry.get("text", ""),
+            "reason": "current",
+            "trust": entry.get("trust", ""),
+            "source": entry.get("source", ""),
+        })
+    current_cold_effects = set()
+    for key, cold in sorted(state.get("cold_current", {}).items()):
+        entry = parse_entry_line(cold["raw_line"])
+        current_by_key[key] = entry
+        records.append({
+            "location": "COLD",
+            "key": key,
+            "id": entry["id"],
+            "detail": entry.get("text", ""),
+            "reason": "current",
+            "trust": entry.get("trust", ""),
+            "source": entry.get("source", ""),
+        })
+        current_cold_effects.add(
+            (cold["archived_by"], cold["raw_line"], "cooled")
+        )
+    historical = {}
+    reason_rank = {"cooled": 0, "replaced": 1, "closed": 2}
+    for record in archive_records(paths):
+        if (
+            record["proposal_id"], record["raw_line"], record["reason"]
+        ) in current_cold_effects:
+            continue
+        generation_key = record["raw_line"]
+        existing = historical.get(generation_key)
+        if (
+            existing is None
+            or reason_rank.get(record["reason"], 1)
+            > reason_rank.get(existing["reason"], 1)
+        ):
+            historical[generation_key] = record
+    for record in historical.values():
+        entry = parse_entry_line(record["raw_line"])
+        records.append({
+            "location": "HISTORY",
+            "key": entry.get("key", ""),
+            "id": entry["id"],
+            "detail": entry.get("text", ""),
+            "reason": record["reason"],
+            "trust": entry.get("trust", ""),
+            "source": entry.get("source", ""),
+        })
+    for path in sorted(paths.decisions.glob("R*-Q*.json")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        decision_data = read_json_strict(path, path.name)
+        if decision_data.get("outcome") != "held":
+            continue
+        decision = validate_decision(decision_data, path.stem)
+        proposal = authority_proposal(paths, state, path.stem)
+        if proposal_equivalent(
+            proposal, current_by_key.get(proposal["key"])
+        ):
+            continue
+        records.append({
+            "location": "HELD",
+            "key": proposal["key"],
+            "id": proposal["proposal_id"],
+            "detail": proposal["text"],
+            "reason": decision["reason"],
+            "trust": proposal.get("trust", ""),
+            "source": proposal.get("source", ""),
+        })
+    return records
+
+
+def cmd_recall(paths, key=None, query=None, history=True, limit=20):
+    if (key is None) == (query is None):
+        raise BimriError("recall requires exactly one of --key or --query.")
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise BimriError("recall limit must be a positive integer.")
+    if limit > 500:
+        raise BimriError("recall limit cannot exceed 500.")
+    exact_key = clean_key(key) if key is not None else None
+    search_text = (
+        clean_scalar(query, "recall query", 500).casefold()
+        if query is not None else None
+    )
+    search_tokens = (
+        re.findall(r"[a-z0-9]+", search_text) if search_text is not None else []
+    )
+    if search_text is not None and (not search_tokens or len(search_tokens) > 32):
+        raise BimriError("recall query must contain 1 to 32 lexical tokens.")
+    with existing_store_lock(paths):
+        state = load_current_state_read_only(paths)
+        _conflicts, authority_issues = governance_snapshot(paths, state)
+        if authority_issues:
+            raise BimriError(
+                "recall stopped because authority recovery is required: "
+                + "; ".join(authority_issues[:3])
+            )
+        records = recall_records(paths, state)
+    matches = []
+    for record in records:
+        if exact_key is not None:
+            if record["key"] != exact_key:
+                continue
+            if not history and record["location"] == "HISTORY":
+                continue
+        else:
+            haystack = " ".join(
+                str(record.get(field, ""))
+                for field in (
+                    "key", "id", "detail", "reason", "location",
+                    "trust", "source",
+                )
+            ).casefold()
+            if not all(token in haystack for token in search_tokens):
+                continue
+        matches.append(record)
+    location_rank = {"HOT": 0, "COLD": 1, "HELD": 2, "HISTORY": 3}
+    matches.sort(
+        key=lambda item: (
+            location_rank.get(item["location"], 9),
+            item["key"],
+            item["id"],
+            item["reason"],
+        )
+    )
+    for record in matches[:limit]:
+        print(
+            "\t".join(
+                (
+                    record["location"],
+                    record["key"],
+                    record["id"],
+                    record["reason"],
+                    record["trust"],
+                    record["source"],
+                    record["detail"],
+                )
+            )
+        )
+    if not matches:
+        target = exact_key if exact_key is not None else query
+        print(f"BIMRI: no memory matched {target}.")
+        return 1
+    if len(matches) > limit:
+        print(f"BIMRI: {len(matches) - limit} additional matches omitted.")
+    return 0
 
 
 def cmd_maintain(paths):
@@ -7451,21 +9210,34 @@ def cmd_maintain(paths):
         _, entries, errors = parse_hot(content)
         if errors:
             raise BimriError("maintenance stopped: " + "; ".join(errors))
-        flagged = []
-        for entry in entries:
-            if entry["tier"] != 2:
-                continue
-            weight = composite(entry, state)
-            if entry["status"] == "closed" or weight < state["flag_threshold"]:
-                flagged.append((entry["id"], entry["key"], weight, entry["text"]))
-        print("BIMRI maintenance is judgment-first in v5.")
-        if flagged:
-            print("JUDGMENT NEEDED:")
-            for entry_id, key, weight, text in flagged:
-                print(f"  - {entry_id} [{key}] w={weight:.2f}: {text}")
-                print("    Ask the owner if uncertain; otherwise submit touch or close.")
+        candidates = sorted(
+            (
+                entry for entry in entries
+                if entry["tier"] == 2
+            ),
+            key=lambda entry: retention_order(entry, state),
+        )
+        used = len(content.encode("utf-8"))
+        ceiling = state["hot_max_bytes"]
+        pressure = used / ceiling
+        print(
+            f"BIMRI retention forecast: hot bytes {used}/{ceiling} "
+            f"({pressure:.0%}); cold current "
+            f"{len(state.get('cold_current', {}))}."
+        )
+        if pressure >= 0.9 and candidates:
+            candidate = candidates[0]
+            print(
+                "Next byte-pressure admission can cool "
+                f"{candidate['key']} deterministically; no owner action is pending."
+            )
+        elif pressure >= 0.9:
+            print(
+                "No Tier 2 resident is currently eligible; an oversized incoming "
+                "intent will be held durably without changing current truth."
+            )
         else:
-            print("  hot memory is clean.")
+            print("Residency is healthy; no pressure action is needed.")
 
 
 def cmd_review(paths, conflict_id=None, show_all=False, offset=0, limit=20):
@@ -7560,7 +9332,7 @@ def cmd_status(paths):
         content = revision_path(
             paths, state["head_revision"]
         ).read_text(encoding="utf-8")
-        _, _, errors, counts = validate_hot_content(
+        _, status_entries, errors, counts = validate_hot_content(
             content, state, allow_legacy_overflow=True
         )
         outcomes = {}
@@ -7587,6 +9359,28 @@ def cmd_status(paths):
             re.fullmatch(r"V\d{6}\.md", path.name) is not None
             for path in paths.revisions.glob("V*.md")
         )
+        held_candidates = []
+        current_by_key = {
+            entry.get("key"): entry
+            for entry in status_entries if entry.get("key")
+        }
+        for key in state.get("cold_current", {}):
+            current_by_key[key] = cold_entry(state, key=key)
+        for path in sorted(paths.decisions.glob("R*-Q*.json")):
+            if path.is_symlink() or not path.is_file():
+                continue
+            data = read_json_strict(path, path.name)
+            if data.get("outcome") != "held":
+                continue
+            decision = validate_decision(data, path.stem)
+            proposal = authority_proposal(paths, state, path.stem)
+            if proposal_equivalent(
+                proposal, current_by_key.get(proposal["key"])
+            ):
+                continue
+            held_candidates.append(
+                (proposal["key"], decision["reason"], proposal["proposal_id"])
+            )
     print(
         f"BIMRI engine v{ENGINE_VERSION} | memory format "
         f"v{MEMORY_FORMAT_VERSION} | revision V{state['head_revision']:06d} | "
@@ -7602,10 +9396,20 @@ def cmd_status(paths):
         )
     print(
         f"Hot: ~{len(content)//4} tokens | "
-        f"T1 {counts[1]}/{state['tier1_max']} "
-        f"T2 {counts[2]}/{state['tier2_max']} "
-        f"T3 {counts[3]}/{state['tier3_max']}"
+        f"bytes {len(content.encode('utf-8'))}/{state['hot_max_bytes']} hard ceiling | "
+        f"T1 {counts[1]} (soft target {state['tier1_max']}) | "
+        f"T2 {counts[2]} (soft target {state['tier2_max']}) | "
+        f"T3 {counts[3]} (soft target {state['tier3_max']})"
     )
+    print(
+        f"Cold current: {len(state.get('cold_current', {}))} | "
+        f"Held candidates: {len(held_candidates)}"
+    )
+    for key, reason, proposal_id in held_candidates[:5]:
+        print(
+            f"  held {proposal_id} [{key}] "
+            + HOLD_MESSAGES.get(reason, "Candidate preserved; current unchanged.")
+        )
     print(
         f"Open conflicts: {conflict_total} | "
         f"proposals: {proposal_total} | "
@@ -7671,7 +9475,7 @@ def restore_receipt_issues(paths):
     return issues
 
 
-def load_current_state_read_only(paths):
+def load_current_state_read_only(paths, accepted_versions=None):
     """Validate current-format state/head authority without repairing anything."""
     for directory in paths.dirs:
         if path_is_redirected(directory):
@@ -7688,16 +9492,23 @@ def load_current_state_read_only(paths):
     if path_is_redirected(paths.state) or not paths.state.is_file():
         raise BimriError("existing .bimri/state.json is missing or unsafe.")
     raw = read_json_strict(paths.state, "state.json")
-    if raw.get("bimri_version") != MEMORY_FORMAT_VERSION:
+    accepted_versions = accepted_versions or {MEMORY_FORMAT_VERSION}
+    if raw.get("bimri_version") not in accepted_versions:
         raise BimriError(
             "read-only audit requires memory format "
-            f"v{MEMORY_FORMAT_VERSION}; found {raw.get('bimri_version')}."
+            f"{', '.join('v' + value for value in sorted(accepted_versions))}; "
+            f"found {raw.get('bimri_version')}."
         )
-    require_complete_v5_state(raw)
+    require_complete_v5_state(
+        raw,
+        allow_lifecycle_defaults=(
+            raw.get("bimri_version") in LEGACY_V5_FORMATS
+        ),
+    )
     merged = fresh_state()
     merged.update(raw)
     state = validate_state(
-        merged, accepted_versions={MEMORY_FORMAT_VERSION}
+        merged, accepted_versions=accepted_versions
     )
     head = revision_path(paths, state["head_revision"])
     if path_is_redirected(head) or not head.is_file():
@@ -7710,8 +9521,6 @@ def load_current_state_read_only(paths):
     except (OSError, UnicodeDecodeError) as exc:
         raise BimriError(f"accepted head {head.name} is unreadable: {exc}") from exc
     head_hash = sha256_bytes(head_bytes)
-    if state["head_hash"] != head_hash:
-        raise BimriError("state head hash does not match the accepted head revision.")
     _, entries, hot_errors, _ = validate_hot_content(
         head_content, state, allow_legacy_overflow=True
     )
@@ -7730,6 +9539,9 @@ def load_current_state_read_only(paths):
             "accepted head pointer validation failed: "
             + "; ".join(pointer_errors)
         )
+    validate_current_residency(paths, state, hot_entries=entries)
+    if state["head_hash"] != head_hash:
+        raise BimriError("state head hash does not match the accepted head revision.")
     return state
 
 
@@ -8010,8 +9822,10 @@ def doctor_errors(
     return list(dict.fromkeys(errors)), list(dict.fromkeys(warnings))
 
 
-def read_only_store_audit(paths):
-    state = load_current_state_read_only(paths)
+def read_only_store_audit(paths, accepted_versions=None):
+    state = load_current_state_read_only(
+        paths, accepted_versions=accepted_versions
+    )
     _, governance_issues = governance_snapshot(paths, state)
     errors, warnings = doctor_errors(
         paths,
@@ -9187,13 +11001,21 @@ CODE_UPDATE_PREPARED_FIELDS = {
 }
 
 
-def _validate_prepared_code_update_manifest(paths, backup_dir, manifest):
-    if set(manifest) != CODE_UPDATE_PREPARED_FIELDS:
+def _validate_prepared_code_update_manifest(
+    paths,
+    backup_dir,
+    manifest,
+    expected_engine=ENGINE_VERSION,
+    expected_memory=MEMORY_FORMAT_VERSION,
+):
+    if not CODE_UPDATE_PREPARED_FIELDS.issubset(manifest):
         raise BimriError("prepared code-update manifest fields are invalid.")
     if (
-        manifest.get("engine_release") != ENGINE_VERSION
-        or manifest.get("memory_format") != MEMORY_FORMAT_VERSION
-        or manifest.get("mode") != "code-only-update"
+        manifest.get("engine_release") != expected_engine
+        or manifest.get("memory_format") != expected_memory
+        or manifest.get("mode") not in {
+            "code-only-update", "lossless-authority-activation"
+        }
         or manifest.get("target") != str(paths.root)
         or manifest.get("status") != "prepared"
     ):
@@ -9263,6 +11085,20 @@ def _validate_prepared_code_update_manifest(paths, backup_dir, manifest):
     return manifest
 
 
+def code_update_receipt_identity(manifest):
+    identity = (
+        manifest.get("engine_release"), manifest.get("memory_format")
+    )
+    if identity not in {
+        ("5.0.3", V5_0_2_VERSION),
+        (ENGINE_VERSION, MEMORY_FORMAT_VERSION),
+    }:
+        raise BimriError(
+            "code-update receipt has an unsupported release identity."
+        )
+    return identity
+
+
 def _validate_terminal_code_update_manifest(paths, backup_dir, manifest):
     if not CODE_UPDATE_PREPARED_FIELDS.issubset(manifest):
         raise BimriError("completed code-update manifest fields are invalid.")
@@ -9301,8 +11137,13 @@ def _validate_terminal_code_update_manifest(paths, backup_dir, manifest):
     # the project's new location.
     prepared_projection["target"] = str(paths.root)
     prepared_projection["status"] = "prepared"
+    receipt_identity = code_update_receipt_identity(manifest)
     _validate_prepared_code_update_manifest(
-        paths, backup_dir, prepared_projection
+        paths,
+        backup_dir,
+        prepared_projection,
+        expected_engine=receipt_identity[0],
+        expected_memory=receipt_identity[1],
     )
     if status == "restored-before-retry":
         parse_timestamp(
@@ -9342,13 +11183,16 @@ def _validate_terminal_code_update_manifest(paths, backup_dir, manifest):
             "installed code-update receipt does not prove zero-write "
             "preservation."
         )
-    before_after = (
-        ("before_tree_digest", "after_tree_digest"),
+    before_after = [
         ("before_bimri_md_sha256", "after_bimri_md_sha256"),
-        ("before_state_sha256", "after_state_sha256"),
         ("accepted_head_revision_before", "accepted_head_revision_after"),
         ("accepted_head_hash_before", "accepted_head_hash_after"),
-    )
+    ]
+    if manifest.get("mode") == "code-only-update":
+        before_after.extend((
+            ("before_tree_digest", "after_tree_digest"),
+            ("before_state_sha256", "after_state_sha256"),
+        ))
     if any(
         manifest.get(before) != manifest.get(after)
         for before, after in before_after
@@ -9376,15 +11220,23 @@ def _validate_terminal_code_update_manifest(paths, backup_dir, manifest):
     return manifest
 
 
-def _validate_retryable_rollback_manifest(paths, backup_dir, manifest):
+def _validate_retryable_rollback_manifest(
+    paths, backup_dir, manifest, expected_engine=None, expected_memory=None
+):
     if not CODE_UPDATE_PREPARED_FIELDS.issubset(manifest):
         raise BimriError("incomplete rollback manifest fields are invalid.")
     prepared_projection = {
         field: manifest[field] for field in CODE_UPDATE_PREPARED_FIELDS
     }
     prepared_projection["status"] = "prepared"
+    if expected_engine is None or expected_memory is None:
+        expected_engine, expected_memory = code_update_receipt_identity(manifest)
     _validate_prepared_code_update_manifest(
-        paths, backup_dir, prepared_projection
+        paths,
+        backup_dir,
+        prepared_projection,
+        expected_engine=expected_engine,
+        expected_memory=expected_memory,
     )
     if manifest.get("status") != "rollback-incomplete":
         raise BimriError("incomplete rollback manifest status is invalid.")
@@ -9553,18 +11405,63 @@ def _recover_prepared_code_updates(paths, policy, backup_root):
             )
         manifest = _read_update_manifest(manifest_path)
         status = manifest.get("status")
+        if status == "prepared-for-authority-activation":
+            prepared_projection = dict(manifest)
+            prepared_projection["status"] = "prepared"
+            _validate_prepared_code_update_manifest(
+                paths, manifest_path.parent, prepared_projection
+            )
+            backup = _safe_code_update_backup_file(
+                manifest_path.parent, manifest.get("state_backup")
+            )
+            backup_bytes = backup.read_bytes()
+            if sha256_bytes(backup_bytes) != manifest.get("state_backup_sha256"):
+                raise BimriError(
+                    "interrupted activation exact state backup changed."
+                )
+            expected = manifest["protected_manifest_before"]
+            current = protected_store_manifest(paths)
+            if current["state_sha256"] != expected["state_sha256"]:
+                activated_state = read_json_strict(
+                    paths.state, "interrupted activated state"
+                )
+                if activated_state.get("bimri_version") != MEMORY_FORMAT_VERSION:
+                    raise BimriError(
+                        "interrupted authority activation left an unknown state."
+                    )
+                unexpected = activation_manifest_differences(expected, current)
+                if unexpected:
+                    raise BimriError(
+                        "interrupted authority activation changed immutable "
+                        "evidence: " + "; ".join(unexpected)
+                    )
+                with active_code_update_policy(None):
+                    atomic_write_bytes(paths.state, backup_bytes)
+            manifest["status"] = "prepared"
+            manifest["activation_recovered_at"] = now_iso()
+            policy.write_json(manifest_path, manifest)
+            status = "prepared"
         if status not in {"prepared", "rollback-incomplete"}:
             _validate_terminal_code_update_manifest(
                 paths, manifest_path.parent, manifest
             )
             continue
+        receipt_engine, receipt_memory = code_update_receipt_identity(manifest)
         if status == "prepared":
             _validate_prepared_code_update_manifest(
-                paths, manifest_path.parent, manifest
+                paths,
+                manifest_path.parent,
+                manifest,
+                expected_engine=receipt_engine,
+                expected_memory=receipt_memory,
             )
         else:
             _validate_retryable_rollback_manifest(
-                paths, manifest_path.parent, manifest
+                paths,
+                manifest_path.parent,
+                manifest,
+                expected_engine=receipt_engine,
+                expected_memory=receipt_memory,
             )
         expected = manifest["protected_manifest_before"]
         current = protected_store_manifest(paths)
@@ -9682,15 +11579,79 @@ def _install_staged_code_update(
     verify_python_relaunch(python_executable, installed_engine)
 
 
+def prepare_v5_1_authority_activation(paths, source_version, source_bytes):
+    """Build a state-only activation while preserving the accepted head bytes."""
+    if source_version == MEMORY_FORMAT_VERSION:
+        return None
+    if source_version != V5_0_2_VERSION:
+        raise BimriError(
+            f"lossless v5.1 activation does not support v{source_version}."
+        )
+    if paths.state.read_bytes() != source_bytes:
+        raise BimriError("state changed while v5.1 activation was preparing.")
+    raw = json.loads(source_bytes.decode("utf-8"))
+    require_complete_v5_state(raw, allow_lifecycle_defaults=True)
+    merged = fresh_state()
+    merged["bimri_version"] = source_version
+    merged.update(raw)
+    source_state = validate_state(merged, accepted_versions={source_version})
+    head = revision_path(paths, source_state["head_revision"])
+    if head.is_symlink() or not head.is_file():
+        raise BimriError("accepted head is missing or unsafe during activation.")
+    head_bytes = head.read_bytes()
+    if sha256_bytes(head_bytes) != source_state["head_hash"]:
+        raise BimriError("accepted head hash changed during activation.")
+    try:
+        head_content = head_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise BimriError("accepted head is not UTF-8 during activation.") from exc
+    _, entries, errors, _ = validate_hot_content(
+        head_content, source_state, allow_legacy_overflow=True
+    )
+    errors.extend(
+        error for error in (
+            pointer_validation_error(paths, entry) for entry in entries
+        ) if error
+    )
+    if errors:
+        raise BimriError(
+            "accepted head is invalid during activation: " + "; ".join(errors)
+        )
+    activated = copy.deepcopy(source_state)
+    activated["bimri_version"] = MEMORY_FORMAT_VERSION
+    activated.setdefault("cold_current", {})
+    validate_state(activated)
+    return {
+        "state": activated,
+        "source_state_sha256": sha256_bytes(source_bytes),
+        "accepted_head_revision": source_state["head_revision"],
+        "accepted_head_hash": source_state["head_hash"],
+        "accepted_head_bytes": head_bytes,
+        "hot_bytes": paths.hot.read_bytes(),
+    }
+
+
+def activation_manifest_differences(before, after):
+    """Permit only the intentional state.json authority-version transition."""
+    return [
+        difference for difference in protected_manifest_differences(before, after)
+        if difference not in {
+            "changed protected path .bimri/state.json",
+            "changed protected manifest field state_sha256",
+        }
+    ]
+
+
 def cmd_code_only_update(
     source_paths,
     paths,
     python_executable,
     quiescent,
+    source_version,
 ):
     if not quiescent:
         raise BimriError(
-            "updating an existing v5.0.2 store requires an externally verified "
+            f"updating an existing v{source_version} store requires an externally verified "
             "quiescent handoff. Stop every process running the old engine, then "
             "retry install with --quiescent. The lock cannot enforce that "
             "old-process shutdown."
@@ -9702,20 +11663,36 @@ def cmd_code_only_update(
     pre_errors = []
     post_errors = []
     post_warnings = []
+    source_state_bytes = None
+    state_backup_path = None
+    activation = None
+    state_activated = False
     with existing_store_lock(paths), active_code_update_policy(policy):
         raw_state = read_json_strict(paths.state, "state.json")
-        if raw_state.get("bimri_version") != MEMORY_FORMAT_VERSION:
+        if raw_state.get("bimri_version") != source_version:
             raise BimriError(
-                "target stopped being a v5.0.2 store while the updater waited "
+                f"target stopped being a v{source_version} store while the updater waited "
                 "for its lock."
             )
         validate_install_target(
             source_paths, paths.root, paths, backup_root
         )
         _recover_prepared_code_updates(paths, policy, backup_root)
+        recovered_state = read_json_strict(paths.state, "state.json")
+        recovered_version = recovered_state.get("bimri_version")
+        if recovered_version != source_version:
+            if (
+                source_version == MEMORY_FORMAT_VERSION
+                and recovered_version == V5_0_2_VERSION
+            ):
+                source_version = recovered_version
+            else:
+                raise BimriError(
+                    "state version changed unexpectedly during update recovery."
+                )
         before = protected_store_manifest(paths)
         _state, pre_errors, _pre_warnings, _pre_governance = (
-            read_only_store_audit(paths)
+            read_only_store_audit(paths, accepted_versions={source_version})
         )
         after_pre_audit = protected_store_manifest(paths)
         pre_audit_differences = protected_manifest_differences(
@@ -9734,6 +11711,16 @@ def cmd_code_only_update(
         backup_dir, manifest = _prepare_code_update_backup(
             paths, policy, backup_root, before
         )
+        source_state_bytes = paths.state.read_bytes()
+        state_backup_path = backup_dir / f"state-v{source_version}-exact.json"
+        policy.copy(paths.state, state_backup_path)
+        manifest.update({
+            "mode": "lossless-authority-activation",
+            "source_memory_format": source_version,
+            "state_backup": state_backup_path.relative_to(backup_dir).as_posix(),
+            "state_backup_sha256": sha256_bytes(source_state_bytes),
+        })
+        policy.write_json(backup_dir / "install-manifest.json", manifest)
         try:
             staged = _stage_code_update(
                 source_paths,
@@ -9764,7 +11751,9 @@ def cmd_code_only_update(
                     + "; ".join(differences)
                 )
             _state, post_errors, post_warnings, _post_governance = (
-                read_only_store_audit(paths)
+                read_only_store_audit(
+                    paths, accepted_versions={source_version}
+                )
             )
             after = protected_store_manifest(paths)
             post_audit_differences = protected_manifest_differences(
@@ -9780,6 +11769,53 @@ def cmd_code_only_update(
                     "read-only post-update audit changed or attempted to "
                     "change protected memory: "
                     + "; ".join(post_audit_differences)
+                )
+            activation = prepare_v5_1_authority_activation(
+                paths, source_version, source_state_bytes
+            )
+            if activation is not None:
+                manifest.update({
+                    "status": "prepared-for-authority-activation",
+                    "activation_target_version": MEMORY_FORMAT_VERSION,
+                    "activation_preserves_head": True,
+                    "activation_preserves_bimri_md": True,
+                })
+                policy.write_json(
+                    backup_dir / "install-manifest.json", manifest
+                )
+                if paths.hot.read_bytes() != activation["hot_bytes"]:
+                    raise BimriError(
+                        "bimri.md changed before authority activation."
+                    )
+                head = revision_path(
+                    paths, activation["accepted_head_revision"]
+                )
+                if head.read_bytes() != activation["accepted_head_bytes"]:
+                    raise BimriError(
+                        "accepted head changed before authority activation."
+                    )
+                if paths.state.read_bytes() != source_state_bytes:
+                    raise BimriError(
+                        "state changed before authority activation."
+                    )
+                # The state version/pointer is the only mutable memory write
+                # in this transaction and is committed after all program files.
+                with active_code_update_policy(None):
+                    atomic_write_json(paths.state, activation["state"])
+                state_activated = True
+                after = protected_store_manifest(paths)
+                activation_differences = activation_manifest_differences(
+                    before, after
+                )
+                if activation_differences:
+                    raise BimriError(
+                        "authority activation changed protected evidence: "
+                        + "; ".join(activation_differences)
+                    )
+                _state, post_errors, post_warnings, _post_governance = (
+                    read_only_store_audit(
+                        paths, accepted_versions={MEMORY_FORMAT_VERSION}
+                    )
                 )
             manifest.update({
                 "status": (
@@ -9800,6 +11836,8 @@ def cmd_code_only_update(
                 ),
                 "read_only_audit_errors": post_errors,
                 "preservation": "passed",
+                "activation_preservation": "immutable-evidence-unchanged",
+                "state_activated": state_activated,
                 "protected_write_attempts": len(
                     policy.protected_write_attempts
                 ),
@@ -9808,8 +11846,21 @@ def cmd_code_only_update(
                 backup_dir / "install-manifest.json", manifest
             )
         except Exception as exc:
-            rollback_errors = _rollback_code_update(
-                paths, policy, backup_dir, manifest
+            rollback_errors = []
+            if state_activated:
+                try:
+                    backup_bytes = state_backup_path.read_bytes()
+                    if sha256_bytes(backup_bytes) != manifest["state_backup_sha256"]:
+                        raise BimriError("exact state backup is missing or changed.")
+                    with active_code_update_policy(None):
+                        atomic_write_bytes(paths.state, backup_bytes)
+                    state_activated = False
+                except (BimriError, OSError) as rollback_exc:
+                    rollback_errors.append(
+                        f"could not restore pre-activation state: {rollback_exc}"
+                    )
+            rollback_errors.extend(
+                _rollback_code_update(paths, policy, backup_dir, manifest)
             )
             after_rollback = protected_store_manifest(paths)
             preservation_errors = protected_manifest_differences(
@@ -9849,15 +11900,18 @@ def cmd_code_only_update(
     head_revision = manifest["accepted_head_revision_after"]
     head_hash = manifest["accepted_head_hash_after"]
     print(f"BIMRI {ENGINE_VERSION} installed.")
-    print(
-        f"Existing memory format v{MEMORY_FORMAT_VERSION} verified; "
-        "no migration performed."
-    )
+    if source_version == MEMORY_FORMAT_VERSION:
+        print(f"Existing authority store v{source_version} verified.")
+    else:
+        print(
+            f"Authority store activated from v{source_version} to "
+            f"v{MEMORY_FORMAT_VERSION}; the state version was committed last."
+        )
     print(f"Accepted head unchanged: V{head_revision:06d} {head_hash}.")
     print(
-        "Memory preservation: PASSED ("
-        f"{manifest['protected_path_count']} protected paths unchanged; "
-        "zero protected writes)."
+        "Memory preservation: PASSED (bimri.md and immutable evidence/history "
+        "bytes unchanged; exact prior state backed up at "
+        f"{state_backup_path})."
     )
     print(
         "External quiescence was attested by the installer caller; BIMRI "
@@ -9882,12 +11936,14 @@ def cmd_install(source_paths, target, quiescent=False):
     target_paths = Paths(target)
     if target_paths.state.exists() or path_is_redirected(target_paths.state):
         raw_state = read_json_strict(target_paths.state, "target state.json")
-        if raw_state.get("bimri_version") == MEMORY_FORMAT_VERSION:
+        source_version = raw_state.get("bimri_version")
+        if source_version in {V5_0_2_VERSION, MEMORY_FORMAT_VERSION}:
             return cmd_code_only_update(
                 source_paths,
                 target_paths,
                 python_executable,
                 quiescent,
+                source_version,
             )
     target.mkdir(parents=True, exist_ok=True)
     preflight_legacy_source(target_paths)
@@ -10110,21 +12166,26 @@ def build_parser():
     propose = sub.add_parser("propose")
     propose.add_argument("--run", required=True)
     propose.add_argument("--operation", choices=sorted(OPERATIONS), default="set")
+    propose.add_argument(
+        "--new-subject",
+        action="store_true",
+        help="explicitly admit an exact key that has no current subject",
+    )
     propose.add_argument("--tier", type=int, choices=(1, 2, 3))
     propose.add_argument("--key", required=True)
     propose.add_argument("--target")
-    propose.add_argument("--kind", choices=sorted(TIER1_KINDS), default="fact")
-    propose.add_argument("--importance", type=int, choices=range(1, 6), default=3)
-    propose.add_argument("--status", choices=sorted(TIER2_STATUSES), default="active")
+    propose.add_argument("--kind", choices=sorted(TIER1_KINDS))
+    propose.add_argument("--importance", type=int, choices=range(1, 6))
+    propose.add_argument("--status", choices=sorted(TIER2_STATUSES))
     propose.add_argument("--trust", choices=sorted(TRUSTS), default="working")
     propose.add_argument("--source", choices=sorted(SOURCES), default="agent")
-    propose.add_argument("--tags", default="")
+    propose.add_argument("--tags")
     propose.add_argument("--text")
     propose.add_argument("--rationale")
     propose.add_argument("--needs-human", action="store_true")
     propose.add_argument("--question")
-    propose.add_argument("--confidence", choices=sorted(PATTERN_CONFIDENCE), default="emerging")
-    propose.add_argument("--observations", type=int, default=1)
+    propose.add_argument("--confidence", choices=sorted(PATTERN_CONFIDENCE))
+    propose.add_argument("--observations", type=int)
     propose.add_argument("--evidence")
     propose.add_argument("--falsifier")
 
@@ -10167,6 +12228,22 @@ def build_parser():
     review.add_argument("--offset", type=int, default=0)
     review.add_argument("--limit", type=int, default=20)
 
+    recall = sub.add_parser("recall")
+    recall_group = recall.add_mutually_exclusive_group(required=True)
+    recall_group.add_argument("--key")
+    recall_group.add_argument("--query")
+    recall.add_argument("--history", action="store_true")
+    recall.add_argument("--limit", type=int, default=20)
+
+    get_memory = sub.add_parser("get")
+    get_memory.add_argument("--key", required=True)
+    get_memory.add_argument("--history", action="store_true")
+    get_memory.add_argument("--limit", type=int, default=20)
+
+    search = sub.add_parser("search")
+    search.add_argument("--query", required=True)
+    search.add_argument("--limit", type=int, default=20)
+
     sub.add_parser("status")
     doctor = sub.add_parser("doctor")
     doctor.add_argument("--read-only", action="store_true")
@@ -10184,7 +12261,7 @@ def build_parser():
         action="store_true",
         help=(
             "attest that every process running the old engine has exited "
-            "before a code-only update"
+            "before an existing-store authority update"
         ),
     )
     return parser
@@ -10257,6 +12334,28 @@ def main(argv=None):
                 args.conflict_id,
                 show_all=args.show_all,
                 offset=args.offset,
+                limit=args.limit,
+            )
+        elif command == "recall":
+            return cmd_recall(
+                paths,
+                key=args.key,
+                query=args.query,
+                history=(args.history if args.key is not None else True),
+                limit=args.limit,
+            )
+        elif command == "get":
+            return cmd_recall(
+                paths,
+                key=args.key,
+                history=args.history,
+                limit=args.limit,
+            )
+        elif command == "search":
+            return cmd_recall(
+                paths,
+                query=args.query,
+                history=True,
                 limit=args.limit,
             )
         elif command == "status":

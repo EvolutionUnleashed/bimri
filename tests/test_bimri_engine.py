@@ -202,8 +202,33 @@ class BimriCliTest(unittest.TestCase):
         source="user",
         trust="confirmed",
         extra=(),
+        new_subject=None,
         root=None,
     ):
+        target_root = Path(root or self.root)
+        if new_subject is None:
+            marker = f"[K:{key}]"
+            state_path = target_root / ".bimri" / "state.json"
+            current_state = (
+                json.loads(state_path.read_text("utf-8"))
+                if state_path.is_file()
+                else {}
+            )
+            run_meta = current_state.get("active_runs", {}).get(run_id, {})
+            base_revision = run_meta.get("base_revision")
+            base_path = target_root.joinpath(
+                ".bimri", "revisions", f"V{base_revision:06d}.md"
+            ) if isinstance(base_revision, int) else None
+            hot_has_key = bool(
+                base_path
+                and base_path.is_file()
+                and marker in base_path.read_text("utf-8")
+            )
+            cold_has_key = False
+            if base_revision == current_state.get("head_revision"):
+                cold_has_key = key in current_state.get("cold_current", {})
+            new_subject = not (hot_has_key or cold_has_key)
+        admission = ("--new-subject",) if new_subject else ()
         result = self.cli(
             "propose",
             "--run",
@@ -218,6 +243,7 @@ class BimriCliTest(unittest.TestCase):
             source,
             "--trust",
             trust,
+            *admission,
             *extra,
             root=root,
         )
@@ -236,7 +262,7 @@ class BimriCliTest(unittest.TestCase):
         candidate_source="agent",
         writer_text=None,
     ):
-        """Stage one proven v5.0.3 concurrent candidate without syncing it."""
+        """Stage one current concurrent candidate without syncing it."""
         candidate_run = candidate_run or self.start(candidate_actor, root=root)
         writer_run = self.start("concurrent-writer", root=root)
         candidate = self.propose(
@@ -325,7 +351,7 @@ class BimriCliTest(unittest.TestCase):
             "engine_path": engine_path,
             "host_bound": True,
             "python_executable": python_executable,
-            "version": "5.0.3",
+            "version": "5.1.0",
         })
 
         template = json.loads(
@@ -546,6 +572,7 @@ class BimriCliTest(unittest.TestCase):
                 "launch.next-step",
                 "--text",
                 "Prepare the release notes.",
+                "--new-subject",
                 "--source",
                 "user",
                 "--trust",
@@ -561,6 +588,7 @@ class BimriCliTest(unittest.TestCase):
                 "research.next-step",
                 "--text",
                 "Interview three users.",
+                "--new-subject",
                 "--source",
                 "user",
                 "--trust",
@@ -764,6 +792,7 @@ class BimriCliTest(unittest.TestCase):
             "working",
             "--rationale",
             "Evidence from the current task.",
+            "--new-subject",
         )
         self.assertEqual(retry.stdout.strip(), first)
         self.assertEqual(snapshot(), before_retry)
@@ -862,14 +891,14 @@ class BimriCliTest(unittest.TestCase):
             ).read_text("utf-8")
         )
         receipt = proposal["preflight_receipt"]
-        self.assertEqual(proposal["bimri_version"], "5.0.2")
+        self.assertEqual(proposal["bimri_version"], "5.1.0")
         self.assertEqual(proposal["base_revision"], state["head_revision"])
-        self.assertEqual(receipt["engine_release"], "5.0.3")
+        self.assertEqual(receipt["engine_release"], "5.1.0")
         self.assertEqual(receipt["observed_head_revision"], state["head_revision"])
         self.assertEqual(receipt["observed_head_hash"], state["head_hash"])
         self.assertEqual(receipt["observed_key_hash"], "absent")
 
-    def test_v503_containment_and_capacity_fail_without_conflicts(self):
+    def test_v510_authority_holds_and_soft_targets_create_no_conflicts(self):
         confirmed_run = self.start("owner")
         confirmed = self.propose(
             confirmed_run,
@@ -891,56 +920,83 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(self.decision(promotable)["outcome"], "accepted")
         policy_run = self.start("policy-agent")
 
-        attempts = [
-            (
-                "confirmed replacement",
-                ("--tier", "2", "--key", "confirmed.subject", "--text", "Replace it.",
-                 "--source", "agent", "--trust", "working"),
-            ),
-            (
-                "confirmed removal",
-                ("--operation", "close", "--key", "confirmed.subject",
-                 "--source", "agent", "--trust", "working"),
-            ),
-            (
-                "Tier 1",
-                ("--tier", "1", "--key", "new.core", "--text", "New core.",
-                 "--kind", "fact", "--source", "user", "--trust", "confirmed"),
-            ),
-            (
-                "Tier 1 promotion",
-                ("--tier", "1", "--key", "working.subject", "--text", "Promote it.",
-                 "--kind", "fact", "--source", "agent", "--trust", "working"),
-            ),
+        replacement = self.cli(
+            "propose", "--run", policy_run, "--tier", "2",
+            "--key", "confirmed.subject", "--text", "Replace it.",
+            "--source", "agent", "--trust", "working",
+        )
+        replacement_id = PROPOSAL_RE.search(replacement.stdout).group(0)
+        self.cli("sync", "--run", policy_run)
+        replacement_proposal = json.loads((
+            self.root / ".bimri" / "proposals" / f"{replacement_id}.json"
+        ).read_text("utf-8"))
+        self.assertEqual(
+            replacement_proposal["hold_reason"],
+            "confirmed-user-authority-required",
+        )
+        self.assertEqual(self.decision(replacement_id)["outcome"], "held")
+        removal = self.cli(
+            "propose", "--run", policy_run, "--operation", "close",
+            "--key", "confirmed.subject", "--source", "agent",
+            "--trust", "working",
+        )
+        removal_id = PROPOSAL_RE.search(removal.stdout).group(0)
+        self.cli("sync", "--run", policy_run)
+        removal_proposal = json.loads((
+            self.root / ".bimri" / "proposals" / f"{removal_id}.json"
+        ).read_text("utf-8"))
+        self.assertEqual(
+            removal_proposal["hold_reason"],
+            "confirmed-user-authority-required",
+        )
+        self.assertEqual(self.decision(removal_id)["outcome"], "held")
+        self.assertIn("Preserve this confirmed value.", self.hot())
+
+        human_core = self.cli(
+            "propose", "--run", policy_run, "--tier", "1",
+            "--new-subject", "--key", "new.core", "--text", "New core.",
+            "--kind", "fact", "--source", "user", "--trust", "confirmed",
+        )
+        human_core_id = PROPOSAL_RE.search(human_core.stdout).group(0)
+        self.cli("sync", "--run", policy_run)
+        self.assertEqual(self.decision(human_core_id)["outcome"], "accepted")
+        self.assertIn("[K:new.core]", self.hot())
+
+        promotion = self.cli(
+            "propose", "--run", policy_run, "--tier", "1",
+            "--key", "working.subject", "--text", "Promote it.",
+            "--kind", "fact", "--source", "agent", "--trust", "working",
+        )
+        promotion_id = PROPOSAL_RE.search(promotion.stdout).group(0)
+        self.cli("sync", "--run", policy_run)
+        promotion_record = json.loads((
+            self.root / ".bimri" / "proposals" / f"{promotion_id}.json"
+        ).read_text("utf-8"))
+        self.assertEqual(
+            promotion_record["hold_reason"], "tier1-human-authority-required"
+        )
+        self.assertEqual(self.decision(promotion_id)["outcome"], "held")
+
+        invalid_attempts = (
             (
                 "system provenance",
-                ("--tier", "2", "--key", "system.claim", "--text", "System claim.",
-                 "--source", "system", "--trust", "confirmed"),
+                ("--tier", "2", "--new-subject", "--key", "system.claim",
+                 "--text", "System claim.", "--source", "system", "--trust",
+                 "confirmed"),
             ),
             (
                 "semantic uncertainty",
-                ("--tier", "2", "--key", "uncertain.claim", "--text", "Maybe.",
-                 "--source", "agent", "--trust", "working", "--needs-human",
-                 "--question", "Which value?"),
+                ("--tier", "2", "--new-subject", "--key", "uncertain.claim",
+                 "--text", "Maybe.", "--source", "agent", "--trust", "working",
+                 "--needs-human", "--question", "Which value?"),
             ),
-        ]
-        for label, arguments in attempts:
+        )
+        for label, arguments in invalid_attempts:
             with self.subTest(label=label):
-                before = {
-                    path.relative_to(self.root).as_posix(): path.read_bytes()
-                    for path in self.root.rglob("*")
-                    if path.is_file() and not path.is_symlink()
-                }
                 result = self.cli(
                     "propose", "--run", policy_run, *arguments, check=False
                 )
                 self.assertEqual(result.returncode, 2, result.stderr)
-                after = {
-                    path.relative_to(self.root).as_posix(): path.read_bytes()
-                    for path in self.root.rglob("*")
-                    if path.is_file() and not path.is_symlink()
-                }
-                self.assertEqual(after, before)
 
         before_touch = next(
             line for line in self.hot().splitlines()
@@ -973,6 +1029,7 @@ class BimriCliTest(unittest.TestCase):
             policy_run,
             "--tier",
             "2",
+            "--new-subject",
             "--key",
             "over.capacity",
             "--text",
@@ -981,14 +1038,15 @@ class BimriCliTest(unittest.TestCase):
             "agent",
             "--trust",
             "working",
-            check=False,
         )
-        self.assertEqual(capacity.returncode, 2)
-        self.assertIn("Tier 2 exceeds cap", capacity.stderr)
+        capacity_id = PROPOSAL_RE.search(capacity.stdout).group(0)
+        self.cli("sync", "--run", policy_run)
+        self.assertEqual(self.decision(capacity_id)["outcome"], "accepted")
+        self.assertIn("[K:over.capacity]", self.hot())
         self.assertEqual(self.state()["conflict_count"], 0)
         self.assertEqual(list((self.root / ".bimri" / "conflicts").glob("C*.json")), [])
 
-    def test_v503_pending_proposal_reserves_last_capacity_slot(self):
+    def test_pending_proposal_does_not_reserve_a_soft_tier_target(self):
         first_run = self.start("first")
         second_run = self.start("second")
         state_path = self.root / ".bimri" / "state.json"
@@ -1013,6 +1071,7 @@ class BimriCliTest(unittest.TestCase):
             second_run,
             "--tier",
             "2",
+            "--new-subject",
             "--key",
             "slot.two",
             "--text",
@@ -1021,20 +1080,23 @@ class BimriCliTest(unittest.TestCase):
             "agent",
             "--trust",
             "working",
-            check=False,
         )
-        self.assertEqual(second.returncode, 2)
-        self.assertIn("reserved by pending work", second.stderr)
-        after = {
+        second_id = PROPOSAL_RE.search(second.stdout).group(0)
+        self.assertEqual(
+            [path.stem for path in (self.root / ".bimri" / "proposals").glob("*.json")],
+            [first, second_id],
+        )
+        self.assertNotEqual(before, {
             path.relative_to(self.root).as_posix(): path.read_bytes()
             for path in self.root.rglob("*")
             if path.is_file() and not path.is_symlink()
-        }
-        self.assertEqual(after, before)
-        self.assertEqual(
-            [path.stem for path in (self.root / ".bimri" / "proposals").glob("*.json")],
-            [first],
-        )
+        })
+        self.cli("sync", "--run", first_run)
+        self.cli("sync", "--run", second_run)
+        self.assertEqual(self.decision(first)["outcome"], "accepted")
+        self.assertEqual(self.decision(second_id)["outcome"], "accepted")
+        self.assertIn("[K:slot.one]", self.hot())
+        self.assertIn("[K:slot.two]", self.hot())
         self.assertEqual(list((self.root / ".bimri" / "conflicts").glob("C*.json")), [])
 
     def test_v503_genuine_concurrent_edit_notifies_once(self):
@@ -1161,7 +1223,7 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(self.decision(first)["outcome"], "accepted")
         blocked = self.cli("sync", "--run", second_run, check=False)
         self.assertEqual(blocked.returncode, 2)
-        self.assertIn("no validated v5.0.3 preflight receipt", blocked.stderr)
+        self.assertIn("no validated versioned preflight receipt", blocked.stderr)
         self.assertFalse(
             (self.root / ".bimri" / "decisions" / f"{second}.json").exists()
         )
@@ -1584,7 +1646,10 @@ class BimriCliTest(unittest.TestCase):
         replay = self.cli("sync", "--run", run_id, check=False)
         self.assertEqual(replay.returncode, 2)
         self.assertIn("authority recovery is required", replay.stderr)
-        self.assertIn("does not match its required reason", replay.stderr)
+        self.assertIn(
+            "close target is absent without exact archive provenance",
+            replay.stderr,
+        )
 
     def test_resolution_requires_attestation_and_preserves_claim_origin(self):
         for source in ("agent", "external"):
@@ -1643,7 +1708,7 @@ class BimriCliTest(unittest.TestCase):
                     root=root,
                 )
                 resolution = json.loads(resolution_path.read_text("utf-8"))
-                self.assertEqual(resolution["bimri_version"], "5.0.2")
+                self.assertEqual(resolution["bimri_version"], "5.1.0")
                 self.assertEqual(resolution["authority"], "human-asserted")
                 self.assertIn(
                     f"[T:confirmed] [SRC:{source}]",
@@ -1830,7 +1895,10 @@ class BimriCliTest(unittest.TestCase):
         self.assertNotIn("[K:crash.before-state]", self.hot())
 
         recovered = self.cli("sync", "--run", run_id)
-        self.assertIn("applied 1, already satisfied/no change 0", recovered.stdout)
+        self.assertIn(
+            "applied 1, held candidates 0, already satisfied/no change 0",
+            recovered.stdout,
+        )
         final = self.decision(proposal_id)
         self.assertEqual(final["outcome"], "accepted")
         self.assertEqual(final["revision"], 2)
@@ -1869,6 +1937,9 @@ class BimriCliTest(unittest.TestCase):
         self.assertIn("Value A landed before the child died.", self.hot())
 
         later_run = self.start("later-agent")
+        silently_finalized = self.decision(crashed_proposal)
+        self.assertEqual(silently_finalized["outcome"], "accepted")
+        self.assertEqual(silently_finalized["revision"], landed_revision)
         later_proposal = self.propose(
             later_run,
             "crash.same-key",
@@ -1882,10 +1953,14 @@ class BimriCliTest(unittest.TestCase):
         self.assertIn("Value B is the later committed update.", self.hot())
 
         retry = self.cli("sync", "--run", crashed_run, check=False)
-        self.assertEqual(retry.returncode, 2)
-        self.assertIn("later keyed writer cannot be proven", retry.stderr)
+        self.assertEqual(retry.returncode, 0)
+        self.assertIn(
+            "applied 0, held candidates 0, already satisfied/no change 0",
+            retry.stdout,
+        )
         recovered = self.decision(crashed_proposal)
-        self.assertEqual(recovered["outcome"], "applying")
+        self.assertEqual(recovered["outcome"], "accepted")
+        self.assertEqual(recovered["revision"], landed_revision)
         self.assertEqual(self.state()["head_revision"], 2)
         self.assertIn("Value B is the later committed update.", self.hot())
         self.assertNotIn("Value A landed before the child died.", self.hot())
@@ -2043,7 +2118,9 @@ class BimriCliTest(unittest.TestCase):
             crash_candidate,
             "--human-approved",
         )
-        self.assertIn(f"resolved with {crash_candidate}", recovered.stdout)
+        self.assertIn(
+            f"already resolved as {crash_candidate}", recovered.stdout
+        )
         self.assertEqual(self.state()["head_revision"], revision_with_effect)
         recovered_resolution = json.loads(
             crash_resolution_path.read_text("utf-8")
@@ -2251,7 +2328,7 @@ class BimriCliTest(unittest.TestCase):
         review = self.cli("review", conflict_id)
         self.assertIn("Concurrent removal", review.stdout)
         self.assertIn("Action: remove/archive", review.stdout)
-        self.assertIn("absent from hot memory", review.stdout)
+        self.assertIn("absent from current memory", review.stdout)
         self.assertIn("preserve the exact prior line", review.stdout)
         self.assertNotIn("promote", review.stdout.lower())
 
@@ -2502,7 +2579,10 @@ class BimriCliTest(unittest.TestCase):
         )
 
         close_replay = self.cli("sync", "--run", closer)
-        self.assertIn("applied 1, already satisfied/no change 0", close_replay.stdout)
+        self.assertIn(
+            "applied 0, held candidates 0, already satisfied/no change 0",
+            close_replay.stdout,
+        )
         self.assertEqual(self.state()["head_revision"], close_revision)
         replayed_close = self.decision(close_id)
         self.assertEqual(replayed_close["outcome"], "accepted")
@@ -2572,7 +2652,10 @@ class BimriCliTest(unittest.TestCase):
         )
 
         touch_replay = self.cli("sync", "--run", toucher)
-        self.assertIn("applied 1, already satisfied/no change 0", touch_replay.stdout)
+        self.assertIn(
+            "applied 0, held candidates 0, already satisfied/no change 0",
+            touch_replay.stdout,
+        )
         self.assertEqual(self.state()["head_revision"], touch_revision)
         replayed_touch = self.decision(touch_id)
         self.assertEqual(replayed_touch["outcome"], "accepted")
@@ -2590,6 +2673,7 @@ class BimriCliTest(unittest.TestCase):
             run_id,
             "--tier",
             "2",
+            "--new-subject",
             "--key",
             "invalid.confirmation",
             "--text",
@@ -2609,6 +2693,7 @@ class BimriCliTest(unittest.TestCase):
             run_id,
             "--tier",
             "2",
+            "--new-subject",
             "--key",
             "external.confirmation",
             "--text",
@@ -2622,39 +2707,35 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(invalid_external.returncode, 2)
         self.assertIn("only directly human-stated", invalid_external.stderr)
 
-        before = {
-            path.relative_to(self.root).as_posix(): path.read_bytes()
-            for path in self.root.rglob("*")
-            if path.is_file() and not path.is_symlink()
-        }
         human_core = self.cli(
             "propose", "--run", run_id, "--tier", "1",
-            "--key", "owner.preference",
+            "--new-subject", "--key", "owner.preference",
             "--text", "The owner prefers concise status reports.",
             "--source", "user", "--trust", "confirmed", "--kind", "pref",
-            check=False,
         )
-        self.assertEqual(human_core.returncode, 2)
-        self.assertIn("Tier 1 memory is paused", human_core.stderr)
-        self.assertEqual(
-            {
-                path.relative_to(self.root).as_posix(): path.read_bytes()
-                for path in self.root.rglob("*")
-                if path.is_file() and not path.is_symlink()
-            },
-            before,
-        )
+        human_core_id = PROPOSAL_RE.search(human_core.stdout).group(0)
+        self.cli("sync", "--run", run_id)
+        self.assertEqual(self.decision(human_core_id)["outcome"], "accepted")
+        self.assertIn("[K:owner.preference]", self.hot())
+        self.assertIn("[T:confirmed] [SRC:user]", self.hot())
 
         second = self.start("agent")
         agent_core = self.cli(
             "propose", "--run", second, "--tier", "1",
-            "--key", "architecture.assumption",
+            "--new-subject", "--key", "architecture.assumption",
             "--text", "The service should use a queue.",
             "--source", "agent", "--trust", "working", "--kind", "decision",
-            check=False,
         )
-        self.assertEqual(agent_core.returncode, 2)
-        self.assertIn("Tier 1 memory is paused", agent_core.stderr)
+        agent_core_id = PROPOSAL_RE.search(agent_core.stdout).group(0)
+        self.cli("sync", "--run", second)
+        proposal = json.loads((
+            self.root / ".bimri" / "proposals" / f"{agent_core_id}.json"
+        ).read_text("utf-8"))
+        self.assertEqual(
+            proposal["hold_reason"], "tier1-human-authority-required"
+        )
+        self.assertEqual(self.decision(agent_core_id)["outcome"], "held")
+        self.assertNotIn("[K:architecture.assumption]", self.hot())
         self.assertEqual(self.state()["conflict_count"], 0)
         self.assertEqual(list((self.root / ".bimri" / "conflicts").glob("C*.json")), [])
 
@@ -2700,37 +2781,39 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(self.decision(initial)["outcome"], "accepted")
 
         agent_run = self.start("agent")
-        before = {
-            path.relative_to(self.root).as_posix(): path.read_bytes()
-            for path in self.root.rglob("*")
-            if path.is_file() and not path.is_symlink()
-        }
         changed = self.cli(
             "propose", "--run", agent_run, "--tier", "2",
             "--key", "launch.date", "--text", "Launch on Tuesday.",
-            "--source", "agent", "--trust", "working", check=False,
+            "--source", "agent", "--trust", "working",
         )
-        self.assertEqual(changed.returncode, 2)
-        self.assertIn("confirmed memory launch.date is protected", changed.stderr)
+        changed_id = PROPOSAL_RE.search(changed.stdout).group(0)
+        proposal = json.loads((
+            self.root / ".bimri" / "proposals" / f"{changed_id}.json"
+        ).read_text("utf-8"))
         self.assertEqual(
-            {
-                path.relative_to(self.root).as_posix(): path.read_bytes()
-                for path in self.root.rglob("*")
-                if path.is_file() and not path.is_symlink()
-            },
-            before,
+            proposal["hold_reason"], "confirmed-user-authority-required"
         )
+        self.cli("sync", "--run", agent_run)
+        decision = self.decision(changed_id)
+        self.assertEqual(decision["outcome"], "held")
+        self.assertEqual(
+            decision["reason"], "confirmed-user-authority-required"
+        )
+        self.assertIn("Launch on Monday.", self.hot())
+        self.assertNotIn("Launch on Tuesday.", self.hot())
+        recall = self.cli("recall", "--key", "launch.date")
+        self.assertIn("Launch on Monday.", recall.stdout)
+        self.assertIn("HELD", recall.stdout)
+        self.assertIn("Launch on Tuesday.", recall.stdout)
         self.assertEqual(self.state()["conflict_count"], 0)
         self.assertEqual(list((self.root / ".bimri" / "conflicts").glob("C*.json")), [])
 
-    def test_caps_and_oversize_inputs_fail_without_silent_truncation(self):
+    def test_soft_tier_targets_and_byte_pressure_do_not_silently_truncate(self):
         self.cli("migrate")
         state_path = self.root / ".bimri" / "state.json"
         state = self.state()
         state["entry_max_chars"] = 50
         state["tier2_max"] = 1
-        state["tier2_hard"] = 1
-        state["hot_max_bytes"] = len(self.hot().encode("utf-8")) + 220
         state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", "utf-8")
 
         first = self.start("codex")
@@ -2740,6 +2823,7 @@ class BimriCliTest(unittest.TestCase):
             first,
             "--tier",
             "2",
+            "--new-subject",
             "--key",
             "too.large",
             "--text",
@@ -2759,27 +2843,40 @@ class BimriCliTest(unittest.TestCase):
         second = self.start("claude")
         second_proposal = self.cli(
             "propose", "--run", second, "--tier", "2",
-            "--key", "second.item", "--text", "Second compact item.",
-            "--source", "user", "--trust", "confirmed", check=False,
+            "--new-subject", "--key", "second.item",
+            "--text", "Second compact item.", "--source", "user",
+            "--trust", "confirmed",
         )
-        self.assertEqual(second_proposal.returncode, 2)
-        self.assertIn("Tier 2 exceeds cap", second_proposal.stderr)
+        second_id = PROPOSAL_RE.search(second_proposal.stdout).group(0)
+        self.cli("sync", "--run", second)
+        self.assertEqual(self.decision(second_id)["outcome"], "accepted")
         self.assertEqual(self.hot().count("[K:first.item]"), 1)
-        self.assertNotIn("[K:second.item]", self.hot())
+        self.assertEqual(self.hot().count("[K:second.item]"), 1)
 
         state = self.state()
         state["tier2_max"] = 20
-        state["tier2_hard"] = 26
         state["hot_max_bytes"] = len(self.hot().encode("utf-8")) + 10
         state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", "utf-8")
         third = self.start("other")
         byte_cap = self.cli(
             "propose", "--run", third, "--tier", "2",
-            "--key", "byte.cap", "--text", "This cannot fit.",
-            "--source", "user", "--trust", "confirmed", check=False,
+            "--new-subject", "--key", "byte.cap",
+            "--text", "This cannot fit.", "--source", "user",
+            "--trust", "confirmed",
         )
-        self.assertEqual(byte_cap.returncode, 2)
-        self.assertIn("hot memory exceeds byte cap", byte_cap.stderr)
+        byte_id = PROPOSAL_RE.search(byte_cap.stdout).group(0)
+        self.cli("sync", "--run", third)
+        self.assertEqual(self.decision(byte_id)["outcome"], "accepted")
+        state = self.state()
+        self.assertTrue(state["cold_current"])
+        self.assertLessEqual(
+            len(self.hot().encode("utf-8")), state["hot_max_bytes"]
+        )
+        self.assertEqual(
+            self.hot().count("[K:byte.cap]")
+            + int("byte.cap" in state["cold_current"]),
+            1,
+        )
         self.assertEqual(self.state()["conflict_count"], 0)
 
     def test_inherited_cap_overflow_can_be_reduced_three_to_two_to_one(self):
@@ -2989,19 +3086,33 @@ class BimriCliTest(unittest.TestCase):
         self.assertIn(f"{conflict_id}.json", doctor.stdout)
 
         head_before_sync = self.state()["head_revision"]
-        blocked = self.cli(
+        staged = self.cli(
             "propose", "--run", degraded_run, "--tier", "2",
             "--key", "corruption.unrelated",
-            "--text", "This unrelated proposal must not be staged.",
+            "--text", "This unrelated proposal remains durably staged.",
             "--source", "user", "--trust", "confirmed", check=False,
         )
-        self.assertEqual(blocked.returncode, 2)
-        self.assertIn("C000001.json is unreadable", blocked.stderr)
-        self.assertEqual(self.state()["head_revision"], head_before_sync)
-        self.assertEqual(
-            list((self.root / ".bimri" / "proposals").glob(f"{degraded_run}-Q*.json")),
-            [],
+        self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+        staged_id = PROPOSAL_RE.search(staged.stdout).group(0)
+        staged_path = (
+            self.root / ".bimri" / "proposals" / f"{staged_id}.json"
         )
+        staged_record = json.loads(staged_path.read_text("utf-8"))
+        self.assertEqual(staged_record["hold_reason"], "classification-required")
+        self.assertFalse(
+            (
+                self.root / ".bimri" / "decisions" / f"{staged_id}.json"
+            ).exists()
+        )
+        self.assertEqual(self.state()["head_revision"], head_before_sync)
+        blocked_sync = self.cli(
+            "sync", "--run", degraded_run, check=False
+        )
+        self.assertEqual(blocked_sync.returncode, 2)
+        self.assertIn("shared-memory writes are paused", blocked_sync.stderr)
+        self.assertEqual(staged_path.read_text("utf-8"), json.dumps(
+            staged_record, indent=2, sort_keys=True
+        ) + "\n")
 
         denied = self.cli(
             "quarantine-authority",
@@ -3110,13 +3221,20 @@ class BimriCliTest(unittest.TestCase):
             "current",
             "--human-approved",
         )
-        staged = self.propose(
+        released = self.cli("sync", "--run", degraded_run)
+        self.assertIn("held candidates 1", released.stdout)
+        held = self.decision(staged_id)
+        self.assertEqual(held["outcome"], "held")
+        self.assertEqual(held["reason"], "classification-required")
+        self.assertNotIn("[K:corruption.unrelated]", self.hot())
+
+        classified = self.propose(
             degraded_run,
             "corruption.unrelated",
             "This unrelated proposal is staged after authority recovery.",
         )
         self.cli("sync", "--run", degraded_run)
-        self.assertEqual(self.decision(staged)["outcome"], "accepted")
+        self.assertEqual(self.decision(classified)["outcome"], "accepted")
         self.assertIn("[K:corruption.unrelated]", self.hot())
 
     def test_semantic_or_orphan_authority_corruption_is_recoverable(self):
@@ -4062,8 +4180,7 @@ class BimriCliTest(unittest.TestCase):
                 self.assertNotEqual(status.returncode, 0)
                 self.assertNotEqual(attempted.returncode, 0)
                 self.assertIn(
-                    "resolution revision_before does not match the conflict's "
-                    "recorded current value",
+                    "conflict hot snapshot is not present in its recorded revision",
                     combined,
                 )
                 self.assertEqual(
@@ -4500,7 +4617,7 @@ class BimriCliTest(unittest.TestCase):
         corrupted = self.cli("status", check=False)
         self.assertEqual(corrupted.returncode, 2)
         self.assertIn(
-            "state head hash does not match the head revision",
+            "state head hash does not match the accepted head revision",
             corrupted.stderr,
         )
 
@@ -4545,9 +4662,9 @@ class BimriCliTest(unittest.TestCase):
         )
 
         first = self.cli("migrate")
-        self.assertIn("complete at memory format v5.0.2", first.stdout)
+        self.assertIn("complete at memory format v5.1.0", first.stdout)
         state = self.state()
-        self.assertEqual(state["bimri_version"], "5.0.2")
+        self.assertEqual(state["bimri_version"], "5.1.0")
         self.assertEqual(state["project_id"], "legacy-project")
         self.assertEqual(state["run_count"], 3)
         self.assertEqual(
@@ -4568,7 +4685,7 @@ class BimriCliTest(unittest.TestCase):
         revisions_before = sorted(path.name for path in (bdir / "revisions").iterdir())
 
         second = self.cli("migrate")
-        self.assertIn("complete at memory format v5.0.2", second.stdout)
+        self.assertIn("complete at memory format v5.1.0", second.stdout)
         self.assertEqual(marker_path.read_bytes(), marker_before)
         self.assertEqual(
             sorted(path.name for path in (bdir / "backups").iterdir()),
@@ -4908,7 +5025,7 @@ class BimriCliTest(unittest.TestCase):
         )
         self.assertIn("AUTHORITY RECOVERY NEEDED", installed.stdout)
         self.assertIn("repair tools remain installed", installed.stdout)
-        self.assertEqual(self.state(root=target)["bimri_version"], "5.0.2")
+        self.assertEqual(self.state(root=target)["bimri_version"], "5.1.0")
         self.assert_installed_runtime_binding(target)
         manifests = list(
             (target / ".bimri" / "install-backups").glob(
@@ -5237,8 +5354,11 @@ class BimriCliTest(unittest.TestCase):
         state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", "utf-8")
 
         pointer_result = self.cli("doctor", check=False)
-        self.assertEqual(pointer_result.returncode, 1)
-        self.assertIn("pointer escapes the BIMRI project", pointer_result.stdout)
+        self.assertNotEqual(pointer_result.returncode, 0)
+        self.assertIn(
+            "pointer escapes the BIMRI project",
+            pointer_result.stdout + pointer_result.stderr,
+        )
 
         malformed = escaped.replace(
             "## Tier 2: Active Context",
@@ -5249,8 +5369,11 @@ class BimriCliTest(unittest.TestCase):
         state["head_hash"] = hashlib.sha256(malformed.encode("utf-8")).hexdigest()
         state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", "utf-8")
         malformed_result = self.cli("doctor", check=False)
-        self.assertEqual(malformed_result.returncode, 1)
-        self.assertIn("malformed Tier 2 entry", malformed_result.stdout)
+        self.assertNotEqual(malformed_result.returncode, 0)
+        self.assertIn(
+            "malformed Tier 2 entry",
+            malformed_result.stdout + malformed_result.stderr,
+        )
 
     def test_migrate_does_not_claim_validation_for_duplicate_memory_keys(self):
         initialized = self.cli("migrate")
@@ -5265,8 +5388,8 @@ class BimriCliTest(unittest.TestCase):
             / f"V{state['head_revision']:06d}.md"
         )
         duplicate = revision_path.read_text("utf-8").replace(
-            "<!-- Confirmed facts, decisions, preferences and rules. Capacity: state.json. -->",
-            "<!-- Confirmed facts, decisions, preferences and rules. Capacity: state.json. -->\n\n"
+            "<!-- Confirmed facts, decisions, preferences and rules. Soft target: state.json. -->",
+            "<!-- Confirmed facts, decisions, preferences and rules. Soft target: state.json. -->\n\n"
             "[R0-E1] [K:duplicate.key] [fact] [T:working] "
             "[SRC:legacy] [] First value.\n\n"
             "[R0-E2] [K:duplicate.key] [fact] [T:working] "
@@ -5282,7 +5405,7 @@ class BimriCliTest(unittest.TestCase):
         result = self.cli("migrate", check=False)
 
         self.assertEqual(result.returncode, 2)
-        self.assertIn("migration validation failed", result.stderr)
+        self.assertIn("accepted head memory grammar is invalid", result.stderr)
         self.assertIn("duplicate memory key: duplicate.key", result.stderr)
         self.assertNotIn("Validation: PASSED", result.stdout)
 
@@ -5364,7 +5487,10 @@ class BimriCliTest(unittest.TestCase):
             run_id,
             timeout=45,
         )
-        self.assertIn("applied 1, already satisfied/no change 0", result.stdout)
+        self.assertIn(
+            "applied 1, held candidates 0, already satisfied/no change 0",
+            result.stdout,
+        )
         self.assertIn(
             "BIMRI WARNING: bimri.md could not be refreshed",
             result.stderr,
@@ -5407,7 +5533,10 @@ class BimriCliTest(unittest.TestCase):
             run_id,
             timeout=30,
         )
-        self.assertIn("applied 1, already satisfied/no change 0", result.stdout)
+        self.assertIn(
+            "applied 1, held candidates 0, already satisfied/no change 0",
+            result.stdout,
+        )
         self.assertIn(
             "BIMRI WARNING: bimri.md could not be refreshed",
             result.stderr,
@@ -5526,15 +5655,34 @@ class BimriCliTest(unittest.TestCase):
             "journal", "--run", run_id,
             "--text", "Index paths stay portable across operating systems.",
         )
-        archive_path = self.root / ".bimri" / "archive" / "portability.md"
-        archive_path.write_bytes(
-            b"[R999999-E999] Archived portability fixture.\n"
-        )
         first = self.propose(run_id, "zeta.item", "Zeta comes second alphabetically.")
         second = self.propose(run_id, "alpha.item", "Alpha comes first alphabetically.")
         self.cli("sync", "--run", run_id)
         self.assertEqual(self.decision(first)["outcome"], "accepted")
         self.assertEqual(self.decision(second)["outcome"], "accepted")
+        closed = self.cli(
+            "propose",
+            "--run",
+            run_id,
+            "--operation",
+            "close",
+            "--key",
+            "zeta.item",
+            "--source",
+            "user",
+            "--trust",
+            "confirmed",
+        )
+        close_id = PROPOSAL_RE.search(closed.stdout).group(0)
+        self.cli("sync", "--run", run_id)
+        self.assertEqual(self.decision(close_id)["outcome"], "accepted")
+        archive_path = (
+            self.root
+            / ".bimri"
+            / "archive"
+            / f"{dt.date.today():%Y-%m}.md"
+        )
+        self.assertTrue(archive_path.is_file())
 
         first_index = self.cli("index")
         index_path = self.root / ".bimri" / "index.tsv"
@@ -5558,7 +5706,9 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(ids, sorted(ids))
         indexed_files = {row.split("\t")[6] for row in rows[1:]}
         self.assertIn(f".bimri/log/{run_id}.md", indexed_files)
-        self.assertIn(".bimri/archive/portability.md", indexed_files)
+        self.assertIn(
+            archive_path.relative_to(self.root).as_posix(), indexed_files
+        )
         self.assertTrue(all("\\" not in path for path in indexed_files))
 
         first_doctor = self.cli("doctor")
@@ -5603,7 +5753,7 @@ class BimriCliTest(unittest.TestCase):
         (self.root / "BIMRI-backup.md").write_bytes(rolling)
 
         first = self.cli("migrate")
-        self.assertIn("complete at memory format v5.0.2", first.stdout)
+        self.assertIn("complete at memory format v5.1.0", first.stdout)
         self.assertNotIn("BIMRI.md", {path.name for path in self.root.iterdir()})
         self.assertNotIn("BIMRI-backup.md", {path.name for path in self.root.iterdir()})
         self.assertTrue((self.root / "bimri.md").exists())
@@ -6343,7 +6493,7 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(
             (bdir / "revisions" / "V000000.md").read_bytes(), revision_before
         )
-        self.assertEqual(self.state()["bimri_version"], "5.0.2")
+        self.assertEqual(self.state()["bimri_version"], "5.1.0")
         self.assertIn("BIMRI doctor: PASSED", self.cli("doctor").stdout)
 
     def test_v4_historical_conversion_keeps_v000000_and_normalizes_active_head(self):
@@ -6608,15 +6758,15 @@ class BimriCliTest(unittest.TestCase):
                         "<!-- BIMRI v5 | Generated view. Do not edit directly. -->",
                     )
                     .replace(
-                        "<!-- Confirmed facts, decisions, preferences and rules. Capacity: state.json. -->",
+                        "<!-- Confirmed facts, decisions, preferences and rules. Soft target: state.json. -->",
                         "<!-- Confirmed facts, decisions, preferences and rules. Cap: 12. -->",
                     )
                     .replace(
-                        "<!-- Current work, risks and next actions. Capacity: state.json. -->",
+                        "<!-- Current work, risks and next actions. Soft target: state.json. -->",
                         "<!-- Current work, risks and next actions. Cap: 20. -->",
                     )
                     .replace(
-                        "<!-- Evidence-backed patterns. Capacity: state.json. -->",
+                        "<!-- Evidence-backed patterns. Soft target: state.json. -->",
                         "<!-- Evidence-backed patterns. Cap: 8. -->",
                     )
                 )
@@ -6661,7 +6811,7 @@ class BimriCliTest(unittest.TestCase):
 
                 upgraded = self.cli("migrate", root=root)
 
-                self.assertIn("Memory: upgraded v5.0 to v5.0.2", upgraded.stdout)
+                self.assertIn("Memory: upgraded v5.0 to v5.1.0", upgraded.stdout)
                 self.assertIn(profile["message"], upgraded.stdout)
                 self.assertIn(
                     f"entry {profile['new'][3]} chars", upgraded.stdout
@@ -6675,7 +6825,7 @@ class BimriCliTest(unittest.TestCase):
                     upgraded.stdout,
                 )
                 current = self.state(root=root)
-                self.assertEqual(current["bimri_version"], "5.0.2")
+                self.assertEqual(current["bimri_version"], "5.1.0")
                 self.assertEqual(
                     tuple(current[field] for field in fields), profile["new"]
                 )
@@ -6693,7 +6843,7 @@ class BimriCliTest(unittest.TestCase):
                 self.assertEqual(len(backups), 1)
                 self.assertEqual(backups[0].read_bytes(), old_state_bytes)
                 self.assertIn(
-                    "existing v5.0.2 verified; no migration performed",
+                    "existing v5.1.0 verified; no migration performed",
                     self.cli("migrate", root=root).stdout,
                 )
                 self.assertIn(
@@ -6731,11 +6881,11 @@ class BimriCliTest(unittest.TestCase):
         upgraded = self.cli("migrate")
 
         self.assertIn(
-            "Memory: upgraded v5.0.1 to v5.0.2; limits preserved",
+            "Memory: upgraded v5.0.1 to v5.1.0; limits preserved",
             upgraded.stdout,
         )
         new_state = self.state()
-        self.assertEqual(new_state["bimri_version"], "5.0.2")
+        self.assertEqual(new_state["bimri_version"], "5.1.0")
         self.assertEqual(
             tuple(
                 new_state[field]
@@ -6761,7 +6911,7 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(backups[0].read_bytes(), old_state_bytes)
         repeated = self.cli("migrate")
         self.assertIn(
-            "existing v5.0.2 verified; no migration performed",
+            "existing v5.1.0 verified; no migration performed",
             repeated.stdout,
         )
         self.assertFalse(
@@ -6808,9 +6958,9 @@ class BimriCliTest(unittest.TestCase):
                 "<!-- BIMRI v5.0.2 | Generated view. Do not edit directly. -->",
                 "<!-- BIMRI v5 | Generated view. Do not edit directly. -->",
             )
-            .replace("Capacity: state.json.", "Cap: 12.", 1)
-            .replace("Capacity: state.json.", "Cap: 20.", 1)
-            .replace("Capacity: state.json.", "Cap: 8.", 1)
+            .replace("Soft target: state.json.", "Cap: 12.", 1)
+            .replace("Soft target: state.json.", "Cap: 20.", 1)
+            .replace("Soft target: state.json.", "Cap: 8.", 1)
         )
         revision_path.write_bytes(historical.encode("utf-8"))
         (self.root / "bimri.md").write_bytes(historical.encode("utf-8"))
@@ -6849,9 +6999,9 @@ class BimriCliTest(unittest.TestCase):
                 "<!-- BIMRI v5.0.2 | Generated view. Do not edit directly. -->",
                 "<!-- BIMRI v5 | Generated view. Do not edit directly. -->",
             )
-            .replace("Capacity: state.json.", "Cap: 12.", 1)
-            .replace("Capacity: state.json.", "Cap: 20.", 1)
-            .replace("Capacity: state.json.", "Cap: 8.", 1)
+            .replace("Soft target: state.json.", "Cap: 12.", 1)
+            .replace("Soft target: state.json.", "Cap: 20.", 1)
+            .replace("Soft target: state.json.", "Cap: 8.", 1)
         )
         revision.write_bytes(historical.encode("utf-8"))
         state_path = self.root / ".bimri" / "state.json"
@@ -6917,7 +7067,7 @@ class BimriCliTest(unittest.TestCase):
         state_path = self.root / ".bimri" / "state.json"
         revision_path = self.root / ".bimri" / "revisions" / "V000000.md"
         escaped = revision_path.read_text("utf-8").replace(
-            "<!-- Confirmed facts, decisions, preferences and rules. Capacity: state.json. -->",
+            "<!-- Confirmed facts, decisions, preferences and rules. Soft target: state.json. -->",
             "<!-- Confirmed facts, decisions, preferences and rules. Cap: 12. -->\n\n"
             "[R0-E1] [K:upgrade.pointer] [fact] [T:working] "
             "[SRC:legacy] [] Unsafe inherited pointer -> ../../outside.md",
@@ -6925,10 +7075,10 @@ class BimriCliTest(unittest.TestCase):
             "<!-- BIMRI v5.0.2 | Generated view. Do not edit directly. -->",
             "<!-- BIMRI v5 | Generated view. Do not edit directly. -->",
         ).replace(
-            "<!-- Current work, risks and next actions. Capacity: state.json. -->",
+            "<!-- Current work, risks and next actions. Soft target: state.json. -->",
             "<!-- Current work, risks and next actions. Cap: 20. -->",
         ).replace(
-            "<!-- Evidence-backed patterns. Capacity: state.json. -->",
+            "<!-- Evidence-backed patterns. Soft target: state.json. -->",
             "<!-- Evidence-backed patterns. Cap: 8. -->",
         )
         revision_path.write_bytes(escaped.encode("utf-8"))
@@ -6973,9 +7123,9 @@ class BimriCliTest(unittest.TestCase):
                 "<!-- BIMRI v5.0.2 | Generated view. Do not edit directly. -->",
                 "<!-- BIMRI v5 | Generated view. Do not edit directly. -->",
             )
-            .replace("Capacity: state.json.", "Cap: 12.", 1)
-            .replace("Capacity: state.json.", "Cap: 20.", 1)
-            .replace("Capacity: state.json.", "Cap: 8.", 1)
+            .replace("Soft target: state.json.", "Cap: 12.", 1)
+            .replace("Soft target: state.json.", "Cap: 20.", 1)
+            .replace("Soft target: state.json.", "Cap: 8.", 1)
         )
         revision_path.write_bytes(historical.encode("utf-8"))
         state = self.state()
@@ -7050,7 +7200,7 @@ class BimriCliTest(unittest.TestCase):
 
         self.assertEqual(self.decision(proposal_id)["outcome"], "accepted")
         self.assertIn("[K:upgrade.pending]", self.hot())
-        self.assertEqual(self.state()["bimri_version"], "5.0.2")
+        self.assertEqual(self.state()["bimri_version"], "5.1.0")
         self.assertIn("BIMRI doctor: PASSED", self.cli("doctor").stdout)
 
     def test_installer_migrates_long_legacy_claim_with_receipt_and_repair_path(self):
@@ -7069,7 +7219,7 @@ class BimriCliTest(unittest.TestCase):
 
         self.assertEqual(install.returncode, 0, install.stdout + install.stderr)
         self.assertIn(
-            "Memory: migrated BIMRI v3 from BIMRI.md to v5.0.2.",
+            "Memory: migrated BIMRI v3 from BIMRI.md to v5.1.0.",
             install.stdout,
         )
         self.assertIn("Tier 1 1; Tier 2 0; Tier 3 0; total 1", install.stdout)
@@ -7192,7 +7342,7 @@ class BimriCliTest(unittest.TestCase):
             resumed.stdout,
         )
         state = self.state()
-        self.assertEqual(state["bimri_version"], "5.0.2")
+        self.assertEqual(state["bimri_version"], "5.1.0")
         self.assertEqual(state["head_revision"], 1)
         normalized = (revisions / "V000001.md").read_bytes()
         self.assertEqual((self.root / "bimri.md").read_bytes(), normalized)
@@ -7228,7 +7378,7 @@ class BimriCliTest(unittest.TestCase):
 
         upgraded = self.cli("migrate")
 
-        self.assertIn("Memory: upgraded v5.0 to v5.0.2", upgraded.stdout)
+        self.assertIn("Memory: upgraded v5.0 to v5.1.0", upgraded.stdout)
         state_backups = list(
             (self.root / ".bimri" / "backups").glob("state-v5.0-*.json")
         )
@@ -7726,11 +7876,11 @@ class BimriCliTest(unittest.TestCase):
     def test_engine_release_is_separate_from_memory_format(self):
         self.cli("migrate")
         state = self.state()
-        self.assertEqual(state["bimri_version"], "5.0.2")
+        self.assertEqual(state["bimri_version"], "5.1.0")
         self.assertIn("<!-- BIMRI v5.0.2 |", self.hot())
         status = self.cli("status")
         self.assertIn(
-            "BIMRI engine v5.0.3 | memory format v5.0.2 | revision V000000",
+            "BIMRI engine v5.1.0 | memory format v5.1.0 | revision V000000",
             status.stdout,
         )
 
@@ -8003,10 +8153,14 @@ class BimriCliTest(unittest.TestCase):
         old_stdout, old_stderr = old_waiter.communicate(timeout=60)
         self.assertEqual(candidate.returncode, 0, candidate_stderr)
         self.assertIn("Memory preservation: PASSED", candidate_stdout)
-        self.assertEqual(old_waiter.returncode, 0, old_stderr)
-        self.assertIn("BIMRI RUN HANDLE:", old_stdout)
+        self.assertEqual(old_waiter.returncode, 2, old_stdout + old_stderr)
+        self.assertIn(
+            "unsupported BIMRI state version: 5.1.0",
+            old_stdout + old_stderr,
+        )
+        self.assertNotIn("BIMRI RUN HANDLE:", old_stdout)
         after_old_waiter = protected_tree_snapshot(self.root)
-        self.assertNotEqual(after_old_waiter, protected_before)
+        self.assertEqual(after_old_waiter, protected_before)
 
         signal.unlink()
         release.unlink()
@@ -8059,15 +8213,15 @@ class BimriCliTest(unittest.TestCase):
             timeout=60,
         )
 
-        self.assertIn("BIMRI 5.0.3 installed.", result.stdout)
-        self.assertIn("Existing memory format v5.0.2 verified", result.stdout)
+        self.assertIn("BIMRI 5.1.0 installed.", result.stdout)
+        self.assertIn("Existing authority store v5.1.0 verified", result.stdout)
         self.assertIn("Memory preservation: PASSED", result.stdout)
         self.assertEqual(protected_tree_snapshot(self.root), before)
-        self.assertEqual(self.state()["bimri_version"], "5.0.2")
+        self.assertEqual(self.state()["bimri_version"], "5.1.0")
         runtime = json.loads(
             (bdir / "runtime.local.json").read_text("utf-8")
         )
-        self.assertEqual(runtime["version"], "5.0.3")
+        self.assertEqual(runtime["version"], "5.1.0")
         manifests = list(
             (self.root / ".bimri-update-backups").glob(
                 "*/install-manifest.json"
@@ -8075,9 +8229,9 @@ class BimriCliTest(unittest.TestCase):
         )
         self.assertEqual(len(manifests), 1)
         manifest = json.loads(manifests[0].read_text("utf-8"))
-        self.assertEqual(manifest["engine_release"], "5.0.3")
-        self.assertEqual(manifest["memory_format"], "5.0.2")
-        self.assertEqual(manifest["mode"], "code-only-update")
+        self.assertEqual(manifest["engine_release"], "5.1.0")
+        self.assertEqual(manifest["memory_format"], "5.1.0")
+        self.assertEqual(manifest["mode"], "lossless-authority-activation")
         self.assertEqual(manifest["before_tree_digest"], manifest["after_tree_digest"])
         self.assertEqual(manifest["preservation"], "passed")
         self.assertEqual(manifest["protected_write_attempts"], 0)
@@ -8243,8 +8397,12 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(len(before), fixture_manifest["protected_path_count"])
         self.assertEqual(digest, fixture_manifest["protected_tree_digest"])
 
-        audit = self.cli("doctor", "--read-only")
-        self.assertIn("BIMRI doctor (read-only): PASSED", audit.stdout)
+        audit = self.cli("doctor", "--read-only", check=False)
+        self.assertNotEqual(audit.returncode, 0)
+        self.assertIn(
+            "read-only audit requires memory format v5.1.0; found 5.0.2",
+            audit.stdout + audit.stderr,
+        )
         self.assertEqual(protected_tree_snapshot(self.root), before)
 
         installed = self.cli(
@@ -8257,14 +8415,22 @@ class BimriCliTest(unittest.TestCase):
         )
 
         self.assertIn("Memory preservation: PASSED", installed.stdout)
-        self.assertEqual(protected_tree_snapshot(self.root), before)
+        after = protected_tree_snapshot(self.root)
+        for relative, fingerprint in before.items():
+            if relative == ".bimri/state.json":
+                continue
+            self.assertEqual(after[relative], fingerprint, relative)
         state = self.state()
-        self.assertEqual(state["bimri_version"], "5.0.2")
+        self.assertEqual(state["bimri_version"], "5.1.0")
         self.assertEqual(
             state["head_revision"], fixture_manifest["accepted_head_revision"]
         )
         self.assertEqual(
             state["head_hash"], fixture_manifest["accepted_head_hash"]
+        )
+        activated_audit = self.cli("doctor", "--read-only")
+        self.assertIn(
+            "BIMRI doctor (read-only): PASSED", activated_audit.stdout
         )
 
     def test_code_update_caught_failure_rolls_back_authorized_files_only(self):

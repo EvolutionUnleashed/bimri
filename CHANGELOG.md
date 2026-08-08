@@ -3,6 +3,35 @@
 This file records the public BIMRI architecture history. Historical instruction
 files are preserved under [`legacy/`](legacy/) and are not current installers.
 
+## 5.1.0
+
+- Restored normal Tier 1 authoring and confirmed-memory updates. Direct
+  `user/confirmed` proposals may create, promote, update, or close Tier 1 and
+  Tier 2 subjects without creating authority-policy conflicts; genuinely
+  incompatible cross-run writes to the same key remain concurrent conflicts.
+- Replaced hard per-tier counts with soft curation targets. The generated hot
+  view keeps its configurable byte ceiling, while valid writes are no longer
+  rejected because Tier 1 or Tier 2 reached an arbitrary line count.
+- Added deterministic Tier 2 cooling under byte pressure. Cooling changes
+  residency rather than truth: the exact current generation, stable key,
+  trust, source, and provenance remain retrievable. Maintenance no longer uses
+  unrelated global run starts as an ageing accelerator.
+- Made subject creation explicit with `--new-subject`. Exact-key `set` updates
+  keep one current subject and preserve every displaced generation. Unmatched
+  updates and unauthorized semantic changes remain durable held candidates
+  instead of disappearing or creating routine owner conflicts.
+- Added read-only exact-key and task-language recall across hot, cold-current,
+  replaced, and closed generations. Archived rows retain their stable key and
+  the derived index can be rebuilt without losing retrieval.
+- Made conflicts, deterministic no-ops, human resolutions, and interrupted
+  resolution recovery cold-aware. Their immutable snapshots remain valid after
+  later cooling or same-key work, without rolling current memory backwards.
+- Advanced mutable state and new authority artifacts to v5.1.0 while retaining
+  the readable v5.0.2 hot-memory grammar. Existing v5.0.2 installs preserve
+  `bimri.md`, accepted revisions, and immutable evidence byte-for-byte, back up
+  the exact old state, and activate v5.1 state transactionally so older engines
+  fail closed.
+
 ## 5.0.3
 
 - Made ordinary operation quiet. `start` and `hook-start` no longer replay

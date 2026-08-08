@@ -5,14 +5,14 @@
 
 ## Tier 1: Core Intelligence
 
-<!-- Confirmed facts, decisions, preferences and rules. Capacity: state.json. -->
+<!-- Confirmed facts, decisions, preferences and rules. Soft target: state.json. -->
 
 ## Tier 2: Active Context
 
-<!-- Current work, risks and next actions. Capacity: state.json. -->
+<!-- Current work, risks and next actions. Soft target: state.json. -->
 
 ## Tier 3: Pattern Recognition
 
-<!-- Evidence-backed patterns. Capacity: state.json. -->
+<!-- Evidence-backed patterns. Soft target: state.json. -->
 
 <!-- END BIMRI -->

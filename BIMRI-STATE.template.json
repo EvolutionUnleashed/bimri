@@ -1,5 +1,5 @@
 {
-  "bimri_version": "5.0.2",
+  "bimri_version": "5.1.0",
   "project_id": "unset",
   "cadence_class": "interactive",
   "run_count": 0,
@@ -10,6 +10,7 @@
   "active_runs": {},
   "session_runs": {},
   "run_dates": {},
+  "cold_current": {},
   "last_started_at": null,
   "last_closed_at": null,
   "prune_policy": "archive_only",
