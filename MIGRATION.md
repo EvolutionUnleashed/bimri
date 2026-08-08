@@ -1,8 +1,8 @@
-# BIMRI Migration and the v5.0.3 Code-Only Update
+# BIMRI Migration and the v5.1.0 Lifecycle Upgrade
 
-Engine v5.0.3 uses memory format v5.0.2. It automatically migrates explicitly
-versioned v1-v3 tiered
-Markdown and the engine-based v4 format. This canonical repository publicly
+Engine v5.1.0 uses authority format v5.1.0 while retaining the readable v5.0.2
+hot-memory grammar. It automatically migrates explicitly versioned v1-v3
+tiered Markdown and the engine-based v4 format. This canonical repository publicly
 distributed the original v1 and streamlined v3 instructions; the parser also
 accepts a valid v2 header. Migration preserves old material before creating v5
 state and stops when it cannot identify or interpret that material safely.
@@ -160,7 +160,8 @@ evidence. The v5 migration keeps these assets in place:
 - pattern IDs and evidence references;
 - existing log pointers;
 - project ID, cadence class, and archive policy;
-- active Tier 1, Tier 2, and Tier 3 caps and the maintenance flag threshold;
+- configured Tier 1, Tier 2, and Tier 3 values, which become soft targets, and
+  the maintenance flag threshold;
 - run dates; and
 - a run count at least as high as the old state or existing log numbers.
 
@@ -224,54 +225,64 @@ and relative paths to the state and memory backups.
 
 The v4 fields `maintenance_mode`, `tier2_hard`, and
 `auto_archive_threshold` are retired. Their values may remain in preserved
-backups, but they do not control v5 behavior. v5 maintenance is
-judgment-first, Tier 2 uses `tier2_max`, and archival requires an explicit
-accepted `close`.
+backups, but they do not control v5.1 behavior. Tier counts become soft
+curation targets. The byte-bounded hot working set uses non-destructive
+Tier 2 cooling, while an explicit accepted `close` remains a semantic removal.
 
 ## v5 Maintenance Upgrades
 
-### v5.0.2 memory + v5.0.3 engine: no migration
+### v5.0.2 memory to v5.1.0 authority
 
-An existing v5.0.2 store is already on the current memory and authority-record
-format. Installing engine v5.0.3 performs a code-only update after every old
-engine process has been externally stopped. It does not change state, limits,
-the generated-view header, the accepted head, revisions, proposals, decisions,
-conflicts, resolutions, archives, indexes, backups, migrations, recovery
-evidence, unknown files, or sparse-directory shape.
+An existing v5.0.2 store already uses the visible line grammar retained by
+v5.1. Public engine v5.0.3 deliberately retained that persisted version, so
+this is also its normal upgrade path. Installing v5.1.0 therefore preserves
+root `bimri.md`, the accepted head, every immutable revision, log, proposal,
+decision, conflict, resolution, archive, migration record, recovery artifact,
+and unknown owner file exactly. It does not collapse, rename, or infer semantic
+subjects during installation.
 
-The updater runs `doctor --read-only`, captures a complete protected manifest
-of `bimri.md` and every pre-existing `.bimri/` path except the lock and two
-host-local binding files, replaces only authorized package/adapter files, and
-requires the same protected manifest and accepted head before success. Its
-backup and receipt live in sibling `.bimri-update-backups/`, outside the memory
-tree. A divergent `bimri.md` or damaged governance is reported without healing
-or rewriting it. See [`INSTALL.md`](INSTALL.md) for the exact guard, rollback,
-and receipt contract.
+The mutable `state.json` is different. Under the existing engine lock and an
+explicit quiescent handoff, the updater validates the complete v5.0.2
+authority graph, copies the exact old state into the sibling
+`.bimri-update-backups/<timestamp>/` transaction, adds the v5.1 lifecycle
+fields, changes the state version to 5.1.0, and commits that state last. This
+immediately makes v5.0.3 fail closed instead of writing through v5.1 residency
+authority. A repeated or interrupted install resumes or rolls back
+idempotently from the prepared receipt.
 
-The old-process shutdown is a real precondition. The file lock cannot stop an
-already-loaded v5.0.2 process that waits during installation and writes after
-the new engine releases the lock. v5.0.3 adds no persisted writer fence and
-does not claim live-update safety.
+Before success, the updater proves that root `bimri.md`, the accepted head and
+hash, and every immutable/unknown pre-existing path remain byte-identical. It
+runs the installed engine's read-only doctor against the activated state and
+records both the old-state backup and the preservation digests. A divergent
+`bimri.md` or damaged core authority stops activation without healing or
+rewriting it. See [`INSTALL.md`](INSTALL.md) for the exact transaction and
+receipt contract.
 
-### v5.0 and v5.0.1 to memory format v5.0.2
+The old-process shutdown is a real precondition. The file lock cannot safely
+upgrade an already-loaded old process that resumes after installation. Once
+the quiescent transaction commits v5.1 state, any later v5.0.3 command rejects
+the unsupported state version before mutation.
 
-Existing v5.0 and v5.0.1 states upgrade automatically to v5.0.2 under the
-engine lock. Before changing state, the engine validates the complete source
-state and accepted head and preserves an exact content-addressed state backup
-under `.bimri/backups/`. Accepted historical revisions and existing governance
+### v5.0 and v5.0.1 to v5.1.0 authority
+
+Existing v5.0 and v5.0.1 states upgrade automatically under the engine lock.
+Before changing state, the engine validates the complete source state and
+accepted head and preserves an exact content-addressed state backup under
+`.bimri/backups/`. Accepted historical revisions and existing governance
 records are never rewritten. Historical v5.0 and v5.0.1 resolutions retain
-their original effect semantics.
+their original effect semantics. The readable hot grammar is normalized only
+through the existing v5.0.2-compatible metadata path.
 
-For v5.0, the capacity behavior introduced by v5.0.1 remains unchanged. If the
-complete active limit profile exactly matches the original v5.0 defaults, the
-upgrade adopts 20 Tier 1 entries, 40 Tier 2 entries, 12 Tier 3 entries, a
-500-character new-entry text cap, and a 49,152-byte hot view. If any v5.0 limit
-was customized, the complete custom profile is retained; the engine does not
-guess which individual values the owner meant to customize.
+For v5.0, if the complete stored profile exactly matches the original defaults,
+the upgrade adopts values of 20 for Tier 1, 40 for Tier 2, 12 for Tier 3, a
+500-character new-entry text ceiling, and a 49,152-byte hot view. Tier values
+become soft targets. If any v5.0 value was customized, the complete custom
+profile is retained; the engine does not guess which individual values the
+owner meant to customize.
 
-For v5.0.1, the complete active limit profile is preserved exactly. The
-v5.0.2 upgrade changes the state version and generated-view metadata, not the
-owner's capacity choices.
+For v5.0.1, the complete configured profile is preserved as soft curation
+targets. The v5.1 upgrade changes authority state and generated-view metadata,
+not the owner's stored values.
 
 When the active revision still contains a historical v5.0 or v5.0.1 header or
 fixed cap comments, the engine preserves that revision byte-for-byte and makes
@@ -291,7 +302,7 @@ State/head/metadata preflight failures stop before upgrade authority changes.
 
 Damage to a proposal, decision, conflict, or resolution does not authorize the
 engine to discard that record. When core state and the accepted head are valid,
-installation can complete the v5.0.2 engine and state/header upgrade while
+installation can complete the v5.1.0 authority upgrade while
 reporting `AUTHORITY RECOVERY NEEDED`. The install manifest records the
 recovery-required result. `start` remains available with a degraded brief, and
 `status` prints the full status but exits nonzero. Shared-memory commits remain
@@ -341,15 +352,15 @@ appears legacy, the engine recomputes the deterministic conversion. It resumes
 only when the existing artifacts are byte-identical to that conversion. Any
 mismatch stops without overwriting either version.
 
-If valid legacy memory already exceeds a v5 tier, byte, or new-entry text cap,
-migration
-preserves it and `doctor` reports a bounded-memory repair warning. Subsequent
-changes may only reduce inherited overflow without worsening another limit
-until all caps are satisfied.
+If valid legacy memory already exceeds the hot-view byte ceiling or inherited
+entry-text ceiling, migration preserves it and `doctor` reports a
+bounded-memory repair warning. Subsequent changes may only reduce inherited
+overflow without worsening another enforced bound. Legacy tier counts become
+soft targets and do not block new memory.
 
-The 49,152-byte generated-view cap is independent of the tier line caps and may
-bind first. Tier counts alone do not prove that converted memory is within the
-complete rendered-view bound.
+The 49,152-byte generated-view ceiling remains independent of tier counts.
+Tier counts alone do not prove that converted memory fits the complete
+rendered-view bound.
 
 ## Verify the Upgrade
 
@@ -363,7 +374,8 @@ Have the installing agent run:
 The agent should confirm:
 
 - `doctor` reports `PASSED`, or only the documented inherited-overflow warning;
-- the version is `5.0.2` and the head is `V000000` or later;
+- the authority version is `5.1.0`, the hot grammar is `5.0.2`, and the head
+  is `V000000` or later;
 - Tier 1, Tier 2, and Tier 3 counts are plausible;
 - expected legacy text appears in lowercase `bimri.md`;
 - the applicable migration record exists;

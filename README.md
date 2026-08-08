@@ -1,7 +1,7 @@
 # BIMRI: Portable Memory for Local Agents
 
-**Brief Interaction Memory and Retrieval Intelligence, engine v5.0.3. Memory
-and authority-record format: v5.0.2.**
+**Brief Interaction Memory and Retrieval Intelligence, engine and authority
+format v5.1.0. The readable hot-memory grammar remains v5.0.2.**
 
 BIMRI gives a project one durable memory that Claude, Codex, and other local
 agents can share without a server, database, account, or model-specific
@@ -86,10 +86,17 @@ Follow INSTALL.md, preserve my existing instructions and memory, and run the
 self-check.
 ```
 
-The installer command the agent runs is:
+For a fresh target or v1-v4 migration, the installer command is:
 
 ```text
 <verified-python> bimri-engine.py install --target /absolute/path/to/the/project
+```
+
+For any existing v5 store, stop every old engine process first and attest that
+external handoff explicitly:
+
+```text
+<verified-python> bimri-engine.py install --target /absolute/path/to/the/project --quiescent
 ```
 
 Existing BIMRI v1-v4 memory migrates automatically during installation. The
@@ -98,26 +105,32 @@ file, imported counts, converted patterns, backup location, and validation
 result. See
 [`MIGRATION.md`](MIGRATION.md) for preservation and rollback details.
 Existing v5.0 and v5.0.1 states also upgrade automatically. A stock v5.0 limit
-profile expands to the v5.0.1 capacity; custom v5.0 profiles remain custom.
-Every v5.0.1 limit remains unchanged during the v5.0.2 state and generated-view
-header upgrade. Earlier state bytes are backed up, and accepted revisions are
-preserved rather than rewritten.
+profile expands to the v5.0.1 profile; custom values remain custom and become
+soft curation targets. Earlier state bytes are backed up, and accepted
+revisions are preserved rather than rewritten.
 
-Updating an existing v5.0.2 store to engine v5.0.3 is a dedicated code-only
-operation. Stop every process running the old engine first, then invoke install
-with the mandatory `--quiescent` handoff attestation. The updater audits
-the accepted head without healing or rebuilding memory, protects `bimri.md`
-and every pre-existing path under `.bimri/`, and verifies that their path set,
-types, symlink targets, and bytes are unchanged before it reports success.
-State and all new authority records remain format v5.0.2; no memory migration,
-header change, limit change, reindex, or open-record rewrite occurs.
+Updating an existing v5.0.2 store to engine v5.1.0 uses a dedicated lossless
+authority-activation operation. Stop every process running the old engine, then
+invoke install with the mandatory `--quiescent` handoff attestation. The
+updater audits the accepted head without healing or rebuilding memory,
+records every pre-existing path, and verifies that `bimri.md`, the accepted
+head, and every immutable evidence/history path remain byte-identical. It backs
+up the exact old mutable state, then activates v5.1 state last so an older
+engine fails closed immediately. The readable hot-memory grammar and all
+legacy evidence remain unchanged.
+
+Engine v5.0.3 deliberately kept its persisted state at v5.0.2, so this is also
+the normal upgrade path from a public v5.0.3 installation.
 
 The v5 installer serializes with other v5 engine commands in the same lock
 domain. Before upgrading any earlier version, disable the old Claude Cowork
 Global Instructions and stop every agent using that memory. Earlier versions
 write files directly and cannot participate in the v5 lock protocol.
 If installation fails its self-check, the installer restores the files it
-touched and reports the exact `.bimri/install-backups/<timestamp>/` directory.
+touched and reports the applicable exact rollback directory:
+`.bimri/install-backups/<timestamp>/` for initialization or legacy migration,
+or the sibling `.bimri-update-backups/<timestamp>/` for an existing v5
+authority update.
 
 This repository is the canonical BIMRI project. It originally distributed the
 v1 and v3 Claude Cowork Global Instructions, so many existing folders still
@@ -144,13 +157,37 @@ The engine prints a brief and a handle such as `R000042`. The agent reads
 ```
 
 Anything that should affect future runs is proposed under a stable,
-lowercase key:
+lowercase key. Creating a genuinely new subject is explicit:
 
 ```text
 <verified-python> bimri-engine.py propose --run R000042 --tier 2 \
+  --new-subject \
   --key checkout.next-step \
   --text "Verify retry behavior under concurrent requests."
 ```
+
+Update that subject by reusing the same key and omitting `--new-subject`:
+
+```text
+<verified-python> bimri-engine.py propose --run R000043 --tier 2 \
+  --key checkout.next-step \
+  --text "Retry behavior is verified; monitor the next production run."
+```
+
+An update replaces the current generation in one hot-memory slot. The
+displaced generation remains retrievable as immutable history. Omitted kind,
+importance, status, tags, and pattern fields inherit from the current subject,
+so a text update does not silently reset its lifecycle metadata. An unmatched
+update cannot silently create a near-duplicate subject. The engine preserves
+it as a held candidate for classification and requires an explicit
+new-subject proposal before it can become current. After classification, the
+agent resubmits the intent under the matching canonical key or with
+`--new-subject` when the subject is genuinely distinct; the held record remains
+as an audit trail rather than becoming a recurring prompt.
+
+Use one key for one independently changing question. If a new value makes the
+old answer false, update that key. Put changing versions, dates, and status in
+the memory text rather than minting a new key for each value.
 
 Proposals are applied by `sync` or `close`:
 
@@ -180,20 +217,25 @@ outcomes.
 
 ## Memory and Trust
 
-Hot memory has three bounded tiers:
+Hot memory has three tiers with soft curation targets:
 
-| Tier | Contents | Default cap | Curation target |
+| Tier | Contents | Default soft target | Curation target |
 | --- | --- | ---: | ---: |
 | 1 | Durable facts, decisions, preferences, and operating rules | 20 | ~3,000 tokens |
 | 2 | Active work, risks, and next actions | 40 | ~6,000 tokens |
 | 3 | Evidence-backed patterns with a falsifier | 12 | ~3,000 tokens |
 
-The generated view has an independent 49,152-byte cap, roughly 12,000 tokens
-for ordinary English text. Tokenization and UTF-8 width vary, so bytes are the
-enforced limit. The 3k/6k/3k tier split is an elastic curation target, not three
-hard partitions: spare capacity can serve another tier while the total byte
-cap and line caps still hold. Entry metadata, tags, pointers, and text all
-consume the same budget.
+The generated view has an independent 49,152-byte context ceiling, roughly
+12,000 tokens for ordinary English text. Tokenization and UTF-8 width vary, so
+bytes are the enforced limit. The tier counts never reject a valid memory
+write. They tell maintenance how the hot working set is distributed.
+
+When an incoming change would cross the byte ceiling, BIMRI cools the
+lowest-retention eligible Tier 2 subjects into keyed cold-current storage
+before admitting it. Cooling changes residency only: the subject remains
+current, keeps its source and trust, and stays available to retrieval.
+Exact-key updates and explicit closes preserve the displaced generation as
+history. Tier 1 is never cooled automatically.
 
 These bounds govern only the generated hot view. The durable long tail is not
 subject to a 12,000-token total-memory ceiling.
@@ -225,13 +267,17 @@ one can commit and the later incompatible candidate becomes a concurrent
 conflict. Independent keys and exact compatible effects merge without owner
 involvement. A stale run is told to sync before it can create a proposal.
 
-v5.0.3 temporarily contains the two areas that previously produced most
-routine interruptions. New Tier 1 subjects and promotions into Tier 1 are
-rejected before any proposal or conflict is written. Replacement or removal
-of confirmed Tier 1 or Tier 2 memory is also rejected before mutation. Journal
-the evidence, keep current material in working Tier 2, and ask the owner in the
-current conversation when semantic judgment is needed. A separate pull-based
-core-review model is planned for a minor release.
+Direct human statements can create or update confirmed Tier 1 and Tier 2
+memory immediately with `--source user --trust confirmed`. Agent and external
+claims retain their actual source and working trust. They cannot silently
+replace a confirmed human rule, preference, or decision. The attempted change
+remains a durable held candidate, creates no routine owner conflict, and does
+not prevent residency maintenance from cooling an eligible Tier 2 subject.
+Tier 1 admission or promotion likewise requires direct human confirmation;
+unconfirmed agent/external claims remain current in Tier 2, while an attempted
+Tier 1 admission is preserved quietly as a held candidate.
+If the owner directly adopts that change, the agent submits the exact owner
+statement as a normal `--source user --trust confirmed` update.
 
 ## Pull Review and Human Resolution
 
@@ -301,7 +347,7 @@ Runtime files:
 | Path | Purpose |
 | --- | --- |
 | `bimri.md` | Small generated view of the accepted head revision. |
-| `.bimri/state.json` | Revision pointer, counters, and active run registry. |
+| `.bimri/state.json` | Hot-revision pointer, keyed cold-current state, counters, and active runs. |
 | `.bimri/log/` | One append-only Markdown journal per run. |
 | `.bimri/revisions/` | Immutable snapshots of accepted shared memory. |
 | `.bimri/proposals/` | Immutable structured changes submitted by agents. |
@@ -309,7 +355,7 @@ Runtime files:
 | `.bimri/conflicts/` | Open and historical questions for the human. |
 | `.bimri/resolutions/` | Durable human choices. |
 | `.bimri/index.tsv` | Rebuildable, non-authoritative retrieval index. |
-| `.bimri/archive/` | Closed memory with provenance. |
+| `.bimri/archive/` | Cooled-current, replaced, and closed generations with provenance. |
 | `.bimri/backups/` | Migration and pre-change safety copies. |
 | `.bimri/recovery/` | Direct edits, damaged authority evidence, and restore receipts. |
 | `.bimri/migrations/` | Completed migration records. |
@@ -331,19 +377,22 @@ files carry transparent bookkeeping. All of it stays in the project folder.
 <verified-python> bimri-engine.py migrate
 ```
 
-`doctor` validates state, revisions, memory grammar, caps, proposals,
-decisions, conflicts, resolutions, pointers, active logs, and index shape.
-`maintain` reports aging or closed Tier 2 entries for judgment. The engine
-archives through explicit accepted changes and never silently hard-deletes
-memory. A close is archived durably before its entry can disappear from the
-accepted view.
+`doctor` validates state, revisions, memory grammar, proposals, decisions,
+conflicts, resolutions, cold-current archive records, pointers, active logs, the byte ceiling,
+and index shape. `maintain` reports the deterministic retention order and
+current byte pressure without asking the owner to curate routine ageing.
+Admission-time maintenance performs any required non-destructive cooling under
+the engine lock and never turns capacity work into an owner conflict. A close,
+replacement, or cool is preserved durably before an entry can disappear from
+the hot view.
 
-The immutable revision named by `.bimri/state.json` is authoritative.
-`bimri.md` is generated from it and `.bimri/index.tsv` is a derived cache. If a
-generated-view refresh fails after state commits, the engine warns; the durable
-change remains accepted and the next engine command retries the refresh. An
-index failure cannot change a memory decision and can be repaired with
-`index`.
+The current memory authority is the union of the immutable hot revision named
+by `.bimri/state.json` and the state's archive-bound cold-current mapping.
+`bimri.md` is generated from the hot revision and `.bimri/index.tsv` is a
+derived cache. If a generated-view refresh fails after state commits, the
+engine warns; the durable change remains accepted and the next engine command
+retries the refresh. An index failure cannot change a memory decision and can
+be repaired with `index`.
 
 If any process edits `bimri.md` directly, including CRLF-only changes, invalid
 UTF-8, or replacing it with an empty file, the next synchronizing command

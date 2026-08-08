@@ -1,4 +1,4 @@
-# BIMRI Protocol Release v5.0.3
+# BIMRI Protocol Release v5.1.0
 
 Brief Interaction Memory and Retrieval Intelligence.
 
@@ -6,10 +6,11 @@ This document is the normative protocol for a portable, human-governed BIMRI
 memory folder. `AGENTS.md` is the short runtime adapter. `bimri-engine.py` is
 the reference implementation.
 
-The engine release is v5.0.3. The persisted memory, state, and authority-record
-format remains v5.0.2. Unless a section explicitly discusses an older artifact,
-all persisted `bimri_version` fields and the generated-memory format in this
-release are v5.0.2.
+The engine, mutable state, and new authority-record format are v5.1.0. The
+readable `bimri.md` line grammar and header remain v5.0.2 because v5.1 changes
+subject lifecycle and residency rather than the visible line syntax. Frozen
+v5.0-v5.0.2 artifacts retain their original version and are validated against
+their original contract.
 
 The words MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY describe interoperability
 requirements.
@@ -71,7 +72,7 @@ state has this shape:
 ```text
 bimri.md                       generated view of accepted memory
 .bimri/
-  state.json                   head pointer, counters, active runs
+  state.json                   head pointer, counters, active runs, cold-current
   engine.lock                  local cross-process lock
   index.tsv                    rebuildable retrieval index
   log/R000001.md               append-only log for one run
@@ -80,24 +81,37 @@ bimri.md                       generated view of accepted memory
   decisions/R000001-Q001.json  proposal outcomes
   conflicts/C000001.json       human questions
   resolutions/C000001.json     human answers
-  archive/YYYY-MM.md           closed entries with provenance
+  archive/YYYY-MM.md           cooled, replaced, and closed generations
   backups/                     migration and safety copies
   recovery/                    exact damage evidence and restore receipts
   migrations/                  completed migration records
   inbox/                       optional unconsolidated notes
 ```
 
-The canonical shared memory content is the immutable revision named by
-`state.json` fields `head_revision` and `head_hash`. `bimri.md` MUST be
-generated from that revision. It is a convenient current view, not an
-independent write target. If its refresh fails after the revision and state are
-durable, the implementation MUST preserve the accepted state, warn, and retry
-the generated view on the next engine command.
+The canonical current memory is the union of the immutable hot revision named
+by `state.json` fields `head_revision` and `head_hash` and the cold-current
+mapping in `state.json`, whose exact lines MUST be backed by matching immutable
+`cooled` archive records. A stable key MUST be current in at most one
+residency. `bimri.md` MUST be generated from the hot revision. It is a
+convenient working-set view, not an independent write target. If its refresh
+fails after the revision and state are durable, the implementation MUST
+preserve the accepted state, warn, and retry the generated view on the next
+engine command.
 
-Run logs, proposals, revisions, conflicts, and resolutions are durable records.
-`index.tsv` is a derived, non-authoritative cache. It MAY be deleted and rebuilt
-from canonical memory, logs, and archives; an index failure MUST NOT alter the
-outcome of a memory mutation.
+Each `cold_current` value MUST contain exactly `entry_id`, `key`, `tier`,
+`raw_line`, `line_hash`, `archived_by`, and `archived_on`. The map key and the
+embedded `key` MUST agree. The raw line, its hash, and the named cooling
+proposal/date MUST bind exactly one immutable `[cooled]` archive row. Current
+keys and entry IDs MUST be unique across the complete hot-plus-cold set; a
+subject cannot occupy both residencies. Every pointer inside a cold line is
+subject to the same containment checks as a hot line. Normal load MUST fail
+closed on an overlap, duplicate ID, unsafe pointer, or broken archive binding
+before it performs any canonical write.
+
+Run logs, proposals, revisions, archived cold records, conflicts, and resolutions are
+durable records. `index.tsv` is a derived, non-authoritative cache. It MAY be
+deleted and rebuilt from canonical hot and cold memory, logs, and archives; an
+index failure MUST NOT alter the outcome of a memory mutation.
 
 ## 4. Identifiers and Stable Keys
 
@@ -124,9 +138,15 @@ grammar is:
 
 Keys are at most 80 characters. Examples are `project.goal`,
 `checkout.next-step`, and `style.concise`. Before creating a key, an agent
-MUST search the current memory and index for the same subject and reuse its
-key. Key reuse is what makes concurrent updates to one subject structurally
-detectable.
+MUST search hot, cold-current, and historical memory for the same subject and
+reuse its key. Creation requires explicit `--new-subject` authority. A normal
+`set` is update-only and MUST NOT turn an unmatched or misspelled key into a
+second current subject. Its immutable proposal MUST remain as a held candidate
+for later classification. Key reuse is what makes concurrent updates to one
+subject structurally detectable. If a new value makes the old answer false for
+the same question, the writer MUST update the same key. Changing values such as
+versions, dates, and workflow status belong in the entry text rather than in a
+new key, unless the versioned event itself is the permanent subject.
 
 ## 5. Generated Memory Grammar
 
@@ -144,16 +164,16 @@ inherited v1-v4 text without truncation when its complete serialized entry,
 including metadata, is at most 4,096 characters; Section 14 defines the
 required overflow behavior. The entire generated view defaults to 49,152
 bytes, roughly 12,000 tokens for ordinary English text. Bytes are normative
-because tokenization and UTF-8 width vary. The byte cap is independent of the
-tier line caps and is the primary bound on the complete rendered view.
-Metadata, tags, pointers, and text all consume that budget, so the byte cap may
-bind before any tier reaches its line cap. Tier 1 and Tier 2 entries may carry
-at most 12 unique normalized tags.
+because tokenization and UTF-8 width vary. The byte ceiling is the normative
+bound on the complete rendered view. Tier counts are soft curation targets and
+MUST NOT reject a valid proposal. Metadata, tags, pointers, and text all
+consume the byte budget. Tier 1 and Tier 2 entries may carry at most 12 unique
+normalized tags.
 
 ### 5.1 Tier 1
 
 Tier 1 contains durable facts, decisions, preferences, and operating rules.
-Its default cap is 20, with an elastic curation target of roughly 3,000 tokens.
+Its default soft target is 20, with a curation target of roughly 3,000 tokens.
 
 ```text
 [R000042-E003] [K:project.goal] [decision] [T:confirmed] [SRC:user] [strategy] Ship a portable local memory layer. -> .bimri/log/R000042.md
@@ -169,8 +189,8 @@ Normative field order:
 
 ### 5.2 Tier 2
 
-Tier 2 contains active work, risks, watches, and next actions. Its default cap
-is 40, with an elastic curation target of roughly 6,000 tokens.
+Tier 2 contains active work, risks, watches, and next actions. Its default soft
+target is 40, with a curation target of roughly 6,000 tokens.
 
 ```text
 [R000044-E001] [K:checkout.next-step] [I:3] [active] [T:working] [SRC:agent] [F:R000044] [L:R000044] [checkout] Verify retry behavior. -> .bimri/log/R000044.md
@@ -187,8 +207,8 @@ subject. `L` records the most recent run that touched it.
 
 ### 5.3 Tier 3
 
-Tier 3 contains evidence-backed, falsifiable patterns. Its default cap is 12,
-with an elastic curation target of roughly 3,000 tokens.
+Tier 3 contains evidence-backed, falsifiable patterns. Its default soft target
+is 12, with a curation target of roughly 3,000 tokens.
 
 ```text
 [P0004] [K:workflow.arch-first] [developing] [obs:4] [ev:R000004-E002,R000009-E001] The owner simplifies architecture before adding features. | Falsify: repeated preference for feature speed over structure.
@@ -301,17 +321,25 @@ Shared state changes MUST be submitted as proposals:
 
 ```text
 <verified-python> bimri-engine.py propose --run R000042 --operation set --tier 2 \
-  --key checkout.next-step --importance 3 --status active \
+  --new-subject --key checkout.next-step --importance 3 --status active \
   --trust working --source agent --tags checkout \
   --text "Verify retry behavior."
 ```
 
 Operations are:
 
-- `set`: add or replace a keyed memory entry.
+- `set`: replace an existing keyed subject. With `--new-subject`, create a
+  subject only when the exact key is absent from hot and cold-current memory.
+  An update inherits omitted kind, importance, status, tags, and pattern
+  fields from the current generation.
 - `touch`: refresh an existing Tier 2 entry's last-relevant run.
-- `close`: remove an existing keyed entry from hot memory and append it to the
-  archive with provenance.
+- `close`: remove an existing hot or cold-current keyed subject from current
+  memory and append its exact generation to the archive with provenance.
+
+Cooling is an internal residency operation. It removes an eligible Tier 2
+line from the generated hot view while keeping that exact generation current
+in an immutable keyed archive record selected by state. Cooling MUST NOT change text, source, trust,
+semantic status, or subject identity.
 
 Before its first durable write, `propose` MUST validate the full rendered
 candidate against the accepted head while holding the engine lock. The run's
@@ -319,31 +347,60 @@ key hash MUST equal the live keyed hash; unrelated head movement is allowed.
 A stale keyed run MUST be told to `sync`, and an effect that already equals the
 live state MUST create no proposal or conflict.
 
+When the overall head has advanced, preflight MUST reconstruct the subject at
+the run's exact base revision across both hot and cold residency. A historical
+cold base is valid only when immutable archive bytes and an accepted cooling
+decision bind it at or before that revision. This derivation also covers a
+genesis or migrated hot entry cooled by an unrelated later proposal; an orphan
+archive row is never sufficient. Unrelated-key commits MUST NOT make an
+unchanged cold subject appear absent or stale. A true same-key generation
+change still requires `sync` before a new proposal is created.
+
 An admitted proposal binds `base_revision` to that current accepted head and
 `base_hash` to the exact keyed line hash, or literal `absent`. It also carries
 one optional backward-readable `preflight_receipt` containing engine release
-v5.0.3, accepted-head revision and hash, and observed key hash. The receipt
+v5.1.0, accepted-head revision and hash, and observed key hash. The receipt
 MUST validate against the named immutable revision before the proposal may
 create a new concurrent conflict. Proposal records remain immutable.
+
+Every v5.1 proposal carries an explicit Boolean `new_subject`. A proposal based
+on cold-current memory additionally records `base_storage: cold` and binds the
+immutable cooling archive proposal and date. A held decision records exactly
+one of `classification-required`, `confirmed-user-authority-required`,
+`tier1-human-authority-required`, `capacity-residency-required`, or
+`owner-resolution-in-progress`. The final two may be assigned at apply time
+when pressure or an applying owner resolution appeared after preflight. Held
+decisions preserve the immutable intent, do not change current truth, do not
+reserve hot residency, and are not replayed as owner conflicts.
 
 An exact same-run retry for the same key and normalized caller-authored intent
 MUST return the existing proposal ID without changing any durable file. A
 different pending same-run intent MUST be rejected until `sync` advances that
 run's base.
 
-v5.0.3 MUST reject before mutation: a new Tier 1 key; promotion into Tier 1;
-`set` or `close` against confirmed Tier 1 or Tier 2; public `source=system`;
-and any `--needs-human` proposal. These are agent actions, not memory
-conflicts. Semantic uncertainty is raised conversationally before an agent
-submits a chosen memory change. Confirmed Tier 2 `touch` remains valid only
-when it preserves every live authority/content field and safely refreshes
-recency.
+Direct `user/confirmed` evidence MAY create, promote, update, or close Tier 1
+and Tier 2 subjects. Agent and external claims retain their original source
+and working trust. They MUST NOT silently replace a confirmed human rule,
+preference, or decision. Public `source=system` and `--needs-human` remain
+invalid; semantic uncertainty is raised conversationally before an agent
+submits the chosen memory change. These authority decisions are agent actions,
+not owner conflicts. An unauthorized semantic change remains a durable held
+candidate and MUST NOT displace current truth, vanish at preflight, or replay
+as a start-time prompt.
 
-Preflight MUST dry-run grammar and active caps and reserve positive entry and
-byte capacity for pending proposals and actionable unresolved candidates.
-Pending closes or reductions receive no capacity credit. Reservation remains
-until the effect is accepted, strictly satisfied, or rejected by an existing
-human resolution.
+A held classification candidate is resolved by a later normal proposal, never
+by mutating the held record. After exact-key discovery, the agent MUST resubmit
+the intent under the canonical key or explicitly use `--new-subject` when it is
+genuinely distinct. If the human directly adopts a held change to confirmed
+memory, the new accepted proposal is `user/confirmed`; the original held
+candidate remains immutable evidence of its actual origin.
+
+Preflight MUST dry-run grammar and the total byte effect. Tier counts MUST NOT
+reserve or deny capacity. If the incoming hot effect would cross the byte
+ceiling, application MUST cool safe Tier 2 current subjects under the same
+lock before admitting it. When no safe victim exists, the immutable intent
+MUST remain durable and current truth MUST remain unchanged; this condition
+MUST NOT allocate or repeatedly announce an owner conflict.
 
 ### 7.4 Sync and Close
 
@@ -364,11 +421,11 @@ that run from `active_runs`:
 Outcomes are `success`, `partial`, `overflow`, or `fail`. The log receives one
 `[OUTCOME:...]` line and one `[CLOSED:...]` line.
 
-Command summaries MUST distinguish newly applied effects, already
-satisfied/no-change effects, newly created concurrent-conflict generations,
-and agent-action failures. An existing contested decision MUST NOT be counted
-or announced again. A normal close with no new exceptional event SHOULD remain
-compact.
+Command summaries MUST distinguish newly applied effects, durable held
+candidates, already satisfied/no-change effects, newly created
+concurrent-conflict generations, and agent-action failures. An existing held
+or contested decision MUST NOT be counted or announced again. A normal close
+with no new exceptional event SHOULD remain compact.
 
 When more than one run is active, an implementation MUST refuse a close that
 does not identify its target. Closing run A MUST NOT close, stamp, mutate, or
@@ -398,15 +455,16 @@ section. A conforming commit performs these steps:
 2. read the immutable head revision and verify its SHA-256 against
    `head_hash`;
 3. parse and validate the memory grammar;
-4. validate the immutable proposal and v5.0.3 preflight receipt;
+4. validate the immutable proposal and its versioned preflight receipt;
 5. locate the current entry by stable key or explicit target ID;
 6. test the operation's complete exact effect before any policy or conflict
    gate, including exact archive provenance for an absent `close`;
 7. prove any later same-key writer through accepted decision/revision
    authority and require a different run handle before creating a conflict;
-8. render and validate IDs, keys, caps, entry length, and total byte limit;
+8. render and validate IDs, keys, entry length, and total byte ceiling;
 9. write a durable per-proposal `applying` intent;
-10. for a `close`, durably append the exact removed line to its archive;
+10. durably preserve every replaced, closed, or cooled generation before it
+    leaves the hot view;
 11. exclusively write a new immutable revision;
 12. atomically update `state.json` to that revision;
 13. attempt to regenerate `bimri.md`, warning if the durable state has
@@ -425,16 +483,43 @@ either the unchanged base or the already-rendered result. Reprocessing a
 final proposal decision MUST return the same effective decision rather than
 applying it twice.
 
+A v5.1 proposal `applying` decision freezes `base_storage`, `base_line`, and
+the matching `base_hash` at decision time. A cold base also freezes
+`base_archive_proposal_id` and `base_archive_date`. Validation binds hot bases
+to `revision_before` and cold bases to exact immutable cooling and revision
+authority. A crash before commit MUST therefore remain recoverable for
+`set`, `touch`, and `close`, including when a hot-observed base cooled without
+changing before the proposal reached apply.
+
+Interrupted proposal recovery may silently finalize a committed effect only
+when the atomic state head is the exact intended revision,
+`last_revision_reason` is exactly `accepted <proposal-id>`, and that revision's
+hot-or-cold current effect matches the proposal. An archive row by itself is
+never commit authority. Accepted and resolved set/touch cooling evidence MUST
+be current at the exact recorded revision; a later cooling event cannot
+retroactively validate earlier history. Accepted close evidence MUST name the
+closing proposal and be bounded by the decision revision. A compatible close
+or touch no-op may use a different accepted writer only when that writer is
+same-key, same-base, and no later than the no-op's recorded revision.
+
+A v5.1 non-resolution `noop` decision MUST freeze the accepted effect as
+`effect_storage`, `effect_line`, and `effect_hash`. When the effect is cold it
+MUST also bind `effect_archive_proposal_id` and `effect_archive_date`. This
+immutable evidence allows a redundant set or touch to remain valid after later
+residency or same-key movement; validation MUST NOT reinterpret a historical
+decision through the latest `cold_current` map.
+
 If a later accepted change has replaced the visible effect of an interrupted
 `applying` decision, an unreceipted or unproven candidate MUST fail as
 agent/recovery work rather than allocate a new owner conflict. The presence of
 an otherwise valid revision file is not sufficient: the process may have
 crashed after creating it but before advancing `state.json`.
 
-For any accepted operation that removes an entry from hot memory, the archive
-record MUST be durable before `state.json` can point to a revision where that
-entry is absent. Archive replay MUST be idempotent. If archival fails, the
-accepted head MUST continue to contain the entry.
+For any accepted operation that removes an entry from hot or cold-current
+memory, the archive record MUST be durable before `state.json` can point to
+authority where that entry is absent. Archive replay MUST be idempotent. If
+archival fails, the previously accepted current generation MUST remain
+authoritative.
 
 An existing `[BY:<proposal>]` marker proves replay only when a strict archive
 record parse confirms the required reason and exact removed raw line. A marker
@@ -456,7 +541,7 @@ validate:
 
 1. two different run handles observed the same keyed state before either
    competing effect became canonical;
-2. the candidate's v5.0.3 preflight receipt binds its proposal base, accepted
+2. the candidate's versioned preflight receipt binds its proposal base, accepted
    head hash, and keyed hash;
 3. accepted decision and revision authority proves that another run committed
    a later change to that exact key before the candidate applied;
@@ -468,7 +553,7 @@ The stored type remains `stale-base` for v5.0.2 format compatibility. The
 owner-facing label MUST be **Concurrent edit** or **Concurrent removal**.
 Actor labels and run-number ordering MUST NOT select a winner.
 
-Tier 1 admission, confirmed-memory policy, semantic uncertainty, caps,
+Tier 1 admission, confirmed-memory policy, semantic uncertainty, residency,
 validation, same-run reuse, and stale state detected before proposal creation
 MUST NOT allocate a conflict. Compatible exact sets and closes become strict
 no-ops. A compatible intervening Tier 2 touch becomes a causal no-op only when
@@ -496,7 +581,7 @@ MUST NOT absorb later edit evidence; a later edit receives a new conflict.
 
 The engine cannot reliably prove that differently keyed statements contradict
 one another, refer to the same real-world entity, or reflect a changed human
-preference. In v5.0.3 an agent MUST ask the owner conversationally before
+preference. In v5.1.0 an agent MUST ask the owner conversationally before
 submitting its chosen memory change. Public `--needs-human` proposals are
 rejected before mutation and MUST NOT become memory conflicts.
 
@@ -523,7 +608,15 @@ metadata, labelled creation snapshot, proposed post-state, run, actor,
 timestamp, source, trust, base revision, rationale, why reconciliation stopped,
 and the consequence of keeping live or choosing each internal proposal ID.
 Raw storage lines MUST NOT be the primary choice. A close always says that it
-removes the key from hot memory and preserves the exact prior line in archive.
+removes the key from current memory and preserves the exact prior line in
+archive.
+
+A v5.1 conflict records `extra.current_storage`. When its live snapshot is
+cold, it MUST also record `extra.current_archive_proposal_id` and
+`extra.current_archive_date`, and those fields MUST bind exactly one immutable
+cooled row matching the snapshot. Review, conflict validation, and resolution
+MUST present and compare the same current subject whether it is hot or cold.
+They MUST NOT describe a cold-current subject as absent.
 
 After the owner chooses, the agent records one of:
 
@@ -540,10 +633,39 @@ records confirmed trust where the tier supports it without changing the
 proposal's source. `current` keeps the current value. `dismiss` closes the
 question without changing memory. Before applying a choice, the engine writes
 a durable `applying` resolution intent, records `authority: human-asserted`,
-and verifies the recorded hash of every candidate proposal. A crash can resume
-the exact choice after the owner re-attests it. Once status becomes `resolved`,
-the record is durable decision authority and repeated resolution is
-idempotent without another write.
+and verifies the recorded hash of every candidate proposal. After a crash, the
+engine MAY silently finalize only when the atomic state head, exact revision
+reason, and chosen effect prove that the already-attested choice committed.
+Otherwise the agent repeats the exact choice with `--human-approved` after the
+owner re-attests it. Once status becomes `resolved`, the record is durable
+decision authority and repeated resolution is idempotent without another
+write.
+
+Every v5.1 `applying` or `failed` resolution records
+`intended_revision_after` before the chosen effect can commit. A recovered
+`resolved` record retains that field and its `revision_after` MUST equal it.
+Recovery validates the exact precommitted historical effect for proposal,
+`current`, and `dismiss` choices. Later pressure cooling or same-key work MUST
+NOT strand an applying resolution, rewrite its historical choice, or roll back
+newer current memory.
+
+While a proposal-choice resolution has an uncommitted intended effect,
+unrelated subjects remain writable and a later same-key intent MUST be durably
+held as `owner-resolution-in-progress` rather than overwrite the pending owner
+choice or become another owner conflict. Recovery silently finalizes an exact
+effect already proven committed. If the intended effect did not commit, the
+owner must re-attest the exact choice before recovery may rebind it to the next
+revision. `current` and `dismiss` choices remain bound to their precommitted
+historical snapshot even if later same-key work proceeds. Recovery MUST
+preserve any later accepted current generation.
+
+An immutable revision file whose number was predeclared by an applying
+resolution but whose state pointer never committed is an orphan, not accepted
+authority. Before retrying an uncommitted proposal choice, recovery MUST choose
+the exact next available revision number and update the applying intent to that
+number before force-apply. The final `revision_after` then binds the revision
+that actually committed; an orphan filename MUST NOT strand the resolution or
+be mistaken for owner-approved memory.
 
 If the chosen candidate's exact effect is reflected at the current head, a
 first explicit human-approved resolution MAY complete without a new memory
@@ -576,13 +698,15 @@ map MUST exactly match the candidate list.
 Decision fields are outcome-specific: `applying` requires its base hash and
 pre-commit revision; every final outcome requires a revision; `contested`
 requires a conflict ID; and `noop` requires either a deterministic reason or a
-validated human resolution. A resolution MUST explicitly state `applying`,
+validated human resolution. `held` requires one normalized authority or
+classification reason and MUST leave the current subject unchanged. A
+resolution MUST explicitly state `applying`,
 `failed`, or `resolved`; a missing status MUST NOT default to resolved. Its
 candidate list and choice MUST match the immutable conflict snapshot.
-Every v5.0.2 resolution MUST contain `authority: human-asserted`. Historical
-v5.0 and v5.0.1 resolutions without that field remain valid under their legacy
-effect semantics; deleting the field from a v5.0.2 record MUST fail
-validation.
+Every v5.0.2 or v5.1.0 resolution MUST contain
+`authority: human-asserted`. Historical v5.0 and v5.0.1 resolutions without
+that field remain valid under their legacy effect semantics; deleting the
+field from a v5.0.2 or v5.1.0 record MUST fail validation.
 
 A terminal decision MUST be bound to its claimed immutable revision. The
 revision MUST exist at or before the canonical head and MUST contain the
@@ -642,48 +766,60 @@ until the complete authority graph validates. A replacement that fails semantic
 validation MUST remain behind its existing stub and MUST NOT receive a restore
 receipt. These flags are attestations of owner review, not authentication.
 
-## 10. Caps, Maintenance, and Archival
+## 10. Hot Working Set, Maintenance, and Archival
 
 Default limits are:
 
 | Limit | Value |
 | --- | ---: |
-| Tier 1 lines | 20 |
-| Tier 2 lines | 40 |
-| Tier 3 lines | 12 |
+| Tier 1 soft target | 20 |
+| Tier 2 soft target | 40 |
+| Tier 3 soft target | 12 |
 | Entry text | 500 characters |
 | Inherited v1-v4 serialized entry | 4,096 characters |
 | Generated view | 49,152 bytes |
 
-The accepted head MUST satisfy the active tier caps and byte limit. A proposal
-that would violate them MUST fail preflight as an agent action and MUST NOT
-allocate a conflict. A migrated legacy head that already exceeds a limit MAY temporarily retain inherited overflow;
-the engine permits only changes that strictly reduce at least one overflow
-without worsening another until the head is within all limits.
+The tier targets are diagnostics, never admission limits. A Tier 1, Tier 2, or
+Tier 3 count above its target MAY be reported by `status`, but MUST NOT reject
+an otherwise valid proposal.
 
-The 49,152-byte generated-view cap is enforced independently and may bind
-before the line caps. Tier line caps are maximum counts, not a promise that
-every tier can simultaneously hold its maximum number of maximum-length
-entries.
+The 49,152-byte generated-view ceiling is enforced because every hot entry is
+injected into agent context. Before an incoming effect crosses it, the engine
+MUST cool deterministic eligible Tier 2 subjects until the effect fits. Tier 1
+MUST NOT be cooled automatically. Cooling preserves the exact current
+generation in an exact keyed archive record and MUST be reversible through an explicit
+future `set` or `touch`, which rehydrates the subject while applying the normal
+keyed operation. If no eligible Tier 2 subject exists, the submitted
+intent remains durable without changing current truth.
 
 The target allocation is roughly 3,000 tokens for Tier 1, 6,000 for Tier 2,
-and 3,000 for Tier 3. These targets guide curation and are not hard byte
-partitions. Unused capacity MAY serve another tier while the total byte cap,
-line caps, and entry grammar remain satisfied. Evidence and history outside
-the generated view remain durable in logs, revisions, decisions, resolutions,
-archives, and backups.
+and 3,000 for Tier 3. These targets guide curation rather than partitioning
+memory. Evidence and history outside the generated view remain durable in
+logs, revisions, cooled archive records, decisions, resolutions, archives, and backups.
 
-`maintain` computes cadence-aware freshness for Tier 2 and reports entries that
-need judgment. It does not silently decide their meaning. Closed entries leave
-hot memory through an accepted `close` proposal and are appended to monthly
-archive files with the responsible proposal ID. BIMRI MUST NOT automatically
-hard-delete durable memory.
+`maintain` MUST report a retention forecast using wall-clock age since last
+relevant use, importance, semantic status, and deterministic key ordering. It
+does not change residency or ask the owner to curate routine ageing. The same
+ordering drives admission-time pressure cooling among existing residents under
+the engine lock. The incoming Tier 2 generation is cooled only when existing
+eligible residents cannot make it fit. Global run count MUST NOT accelerate
+ageing because unrelated concurrent agent starts are not evidence that a
+subject became stale. Pressure maintenance changes residency only, raises no
+owner conflict, and never hard-deletes memory. Closed entries leave current
+memory through an accepted `close`; replaced and closed generations remain
+immutable history.
+
+State compaction MAY retain only a bounded tail of otherwise unreferenced run
+dates, but it MUST preserve the dates for every first/last run referenced by a
+current hot or cold Tier 2 subject and for active/session runs. Crossing the
+history window MUST NOT erase a current subject's ageing clock. If an upgraded
+or previously compacted store already lacks a referenced date, retention MUST
+rank that subject conservatively as oldest/coolable, never as maximally fresh.
 
 Legacy fields `maintenance_mode`, `tier2_hard`, and
 `auto_archive_threshold` are retired in v5. An implementation MAY retain and
 validate them while reading or migrating older state, but their values MUST NOT
-change v5 behavior. Maintenance remains judgment-first, Tier 2 uses
-`tier2_max`, and archival occurs only through an explicit accepted `close`.
+change v5.1 behavior. The legacy fields do not control admission or residency.
 
 ## 11. Retrieval
 
@@ -693,10 +829,20 @@ change v5 behavior. Maintenance remains judgment-first, Tier 2 uses
 id  key  loc  trust  source  status  file  headline
 ```
 
-The engine indexes generated memory, journal IDs, and archived IDs. An agent
-SHOULD locate an ID or key in the index, then read only the referenced log or
-archive. Because the index is derived, corruption or deletion of the index is
-repaired with:
+The engine indexes hot memory, keyed cold-current records, journal IDs, and
+historical generations. Archived rows MUST retain the stable key. An agent can
+retrieve an exact subject or discover one from task language without knowing
+its key:
+
+```text
+<verified-python> bimri-engine.py recall --key checkout.next-step
+<verified-python> bimri-engine.py recall --query "checkout retries"
+```
+
+Current generations rank ahead of replaced and closed history. Retrieval is
+read-only and MUST NOT silently rehydrate or touch a subject. Repeating the
+same query MUST NOT game residency. Because the index is derived, corruption
+or deletion of the index is repaired with:
 
 ```text
 <verified-python> bimri-engine.py index
@@ -727,7 +873,7 @@ accepted head/hash, memory grammar, pointer containment, authority records, and
 the authority graph, and reports a divergent generated view in place.
 
 Validation covers strict state parsing, revision grammar, the head hash,
-generated memory grammar and caps, duplicate IDs and keys, proposal and
+generated memory grammar and enforced bounds, duplicate IDs and keys, proposal and
 decision schemas and effects, proposal base-snapshot binding, conflict
 candidate hashes, resolution authority and revision effects, quarantine
 evidence, restore receipts, manual-edit evidence, active-run logs, pointer
@@ -759,15 +905,24 @@ changes; operating-system permissions define the security boundary.
 
 ## 13. Installation and Adapters
 
-An installing agent runs:
+For a fresh target or v1-v4 migration, an installing agent runs:
 
 ```text
 <verified-python> bimri-engine.py install --target /absolute/project/path
 ```
 
-The installer copies the core files, merges a marked BIMRI block into existing
-`AGENTS.md` and `CLAUDE.md`, initializes or migrates memory, rebuilds the index,
-and runs the self-check. It SHOULD complete without asking setup questions.
+For any existing v5 store, the agent first stops every old engine process and
+then records that external handoff explicitly:
+
+```text
+<verified-python> bimri-engine.py install --target /absolute/project/path --quiescent
+```
+
+The installer copies the core files and merges a marked BIMRI block into
+existing `AGENTS.md` and `CLAUDE.md`. Fresh and legacy targets initialize or
+migrate memory, rebuild the index, and run the self-check. An existing v5 target
+uses the non-mutating/lossless update path below and does not rebuild memory or
+the index. Installation SHOULD complete without asking setup questions.
 Before its first target mutation, the reference installer MUST re-launch
 itself through its resolved absolute `sys.executable` with a fresh private
 sentinel, enforce a bounded timeout, and validate the exact non-empty response.
@@ -786,49 +941,61 @@ Python changes. Their absolute paths MUST NOT be copied into shared
 instructions or configuration.
 
 When `.bimri/state.json` declares memory format v5.0.2, installation MUST take
-a dedicated code-only branch before target-directory creation, layout filling,
-or any mutating load. Every process executing the old engine MUST first be
-externally stopped; the lock does not fence an already-loaded old writer and
-v5.0.3 adds no persisted writer-version fence. Under a no-layout lock, the
-installer MUST reclassify the target and run the read-only audit.
+a dedicated lossless authority-activation branch before any normal mutating
+load. Every process executing the old engine MUST first be externally stopped;
+the lock cannot safely upgrade an already-loaded old writer. Under the
+existing no-layout lock, the installer MUST reclassify the target and run the
+v5.0.2 read-only audit.
 
-The code-only transaction MUST protect root `bimri.md` and every pre-existing
-path below `.bimri/`, including directories, unknown files, symlinks, recovery
-litter, unreferenced revisions, and install backups. Only `engine.lock`,
-`runtime.local.json`, and `hooks.claude.local.json` are excluded. A complete
-manifest records path type and exact file bytes/hash or symlink target, plus
-the accepted head and hash. Every mutation primitive and rollback operation
-MUST pass one destination guard that rejects writes, directory creation,
-replace, rename, unlink, or removal against a protected destination.
+The transaction MUST inventory root `bimri.md` and every pre-existing path
+below `.bimri/`, including unknown files, symlinks, recovery litter,
+unreferenced revisions, and install backups. Only `engine.lock`,
+`runtime.local.json`, and `hooks.claude.local.json` are excluded from content
+preservation. The complete manifest records path type and exact file hash or
+symlink target, plus the accepted head and hash.
 
 Authorized writes are limited to package files, marked BIMRI adapter blocks,
-the two host bindings, and a sibling `.bimri-update-backups/<timestamp>/`
-program backup/manifest. Package files MUST be staged and verified, with the
-engine replaced last. A caught failure restores every authorized path without
-repairing memory. Abrupt interruption MUST be safely resumable or restorable
-on repeat install.
+the two host bindings, a sibling `.bimri-update-backups/<timestamp>/`
+transaction, and mutable `state.json`. The transaction MUST copy the exact old
+state to that sibling backup before mutation. It MUST preserve root `bimri.md`,
+all accepted revisions, logs, proposals, decisions, conflicts, resolutions,
+archives, migrations, recovery evidence, and unknown owner files byte-for-byte.
+Package files are staged and verified; the v5.1 state version and lifecycle
+fields commit last. A caught failure restores the old state and every
+authorized program/adapter path. Abrupt interruption MUST be resumable or
+restorable on repeat install.
 
-Before lock release, the installer MUST recompute the complete protected
-manifest, require identical path sets/types/targets/hashes and the same state
-bytes and accepted head, run the new read-only audit, and report zero protected
-write attempts. Engine release becomes v5.0.3; state, generated header, and all
-new authority records remain format v5.0.2. No migration, limit change,
-reindex, open-record rewrite, or generated-view healing is permitted.
+Before lock release, the installer MUST require identical `bimri.md` bytes,
+immutable path sets/types/targets/hashes, accepted head, and head hash. It MUST
+validate v5.1 state, run the installed engine's read-only audit, and record the
+old-state backup and before/after preservation digests. New state and authority
+records use v5.1.0 while the generated hot-memory grammar remains v5.0.2. The
+committed state version is the writer fence: v5.0.3 MUST reject it before
+mutation.
 
-For an existing v5 target, every installer mutation MUST be serialized by the
-same engine lock used by runtime commands. Before upgrading v1-v4, every old
-writer and command MUST stop because the v5 installer cannot assume that an
-earlier runtime participates in the same lock protocol. Any v1-v3 Claude
-Cowork Global Instructions MUST be disabled before v5 operation begins; they
-directly edit the old hot-memory file and are incompatible with the generated
-v5 view.
+The update receipt mode is `lossless-authority-activation`. It MUST bind the
+exact `state-v5.0.2-exact.json` backup, before/after state hashes, the
+v5.0.2-to-v5.1.0 version transition, and passed hot/head/immutable-evidence
+preservation results. Prepared, terminal, and rollback-incomplete receipts are
+validated against the engine/version contract that created each receipt, so a
+valid interrupted or completed public v5.0.3 update cannot block recovery by a
+v5.1 installer.
+
+For an existing v5 target, `--quiescent` is mandatory and every installer
+mutation MUST be serialized by the same engine lock used by runtime commands.
+The flag records the caller's external handoff; the lock cannot fence an
+already-loaded old process. Before upgrading v1-v4, every old writer and
+command MUST stop because the v5 installer cannot assume that an earlier
+runtime participates in the same lock protocol. Any v1-v3 Claude Cowork Global
+Instructions MUST be disabled before v5 operation begins; they directly edit
+the old hot-memory file and are incompatible with the generated v5 view.
 
 For initialization and memory-format migration, the installer MUST preserve existing target files in
 `.bimri/install-backups/<timestamp>/`. If the self-check fails, it MUST restore
 the touched paths to their pre-install state and report that exact backup
 directory in the error. A canonical state, revision, migration, or runtime
 self-check failure remains rollback-worthy. If an existing v5 target has
-valid core state but damaged governance records, v5.0.3 installation
+valid core state but damaged governance records, v5.1.0 installation
 MAY instead complete in an explicit `installed-recovery-required` state so the
 new quarantine and restore commands remain available. It MUST print each
 blocker and MUST NOT claim that doctor passed.
@@ -913,8 +1080,8 @@ installation or migration begins and remain so through validation.
 
 ### 14.3 v5.0
 
-A v5.0 state MUST be validated and backed up before its version changes to
-v5.0.2. When its complete limit profile exactly equals the stock v5.0 profile,
+A v5.0 state MUST be validated and backed up before its authority version
+changes to v5.1.0. When its complete limit profile exactly equals the stock v5.0 profile,
 the implementation SHOULD adopt the expanded defaults introduced in v5.0.1.
 If any limit differs, the
 complete custom profile MUST be preserved. The upgrade receipt MUST state
@@ -928,22 +1095,23 @@ manual-edit recovery and human-conflict path before that view is refreshed.
 
 ### 14.4 v5.0.1
 
-A v5.0.1 state MUST be validated and backed up before its version changes to
-v5.0.2. Its complete limit profile MUST remain unchanged. The active generated
-view header moves to v5.0.2 in a metadata-only immutable revision while the
-old revision remains untouched. v5.0 and v5.0.1 proposals, decisions,
-conflicts, and resolutions remain compatible artifacts. Historical resolutions
-without the v5.0.2 authority field retain legacy source-rewrite semantics;
-new resolutions use v5.0.2 provenance-preserving semantics.
+A v5.0.1 state MUST be validated and backed up before its authority version
+changes to v5.1.0. Its complete configured profile MUST remain unchanged as
+soft curation targets. The active generated-view header moves to v5.0.2 in a
+metadata-only immutable revision while the old revision remains untouched.
+v5.0 and v5.0.1 proposals, decisions, conflicts, and resolutions remain
+compatible artifacts. Historical resolutions without the v5.0.2 authority
+field retain legacy source-rewrite semantics; new resolutions use v5.1.0
+provenance-preserving semantics.
 
 ### 14.5 v5.0.2
 
-Memory format v5.0.2 is current under engine release v5.0.3. Updating from the
-v5.0.2 engine MUST use the code-only preservation contract in Section 13 and
-MUST NOT invoke memory migration. Historical and newly written proposals,
-decisions, conflicts, resolutions, quarantine records, restore records, state,
-and generated-memory headers retain their v5.0.2 format values. The optional
-validated proposal `preflight_receipt` is the only authority-record extension
-in this release.
+Updating a v5.0.2 store MUST use the lossless authority-activation contract in
+Section 13. Root `bimri.md` and every immutable v5.0.2 artifact retain their
+exact bytes and version values. Mutable state advances to v5.1.0 with an exact
+old-state backup and new lifecycle fields. New proposals, decisions,
+resolutions, quarantine records, and restore records use v5.1.0. Validators
+MUST continue to enforce the frozen v5.0.2 artifact and preflight-receipt
+contracts rather than comparing them blindly with the running engine release.
 
-<!-- END BIMRI PROTOCOL RELEASE v5.0.3 | MEMORY FORMAT v5.0.2 -->
+<!-- END BIMRI PROTOCOL RELEASE v5.1.0 | AUTHORITY FORMAT v5.1.0 | HOT GRAMMAR v5.0.2 -->

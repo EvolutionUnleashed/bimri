@@ -253,6 +253,86 @@ def main():
             return result
 
         engine.write_generated_view = crash_after_view
+    elif mode == "resolution_crash_after_force_apply":
+        original = engine.apply_proposal
+
+        def crash_after_resolution_effect(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if kwargs.get("force") and kwargs.get("human_confirmed"):
+                os._exit(106)
+            return result
+
+        engine.apply_proposal = crash_after_resolution_effect
+    elif mode == "resolution_crash_after_applying_record":
+        original = engine.atomic_write_json
+        resolution_dir = root / ".bimri" / "resolutions"
+
+        def crash_after_applying_resolution(path, data):
+            result = original(path, data)
+            candidate = Path(path)
+            if (
+                candidate.parent == resolution_dir
+                and isinstance(data, dict)
+                and data.get("status") == "applying"
+            ):
+                os._exit(107)
+            return result
+
+        engine.atomic_write_json = crash_after_applying_resolution
+    elif mode == "proposal_crash_after_applying_decision":
+        original = engine.write_decision
+
+        def crash_after_applying_decision(
+            paths, proposal_id, outcome, *args, **kwargs
+        ):
+            result = original(
+                paths, proposal_id, outcome, *args, **kwargs
+            )
+            if outcome == "applying":
+                os._exit(108)
+            return result
+
+        engine.write_decision = crash_after_applying_decision
+    elif mode == "resolution_crash_after_cooled_archive":
+        original = engine.append_archive
+
+        def crash_after_cooled_archive(
+            paths, proposal_id, raw_line, reason
+        ):
+            result = original(paths, proposal_id, raw_line, reason)
+            if reason == "cooled":
+                os._exit(109)
+            return result
+
+        engine.append_archive = crash_after_cooled_archive
+    elif mode == "cooling_crash_after_archive_august":
+        engine.today = lambda: "2026-08-31"
+        original = engine.append_archive
+
+        def crash_after_august_cooled_archive(
+            paths, proposal_id, raw_line, reason
+        ):
+            result = original(paths, proposal_id, raw_line, reason)
+            if reason == "cooled":
+                os._exit(109)
+            return result
+
+        engine.append_archive = crash_after_august_cooled_archive
+    elif mode == "cooling_retry_september":
+        engine.today = lambda: "2026-09-01"
+    elif mode == "missing_head_before_state_save":
+        original = engine.save_state
+        removed = False
+
+        def remove_head_then_save(paths, state):
+            nonlocal removed
+            if not removed and len(state.get("run_dates", {})) > 500:
+                head = engine.revision_path(paths, state["head_revision"])
+                head.unlink()
+                removed = True
+            return original(paths, state)
+
+        engine.save_state = remove_head_then_save
     elif mode == "view_permission":
         original = engine.atomic_write_text
         hot = root / "bimri.md"
@@ -353,6 +433,44 @@ def main():
             return original(policy, source, destination)
 
         engine.CodeUpdateDestinationPolicy.rename = crash_before_prepared_publish
+    elif mode in {
+        "code_update_crash_before_activation_state",
+        "code_update_crash_after_activation_state",
+    }:
+        try:
+            target = Path(command[command.index("--target") + 1]).resolve()
+        except (ValueError, IndexError) as exc:
+            raise SystemExit("code-update fault requires --target") from exc
+        if mode == "code_update_crash_before_activation_state":
+            original_write_json = engine.CodeUpdateDestinationPolicy.write_json
+
+            def crash_after_activation_receipt(policy, destination, data):
+                result = original_write_json(policy, destination, data)
+                if (
+                    Path(destination).name == "install-manifest.json"
+                    and data.get("status") == "prepared-for-authority-activation"
+                ):
+                    os._exit(104)
+                return result
+
+            engine.CodeUpdateDestinationPolicy.write_json = (
+                crash_after_activation_receipt
+            )
+        else:
+            original_atomic_write_json = engine.atomic_write_json
+            state_path = target / ".bimri" / "state.json"
+
+            def crash_after_activation_state(path, data):
+                result = original_atomic_write_json(path, data)
+                if (
+                    Path(path).resolve() == state_path
+                    and isinstance(data, dict)
+                    and data.get("bimri_version") == engine.MEMORY_FORMAT_VERSION
+                ):
+                    os._exit(105)
+                return result
+
+            engine.atomic_write_json = crash_after_activation_state
     elif mode == "code_update_fail_one_rollback_restore":
         try:
             target = Path(command[command.index("--target") + 1]).resolve()
@@ -476,7 +594,7 @@ def main():
         original = engine.read_only_store_audit
         audit_count = 0
 
-        def attempt_same_byte_audit_write(paths):
+        def attempt_same_byte_audit_write(paths, *args, **kwargs):
             nonlocal audit_count
             audit_count += 1
             selected = (
@@ -488,7 +606,7 @@ def main():
                 engine.atomic_write_text(
                     paths.hot, paths.hot.read_text(encoding="utf-8")
                 )
-            return original(paths)
+            return original(paths, *args, **kwargs)
 
         engine.read_only_store_audit = attempt_same_byte_audit_write
     elif mode == "code_update_protected_attempt":

@@ -1,8 +1,8 @@
-"""Release-gate regressions for BIMRI engine v5.0.3.
+"""Owner-visible release regressions for BIMRI engine v5.1.0.
 
 These tests focus on the owner-visible contract: routine work stays quiet,
-only proven incompatible concurrency becomes a pull-based review, and an
-existing 5.0.2 memory tree is byte-for-byte preserved during installation.
+only proven incompatible concurrency becomes a pull-based review, tier targets
+never block normal work, and current-version installation preserves memory.
 """
 
 import hashlib
@@ -22,7 +22,7 @@ RUN_RE = re.compile(r"=== BIMRI BRIEF (R\d{6})")
 PROPOSAL_RE = re.compile(r"\bR\d{6}-Q\d{3}\b")
 
 
-class V503ReleaseGateTest(unittest.TestCase):
+class V510ReleaseContractTest(unittest.TestCase):
     maxDiff = None
 
     def setUp(self):
@@ -60,6 +60,15 @@ class V503ReleaseGateTest(unittest.TestCase):
         return match.group(1), result
 
     def propose(self, run_id, key, text, *extra, root=None, check=True):
+        project = Path(root or self.root)
+        hot = project / "bimri.md"
+        state_path = project / ".bimri" / "state.json"
+        current = hot.is_file() and f"[K:{key}]" in hot.read_text("utf-8")
+        if state_path.is_file():
+            current = current or key in json.loads(
+                state_path.read_text("utf-8")
+            ).get("cold_current", {})
+        admission = () if current else ("--new-subject",)
         result = self.cli(
             "propose",
             "--run",
@@ -70,6 +79,7 @@ class V503ReleaseGateTest(unittest.TestCase):
             key,
             "--text",
             text,
+            *admission,
             *extra,
             root=root,
             check=check,
@@ -127,13 +137,13 @@ class V503ReleaseGateTest(unittest.TestCase):
             Path(root or self.root).joinpath(".bimri", "conflicts").glob("C*.json")
         )
 
-    def test_engine_release_is_distinct_from_memory_format(self):
+    def test_authority_release_is_distinct_from_hot_grammar(self):
         self.start()
         status = self.cli("status")
 
-        self.assertIn("BIMRI engine v5.0.3", status.stdout)
-        self.assertIn("memory format v5.0.2", status.stdout)
-        self.assertEqual(self.state()["bimri_version"], "5.0.2")
+        self.assertIn("BIMRI engine v5.1.0", status.stdout)
+        self.assertIn("memory format v5.1.0", status.stdout)
+        self.assertEqual(self.state()["bimri_version"], "5.1.0")
         self.assertIn(
             "<!-- BIMRI v5.0.2 | Generated view.",
             (self.root / "bimri.md").read_text("utf-8"),
@@ -168,7 +178,7 @@ class V503ReleaseGateTest(unittest.TestCase):
         self.cli("sync", "--run", run_id)
         self.assertEqual(self.conflict_files(), [])
 
-    def test_routine_rejections_never_allocate_owner_conflicts(self):
+    def test_normal_tier1_admission_and_invalid_inputs_do_not_create_conflicts(self):
         first_run, _ = self.start("writer-one")
         stale_run, _ = self.start("writer-two")
         self.propose(first_run, "serial.key", "Canonical")
@@ -183,19 +193,25 @@ class V503ReleaseGateTest(unittest.TestCase):
         self.assertEqual(stale.returncode, 2)
         self.assertIn("sync", stale.stderr.lower())
 
+        admitted = self.cli(
+            "propose", "--run", first_run, "--tier", "1", "--kind",
+            "fact", "--new-subject", "--key", "core.new", "--text",
+            "Admit direct owner memory", "--source", "user", "--trust",
+            "confirmed",
+        )
+        self.assertEqual(admitted.returncode, 0)
+        self.cli("sync", "--run", first_run)
+        self.assertIn("[K:core.new]", (self.root / "bimri.md").read_text("utf-8"))
+
         rejected_commands = (
             (
-                "propose", "--run", first_run, "--tier", "1", "--kind",
-                "fact", "--key", "core.new", "--text", "Do not admit",
-            ),
-            (
                 "propose", "--run", first_run, "--tier", "2", "--key",
-                "semantic.question", "--text", "Do not stage", "--needs-human",
+                "semantic.question", "--new-subject", "--text", "Do not stage", "--needs-human",
                 "--question", "Which value?",
             ),
             (
                 "propose", "--run", first_run, "--tier", "2", "--key",
-                "system.public", "--text", "Do not stage", "--source", "system",
+                "system.public", "--new-subject", "--text", "Do not stage", "--source", "system",
             ),
         )
         for command in rejected_commands:
@@ -289,7 +305,7 @@ class V503ReleaseGateTest(unittest.TestCase):
         self.assertEqual(self.state()["conflict_count"], 0)
         self.assertEqual(self.state()["head_revision"], 25)
 
-    def test_code_only_update_and_read_only_doctor_preserve_memory_tree(self):
+    def test_current_version_update_and_read_only_doctor_preserve_memory_tree(self):
         target = self.root / "installed-project"
         self.start("existing", root=target)
         unknown = target / ".bimri" / "owner-unknown.bin"
@@ -308,11 +324,11 @@ class V503ReleaseGateTest(unittest.TestCase):
             root=REPOSITORY,
             timeout=60,
         )
-        self.assertIn("BIMRI 5.0.3 installed.", installed.stdout)
-        self.assertIn("no migration performed", installed.stdout)
+        self.assertIn("BIMRI 5.1.0 installed.", installed.stdout)
+        self.assertIn("Existing authority store v5.1.0 verified", installed.stdout)
         self.assertIn("Memory preservation: PASSED", installed.stdout)
         self.assertEqual(self.authority_snapshot(target), before)
-        self.assertEqual(self.state(target)["bimri_version"], "5.0.2")
+        self.assertEqual(self.state(target)["bimri_version"], "5.1.0")
 
         installed_engine = target / "bimri-engine.py"
         second_audit = self.cli(
