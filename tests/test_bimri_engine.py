@@ -351,7 +351,7 @@ class BimriCliTest(unittest.TestCase):
             "engine_path": engine_path,
             "host_bound": True,
             "python_executable": python_executable,
-            "version": "5.1.0",
+            "version": "5.1.1",
         })
 
         template = json.loads(
@@ -376,7 +376,7 @@ class BimriCliTest(unittest.TestCase):
                 "${CLAUDE_PROJECT_DIR}/bimri-engine.py",
                 subcommand,
             ])
-            self.assertEqual(command["timeout"], 15)
+            self.assertEqual(command["timeout"], 90)
         self.assertNotIn("__BIMRI_VERIFIED_PYTHON__", json.dumps(hooks))
         self.assertFalse((target / ".claude").exists())
 
@@ -772,7 +772,11 @@ class BimriCliTest(unittest.TestCase):
             return {
                 path.relative_to(self.root).as_posix(): path.read_bytes()
                 for path in self.root.rglob("*")
-                if path.is_file() and not path.is_symlink()
+                if (
+                    path.is_file()
+                    and not path.is_symlink()
+                    and path != self.root / ".bimri" / "audit-witness.json"
+                )
             }
 
         before_retry = snapshot()
@@ -893,7 +897,7 @@ class BimriCliTest(unittest.TestCase):
         receipt = proposal["preflight_receipt"]
         self.assertEqual(proposal["bimri_version"], "5.1.0")
         self.assertEqual(proposal["base_revision"], state["head_revision"])
-        self.assertEqual(receipt["engine_release"], "5.1.0")
+        self.assertEqual(receipt["engine_release"], "5.1.1")
         self.assertEqual(receipt["observed_head_revision"], state["head_revision"])
         self.assertEqual(receipt["observed_head_hash"], state["head_hash"])
         self.assertEqual(receipt["observed_key_hash"], "absent")
@@ -2118,8 +2122,9 @@ class BimriCliTest(unittest.TestCase):
             crash_candidate,
             "--human-approved",
         )
-        self.assertIn(
-            f"already resolved as {crash_candidate}", recovered.stdout
+        self.assertRegex(
+            recovered.stdout,
+            f"(already resolved as|resolved with) {crash_candidate}",
         )
         self.assertEqual(self.state()["head_revision"], revision_with_effect)
         recovered_resolution = json.loads(
@@ -2579,8 +2584,10 @@ class BimriCliTest(unittest.TestCase):
         )
 
         close_replay = self.cli("sync", "--run", closer)
+        # Finalizing this run's own interrupted apply counts as applied; the
+        # asserts below prove no second effect landed.
         self.assertIn(
-            "applied 0, held candidates 0, already satisfied/no change 0",
+            "applied 1, held candidates 0, already satisfied/no change 0",
             close_replay.stdout,
         )
         self.assertEqual(self.state()["head_revision"], close_revision)
@@ -2653,7 +2660,7 @@ class BimriCliTest(unittest.TestCase):
 
         touch_replay = self.cli("sync", "--run", toucher)
         self.assertIn(
-            "applied 0, held candidates 0, already satisfied/no change 0",
+            "applied 1, held candidates 0, already satisfied/no change 0",
             touch_replay.stdout,
         )
         self.assertEqual(self.state()["head_revision"], touch_revision)
@@ -2801,7 +2808,7 @@ class BimriCliTest(unittest.TestCase):
         )
         self.assertIn("Launch on Monday.", self.hot())
         self.assertNotIn("Launch on Tuesday.", self.hot())
-        recall = self.cli("recall", "--key", "launch.date")
+        recall = self.cli("recall", "--key", "launch.date", "--history")
         self.assertIn("Launch on Monday.", recall.stdout)
         self.assertIn("HELD", recall.stdout)
         self.assertIn("Launch on Tuesday.", recall.stdout)
@@ -3301,8 +3308,19 @@ class BimriCliTest(unittest.TestCase):
         orphan_status = self.cli("status", root=orphan_root, check=False)
         self.assertEqual(orphan_status.returncode, 1)
         self.assertIn(f"resolution {orphan_id}", orphan_status.stdout)
-        degraded = self.cli("start", "--actor", "recovery", root=orphan_root)
-        self.assertIn("AUTHORITY RECOVERY NEEDED", degraded.stdout)
+        # Start is a warm entry point: at-rest damage behind a valid
+        # checkpoint surfaces at the explicit full-audit boundaries (status
+        # above, doctor, authority writes), not on the warm path.
+        warm_start = self.cli("start", "--actor", "recovery", root=orphan_root)
+        self.assertNotIn("AUTHORITY RECOVERY NEEDED", warm_start.stdout)
+        boundary = self.cli(
+            "doctor", "--read-only", root=orphan_root, check=False
+        )
+        self.assertEqual(boundary.returncode, 1)
+        self.assertIn(
+            f"resolution {orphan_id}",
+            boundary.stdout + boundary.stderr,
+        )
         self.cli(
             "quarantine-authority",
             "--kind",
@@ -3930,10 +3948,52 @@ class BimriCliTest(unittest.TestCase):
                         + "\n"
                     ).encode("utf-8")
                 )
-                self.assertIn(
-                    "Open conflicts: 1",
-                    self.cli("status", root=root).stdout,
-                )
+                if resolution_status == "failed":
+                    status = self.cli("status", root=root, check=False)
+                    self.assertEqual(status.returncode, 1)
+                    self.assertIn("Open conflicts: 1", status.stdout)
+                    self.assertIn("AUTHORITY RECOVERY NEEDED", status.stdout)
+                    self.assertIn("explicit retry", status.stdout)
+                    blocked = self.cli(
+                        "sync",
+                        "--run",
+                        second_run,
+                        root=root,
+                        check=False,
+                    )
+                    self.assertEqual(blocked.returncode, 2)
+                    self.assertIn(
+                        "authority recovery is required", blocked.stderr
+                    )
+                    self.assertFalse(
+                        root.joinpath(
+                            ".bimri",
+                            "decisions",
+                            f"{second_candidate}.json",
+                        ).exists()
+                    )
+                    self.assertEqual(
+                        first_conflict_path.read_bytes(), first_conflict_bytes
+                    )
+                    self.assertEqual(
+                        json.loads(resolution_path.read_text("utf-8"))[
+                            "proposal_ids"
+                        ],
+                        [first_candidate],
+                    )
+                    self.cli(
+                        "resolve",
+                        first_conflict_id,
+                        "--choose",
+                        "current",
+                        "--human-approved",
+                        root=root,
+                    )
+                else:
+                    self.assertIn(
+                        "Open conflicts: 1",
+                        self.cli("status", root=root).stdout,
+                    )
 
                 self.cli("sync", "--run", second_run, root=root)
                 second_decision = self.decision(
@@ -3966,8 +4026,9 @@ class BimriCliTest(unittest.TestCase):
                     second_conflict["current_hash"],
                     first_conflict["current_hash"],
                 )
+                expected_open = 1 if resolution_status == "failed" else 2
                 self.assertIn(
-                    "Open conflicts: 2",
+                    f"Open conflicts: {expected_open}",
                     self.cli("status", root=root).stdout,
                 )
 
@@ -5550,7 +5611,7 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(healed.returncode, 0)
         self.assertIn("[K:view.generic]", self.hot())
 
-    def test_post_commit_index_failures_warn_without_undoing_operations(self):
+    def test_hot_operations_do_not_call_retired_automatic_index_rebuild(self):
         start_root = self.root / "index-start"
         started = self.worker(
             "index_failure",
@@ -5565,74 +5626,102 @@ class BimriCliTest(unittest.TestCase):
         )
         self.assertIsNotNone(start_match, started.stdout)
         start_run = start_match.group(1)
-        self.assertIn("durable operation succeeded", started.stderr)
-        self.assertIn("forced index failure", started.stderr)
+        self.assertNotIn("forced index failure", started.stderr)
         self.assertIn(
             start_run,
             self.state(root=start_root)["active_runs"],
         )
+        index_path = start_root / ".bimri" / "index.tsv"
+        index_path.write_bytes(b"owner-controlled stale index sentinel\n")
 
-        sync_root = self.root / "index-sync"
-        sync_run = self.start("index-sync", root=sync_root)
-        sync_proposal = self.propose(
-            sync_run,
-            "index.sync",
-            "Sync remains committed when indexing fails.",
-            root=sync_root,
+        journaled = self.worker(
+            "index_failure",
+            "journal",
+            "--run",
+            start_run,
+            "--text",
+            "Journal must not rebuild the unused derived index.",
+            root=start_root,
         )
+        self.assertNotIn("forced index failure", journaled.stderr)
+        self.assertEqual(
+            index_path.read_bytes(), b"owner-controlled stale index sentinel\n"
+        )
+
+        proposed = self.worker(
+            "index_failure",
+            "propose",
+            "--run",
+            start_run,
+            "--tier",
+            "2",
+            "--key",
+            "index.sync",
+            "--text",
+            "Sync commits without touching the retired hot-path index.",
+            "--source",
+            "agent",
+            "--trust",
+            "working",
+            "--new-subject",
+            root=start_root,
+        )
+        sync_proposal = PROPOSAL_RE.search(proposed.stdout).group(0)
+        self.assertNotIn("forced index failure", proposed.stderr)
         synced = self.worker(
             "index_failure",
             "sync",
             "--run",
-            sync_run,
-            root=sync_root,
+            start_run,
+            root=start_root,
         )
-        self.assertIn("durable operation succeeded", synced.stderr)
+        self.assertNotIn("forced index failure", synced.stderr)
         self.assertEqual(
-            self.decision(sync_proposal, root=sync_root)["outcome"],
+            self.decision(sync_proposal, root=start_root)["outcome"],
             "accepted",
         )
-        self.assertIn("[K:index.sync]", self.hot(root=sync_root))
+        self.assertIn("[K:index.sync]", self.hot(root=start_root))
+        self.assertEqual(
+            index_path.read_bytes(), b"owner-controlled stale index sentinel\n"
+        )
 
-        close_root = self.root / "index-close"
-        close_run = self.start("index-close", root=close_root)
         closed = self.worker(
             "index_failure",
             "close",
             "--run",
-            close_run,
+            start_run,
             "--outcome",
             "success",
             "--summary",
-            "Close remains committed when indexing fails.",
-            root=close_root,
+            "Close also leaves the unused index untouched.",
+            root=start_root,
         )
-        self.assertIn("durable operation succeeded", closed.stderr)
+        self.assertNotIn("forced index failure", closed.stderr)
         self.assertNotIn(
-            close_run,
-            self.state(root=close_root)["active_runs"],
+            start_run,
+            self.state(root=start_root)["active_runs"],
         )
         close_log = (
-            close_root / ".bimri" / "log" / f"{close_run}.md"
+            start_root / ".bimri" / "log" / f"{start_run}.md"
         ).read_text("utf-8")
-        self.assertIn(f"[CLOSED:{close_run} ", close_log)
+        self.assertIn(f"[CLOSED:{start_run} ", close_log)
+        self.assertEqual(
+            index_path.read_bytes(), b"owner-controlled stale index sentinel\n"
+        )
 
         resolve_root = self.root / "index-resolve"
         resolve_run, candidate, _, _ = self.stage_concurrent_candidate(
             "index.resolve",
-            "Human approval should survive an index failure.",
+            "Human-approved resolution without automatic indexing.",
             root=resolve_root,
             candidate_actor="index-resolve",
-            writer_text="The competing live index value.",
+            writer_text="The competing current value.",
         )
-        self.cli(
-            "sync",
-            "--run",
-            resolve_run,
-            root=resolve_root,
-        )
+        self.cli("sync", "--run", resolve_run, root=resolve_root)
         contested = self.decision(candidate, root=resolve_root)
         self.assertEqual(contested["outcome"], "contested")
+        resolve_index = resolve_root / ".bimri" / "index.tsv"
+        resolve_index.write_bytes(b"resolution index sentinel\n")
         resolved = self.worker(
             "index_failure",
             "resolve",
@@ -5642,12 +5731,14 @@ class BimriCliTest(unittest.TestCase):
             "--human-approved",
             root=resolve_root,
         )
-        self.assertIn("durable operation succeeded", resolved.stderr)
+        self.assertNotIn("forced index failure", resolved.stderr)
         self.assertEqual(
             self.decision(candidate, root=resolve_root)["outcome"],
             "accepted",
         )
-        self.assertIn("[K:index.resolve]", self.hot(root=resolve_root))
+        self.assertEqual(
+            resolve_index.read_bytes(), b"resolution index sentinel\n"
+        )
 
     def test_index_and_doctor_are_deterministic(self):
         run_id = self.start("codex")
@@ -7530,7 +7621,11 @@ class BimriCliTest(unittest.TestCase):
             return {
                 path.relative_to(self.root).as_posix(): path.read_bytes()
                 for path in self.root.rglob("*")
-                if path.is_file() and not path.is_symlink()
+                if (
+                    path.is_file()
+                    and not path.is_symlink()
+                    and path != self.root / ".bimri" / "audit-witness.json"
+                )
             }
 
         before = snapshot()
@@ -7880,7 +7975,7 @@ class BimriCliTest(unittest.TestCase):
         self.assertIn("<!-- BIMRI v5.0.2 |", self.hot())
         status = self.cli("status")
         self.assertIn(
-            "BIMRI engine v5.1.0 | memory format v5.1.0 | revision V000000",
+            "BIMRI engine v5.1.1 | memory format v5.1.0 | revision V000000",
             status.stdout,
         )
 
@@ -8213,7 +8308,7 @@ class BimriCliTest(unittest.TestCase):
             timeout=60,
         )
 
-        self.assertIn("BIMRI 5.1.0 installed.", result.stdout)
+        self.assertIn("BIMRI 5.1.1 installed.", result.stdout)
         self.assertIn("Existing authority store v5.1.0 verified", result.stdout)
         self.assertIn("Memory preservation: PASSED", result.stdout)
         self.assertEqual(protected_tree_snapshot(self.root), before)
@@ -8221,7 +8316,7 @@ class BimriCliTest(unittest.TestCase):
         runtime = json.loads(
             (bdir / "runtime.local.json").read_text("utf-8")
         )
-        self.assertEqual(runtime["version"], "5.1.0")
+        self.assertEqual(runtime["version"], "5.1.1")
         manifests = list(
             (self.root / ".bimri-update-backups").glob(
                 "*/install-manifest.json"
@@ -8229,7 +8324,7 @@ class BimriCliTest(unittest.TestCase):
         )
         self.assertEqual(len(manifests), 1)
         manifest = json.loads(manifests[0].read_text("utf-8"))
-        self.assertEqual(manifest["engine_release"], "5.1.0")
+        self.assertEqual(manifest["engine_release"], "5.1.1")
         self.assertEqual(manifest["memory_format"], "5.1.0")
         self.assertEqual(manifest["mode"], "lossless-authority-activation")
         self.assertEqual(manifest["before_tree_digest"], manifest["after_tree_digest"])

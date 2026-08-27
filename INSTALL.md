@@ -204,7 +204,7 @@ and then runs the new read-only audit. Success is reported only with an
 explicit receipt equivalent to:
 
 ```text
-BIMRI 5.1.0 installed.
+BIMRI 5.1.1 installed.
 Existing v5.0.2 hot memory preserved; authority state activated at v5.1.0.
 Accepted head unchanged: V...... <sha256>.
 Memory preservation: PASSED (bimri.md and immutable evidence unchanged).

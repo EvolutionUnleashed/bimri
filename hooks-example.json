@@ -11,7 +11,7 @@
               "${CLAUDE_PROJECT_DIR}/bimri-engine.py",
               "hook-start"
             ],
-            "timeout": 15
+            "timeout": 90
           }
         ]
       }
@@ -27,7 +27,7 @@
               "${CLAUDE_PROJECT_DIR}/bimri-engine.py",
               "hook-close"
             ],
-            "timeout": 15
+            "timeout": 90
           }
         ]
       }

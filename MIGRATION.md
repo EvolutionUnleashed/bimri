@@ -1,7 +1,12 @@
 # BIMRI Migration and the v5.1.0 Lifecycle Upgrade
 
-Engine v5.1.0 uses authority format v5.1.0 while retaining the readable v5.0.2
-hot-memory grammar. It automatically migrates explicitly versioned v1-v3
+Engine v5.1.1 uses authority format v5.1.0 while retaining the readable v5.0.2
+hot-memory grammar. The upgrade from v5.1.0 is one-way for new work: v5.1.1
+stamps its own engine release into proposal preflight receipts, and a v5.1.0
+engine rejects those receipts, so proposals staged by v5.1.1 cannot be
+processed by an older engine. Roll back only through the update backup, before
+new proposals are staged, or after pending v5.1.1 proposals are decided. The
+engine automatically migrates explicitly versioned v1-v3
 tiered Markdown and the engine-based v4 format. This canonical repository publicly
 distributed the original v1 and streamlined v3 instructions; the parser also
 accepts a valid v2 header. Migration preserves old material before creating v5

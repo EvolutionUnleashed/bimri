@@ -6,11 +6,11 @@ This document is the normative protocol for a portable, human-governed BIMRI
 memory folder. `AGENTS.md` is the short runtime adapter. `bimri-engine.py` is
 the reference implementation.
 
-The engine, mutable state, and new authority-record format are v5.1.0. The
-readable `bimri.md` line grammar and header remain v5.0.2 because v5.1 changes
-subject lifecycle and residency rather than the visible line syntax. Frozen
-v5.0-v5.0.2 artifacts retain their original version and are validated against
-their original contract.
+The reference engine is v5.1.1. The mutable state and new authority-record
+format remain v5.1.0, and the readable `bimri.md` line grammar and header remain
+v5.0.2 because v5.1 changes subject lifecycle and residency rather than the
+visible line syntax. Frozen v5.0-v5.0.2 artifacts retain their original version
+and are validated against their original contract.
 
 The words MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY describe interoperability
 requirements.
@@ -75,6 +75,12 @@ bimri.md                       generated view of accepted memory
   state.json                   head pointer, counters, active runs, cold-current
   engine.lock                  local cross-process lock
   index.tsv                    rebuildable retrieval index
+  audit-witness.json           compact reference-engine audit checkpoint
+  audit-manifest.json          detailed reference-engine audit evidence
+  audit-manifests/             retained manifest generations for audit evidence
+  audit-transition.json        write-ahead marker for a checkpoint change
+  audit-drift/                 bounded append-only receipts of unexplained divergence
+  audit-blocked.json           owner-repair baseline while a quarantine is open
   log/R000001.md               append-only log for one run
   revisions/V000000.md         immutable shared-memory snapshots
   proposals/R000001-Q001.json  immutable agent proposals
@@ -112,6 +118,24 @@ Run logs, proposals, revisions, archived cold records, conflicts, and resolution
 durable records. `index.tsv` is a derived, non-authoritative cache. It MAY be
 deleted and rebuilt from canonical hot and cold memory, logs, and archives; an
 index failure MUST NOT alter the outcome of a memory mutation.
+
+Reference-engine note (non-normative): engine v5.1.1 may maintain a compact
+`audit-witness.json` checkpoint and separate `audit-manifest.json` path-and-hash
+evidence for a successful full integrity audit. Current-only reads may validate
+the checkpoint, accepted head, current state, and one selected cold binding
+without traversing historical authority. Authority-changing writes and
+explicit audit, review, search, and historical retrieval perform the full
+check. The checkpoint is a derived cache: divergence from it is a cache miss
+that forces the full semantic audit, never a stored verdict of its own. When
+that audit passes over divergence the engine cannot attribute to its own
+recorded operation, it preserves an append-only receipt under
+`.bimri/audit-drift/` and continues; when the audit fails, the store refuses
+into damaged-authority recovery exactly as it would without a checkpoint.
+`audit-blocked.json` appears only while an owner-approved quarantine holds its
+pre-repair baseline; restoration, or a clean doctor pass after it, clears it.
+The witness-protected roots are flat; an unexpected subdirectory prevents a
+valid full audit. These derived files never change the authority-store
+contract described here.
 
 ## 4. Identifiers and Stable Keys
 
@@ -276,17 +300,16 @@ Under the engine lock, `start` MUST:
 4. exclusively create `.bimri/log/<run>.md`;
 5. add only that run to `active_runs`;
 6. persist state atomically;
-7. print the BIMRI brief and explicit run handle; and
-8. attempt to rebuild the derived index.
+7. print the BIMRI brief and explicit run handle.
 
 The normal brief MUST be quiet about open review records. `start` and
 `hook-start` MUST NOT print conflict IDs, choices, questions, open-review
 counts, or `HUMAN DECISION NEEDED`. They MUST continue to print authority
 recovery warnings because those indicate that shared writes are unsafe.
 
-Failure to rebuild the index after step 7 MUST be reported as a warning, not
-as failure to create the run. The run handle is already durable and the index
-can be rebuilt independently.
+`start` MUST NOT rebuild the derived index while holding the engine lock. The
+run handle is already durable and the non-authoritative index can be rebuilt
+independently with `index` or as part of scheduled maintenance.
 
 `--session <opaque-session-id>` MAY bind a harness session to a run. Starting
 the same actor and session resumes its active run instead of allocating a
@@ -470,8 +493,11 @@ section. A conforming commit performs these steps:
 13. attempt to regenerate `bimri.md`, warning if the durable state has
     committed but the generated view cannot yet be refreshed;
 14. finalize the proposal decision;
-15. attempt to rebuild the derived index; and
-16. release the lock.
+15. release the lock.
+
+The commit path MUST NOT rebuild the derived index while holding the engine
+lock. A stale or missing index does not change accepted memory and can be
+rebuilt independently with `index` or as part of scheduled maintenance.
 
 Durable replacement SHOULD use a temporary file in the destination directory,
 flush and `fsync` it, and atomically replace the destination. On POSIX, the
@@ -649,15 +675,18 @@ Recovery validates the exact precommitted historical effect for proposal,
 NOT strand an applying resolution, rewrite its historical choice, or roll back
 newer current memory.
 
-While a proposal-choice resolution has an uncommitted intended effect,
-unrelated subjects remain writable and a later same-key intent MUST be durably
-held as `owner-resolution-in-progress` rather than overwrite the pending owner
-choice or become another owner conflict. Recovery silently finalizes an exact
-effect already proven committed. If the intended effect did not commit, the
-owner must re-attest the exact choice before recovery may rebind it to the next
-revision. `current` and `dismiss` choices remain bound to their precommitted
-historical snapshot even if later same-key work proceeds. Recovery MUST
-preserve any later accepted current generation.
+While a proposal-choice resolution remains `applying` and has an uncommitted
+intended effect, unrelated subjects remain writable and a later same-key intent
+MUST be durably held as `owner-resolution-in-progress` rather than overwrite
+the pending owner choice or become another owner conflict. Recovery silently
+finalizes an exact effect already proven committed. If resolution processing
+records `failed`, ordinary retrieval and shared-memory writes MUST pause as an
+authority-recovery condition; only an explicit retry of that exact conflict and
+choice may proceed. If the intended effect did not commit, the owner must
+re-attest the exact choice before recovery may rebind it to the next revision.
+`current` and `dismiss` choices remain bound to their precommitted historical
+snapshot even if later same-key work proceeds. Recovery MUST preserve any
+later accepted current generation.
 
 An immutable revision file whose number was predeclared by an applying
 resolution but whose state pointer never committed is an orphan, not accepted
@@ -839,10 +868,19 @@ its key:
 <verified-python> bimri-engine.py recall --query "checkout retries"
 ```
 
-Current generations rank ahead of replaced and closed history. Retrieval is
-read-only and MUST NOT silently rehydrate or touch a subject. Repeating the
-same query MUST NOT game residency. Because the index is derived, corruption
-or deletion of the index is repaired with:
+An exact-key request without `--history` returns only the accepted current
+generation. Held candidates, replaced generations, and closed generations are
+not current; an agent requests them explicitly with `--history` or uses the
+review workflow. Task-language discovery retains its current-and-historical
+scope. Current generations rank ahead of replaced and closed history.
+
+Retrieval is read-only and MUST NOT silently rehydrate or touch a subject.
+Repeating the same query MUST NOT game residency. A derived audit checkpoint
+MAY short-circuit historical re-verification, but it never supplies memory,
+conflict, held-candidate, trust, archive, or recovery truth itself. The
+returned current entry MUST still come from the accepted head or the exact
+selected cold-current binding. Because the index is derived, corruption or deletion of
+the index is repaired with:
 
 ```text
 <verified-python> bimri-engine.py index
@@ -878,6 +916,14 @@ decision schemas and effects, proposal base-snapshot binding, conflict
 candidate hashes, resolution authority and revision effects, quarantine
 evidence, restore receipts, manual-edit evidence, active-run logs, pointer
 containment, and index shape.
+
+The reference engine performs a full protected-tree audit before an
+authority-changing write and for explicit doctor, review, task-language search,
+and historical retrieval. When intact prior path-and-hash evidence disagrees
+with that audit, it MUST retain the prior evidence and fail closed rather than
+silently bless the new bytes. A normal current-only exact read is not required
+to traverse unrelated historical authority; every non-engine filesystem writer
+therefore remains outside the supported cooperative lock protocol.
 
 Run-log `[PROPOSE:<id>]` references and the monotonic conflict counter are
 deletion anchors. A referenced missing proposal, a required missing decision,

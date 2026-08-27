@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BIMRI Engine v5.1.0 (authority store v5.1.0; hot grammar v5.0.2)
+BIMRI Engine v5.1.1 (authority store v5.1.0; hot grammar v5.0.2)
 Portable, human-governed memory for local agents.
 
 The shared memory is a generated Markdown view. Agents work in independent
@@ -53,9 +53,18 @@ except ImportError:  # pragma: no cover
     msvcrt = None
 
 
-ENGINE_VERSION = "5.1.0"
+ENGINE_VERSION = "5.1.1"
+V5_1_0_ENGINE_VERSION = "5.1.0"
 MEMORY_FORMAT_VERSION = "5.1.0"
 HOT_FORMAT_VERSION = "5.0.2"
+AUDIT_WITNESS_SCHEMA = 1
+AUDIT_MANIFEST_SCHEMA = 1
+AUDIT_BLOCKED_SCHEMA = 1
+AUDIT_DRIFT_SCHEMA = 1
+AUDIT_TRANSITION_SCHEMA = 1
+AUDIT_DRIFT_KEEP = 200
+AUTHORITY_POLICY_VERSION = "5.1.1-authority-1"
+HOOK_TIMEOUT_SECONDS = 90
 PREVIOUS_V5_VERSION = "5.0"
 V5_0_1_VERSION = "5.0.1"
 V5_0_2_VERSION = "5.0.2"
@@ -384,6 +393,12 @@ class Paths:
         self.hot = self.root / "bimri.md"
         self.state = self.bdir / "state.json"
         self.index = self.bdir / "index.tsv"
+        self.audit_witness = self.bdir / "audit-witness.json"
+        self.audit_manifest = self.bdir / "audit-manifest.json"
+        self.audit_manifests = self.bdir / "audit-manifests"
+        self.audit_blocked = self.bdir / "audit-blocked.json"
+        self.audit_drift = self.bdir / "audit-drift"
+        self.audit_transition = self.bdir / "audit-transition.json"
         self.lock = self.bdir / "engine.lock"
         self.logs = self.bdir / "log"
         self.proposals = self.bdir / "proposals"
@@ -396,6 +411,18 @@ class Paths:
         self.backups = self.bdir / "backups"
         self.recovery = self.bdir / "recovery"
         self.migrations = self.bdir / "migrations"
+        # Per-process evidence for a command that has already checked the
+        # witness while holding this store's lock. It is never persisted as
+        # authority and callers must not reuse it after a mutation.
+        self.validated_audit_witness = None
+        self.pending_checkpoint_witness = None
+        self.authority_write_mode = False
+        self.authority_write_audit_healthy = False
+        self.full_audit_manifest = None
+        self.full_audit_run_facts = None
+        # Drift observed by the most recent full audit in this process, for
+        # read-only reporting surfaces that must not write a receipt.
+        self.last_audit_drift = []
 
     @property
     def legacy_active(self):
@@ -411,6 +438,7 @@ class Paths:
             self.bdir, self.logs, self.proposals, self.decisions,
             self.revisions, self.conflicts, self.resolutions, self.archive,
             self.inbox, self.backups, self.recovery, self.migrations,
+            self.audit_manifests,
         )
 
 
@@ -936,6 +964,7 @@ def validate_state(state, accepted_versions=None):
         raise BimriError(f"unsupported BIMRI state version: {state.get('bimri_version')}")
     if state.get("legacy_migration") not in (None, "legacy-to-v5"):
         raise BimriError("state legacy_migration has an unsupported value.")
+    state_audit_epoch(state)
     if not isinstance(state.get("active_runs"), dict):
         raise BimriError("state active_runs must be an object.")
     if not isinstance(state.get("session_runs"), dict):
@@ -1015,7 +1044,7 @@ def current_run_date_references(paths, state):
     return referenced
 
 
-def save_state(paths, state):
+def prepare_state_for_save(paths, state):
     validate_state(state)
     if len(state.get("run_dates", {})) > 500:
         keys = sorted(
@@ -1040,6 +1069,12 @@ def save_state(paths, state):
                 key: state["run_dates"][key]
                 for key in keys if key in retained
             }
+    validate_state(state)
+    return state
+
+
+def save_state(paths, state):
+    prepare_state_for_save(paths, state)
     atomic_write_json(paths.state, state)
 
 
@@ -2685,6 +2720,22 @@ def load_or_initialize(paths):
     merged = fresh_state()
     merged.update(raw)
     state = validate_state(merged)
+    state = reconcile_audit_transition(paths, state)
+    witness = load_valid_audit_witness(paths, state)
+    if witness is not None and not load_audit_blocked_issues(paths):
+        validate_checkpoint_head(paths, state)
+        # Legacy-root and legacy-marker refusal are cheap root checks that
+        # must hold on every load, warm reads included.
+        finalize_legacy_migration(paths, state)
+        reject_unclaimed_legacy_roots(paths)
+        record_migration_receipt(
+            paths,
+            "verified",
+            source_version=MEMORY_FORMAT_VERSION,
+            limits=limits_profile(state),
+            metadata_revision=None,
+        )
+        return state
     validate_current_residency(paths, state)
     finalize_legacy_migration(paths, state)
     reject_unclaimed_legacy_roots(paths)
@@ -2694,6 +2745,10 @@ def load_or_initialize(paths):
     metadata_revision = None
     if not recovery_gate_issues:
         metadata_revision = finalize_current_v5_metadata(paths, state)
+        if authority_has_recoverable_applying(paths):
+            enter_authority_write_after_audit(
+                paths, state, operation="recover-interrupted-authority"
+            )
         recover_interrupted_authority(paths, state)
     record_migration_receipt(
         paths,
@@ -3225,6 +3280,14 @@ def sync_generated_view(paths, state):
         except OSError:
             continue
     if current_hash not in known_hashes and hot_exists:
+        if not paths.authority_write_mode:
+            begin_authority_write(
+                paths,
+                state,
+                allow_degraded=True,
+                operation="recover-manual-hot-edit",
+                scope={"hot_hash": current_hash},
+            )
         try:
             current_bytes.decode("utf-8")
             suffix = ".md"
@@ -3252,6 +3315,8 @@ def sync_generated_view(paths, state):
     else:
         conflict = None
     write_generated_view(paths, expected)
+    if conflict is not None:
+        refresh_audit_witness_after_trusted_write(paths, state)
     return conflict
 
 
@@ -3495,10 +3560,11 @@ def validate_quarantine_stub(paths, path, stub, kind, record_id):
     return stub
 
 
-def logged_proposal_records(paths, state):
+def logged_proposal_records(paths, state, include_run_status=False):
     """Return durable proposal references and processing expectations."""
     records = []
     issues = []
+    closed_by_run = {}
     for log in sorted(paths.logs.glob("R*.md")):
         if not RUN_RE.fullmatch(log.stem):
             continue
@@ -3518,6 +3584,7 @@ def logged_proposal_records(paths, state):
             content,
             re.MULTILINE,
         ) is not None
+        closed_by_run[run_id] = closed
         for proposal_id in dict.fromkeys(proposal_ids):
             if not proposal_id.startswith(f"{run_id}-Q"):
                 issues.append(
@@ -3526,6 +3593,8 @@ def logged_proposal_records(paths, state):
                 )
                 continue
             records.append((proposal_id, run_id, closed))
+    if include_run_status:
+        return records, issues, closed_by_run
     return records, issues
 
 
@@ -3902,8 +3971,1882 @@ def scan_open_conflicts(paths, state):
     return items, issues
 
 
-def governance_snapshot(paths, state, allow_recoverable_applying=False):
+def audit_witness_roots(paths):
+    """Stable authority and history roots covered by the audit witness."""
+    return (
+        paths.proposals,
+        paths.decisions,
+        paths.conflicts,
+        paths.resolutions,
+        paths.revisions,
+        paths.archive,
+        paths.recovery,
+    )
+
+
+def audit_witness_manifest(paths):
+    """Hash a closed inventory without following redirected directory entries."""
+    manifest = []
+    for root in audit_witness_roots(paths):
+        if path_is_redirected(root) or not root.is_dir():
+            raise BimriError(
+                f"audit witness root {root.relative_to(paths.root)} is missing "
+                "or unsafe."
+            )
+        try:
+            children = sorted(root.iterdir(), key=lambda item: item.name)
+        except OSError as exc:
+            raise BimriError(
+                f"audit witness could not inventory "
+                f"{root.relative_to(paths.root)}: {exc}"
+            ) from exc
+        for path in children:
+            relative = path.relative_to(paths.root).as_posix()
+            if path_is_redirected(path):
+                raise BimriError(
+                    f"audit witness refused redirected path {relative}."
+                )
+            if path.is_dir():
+                raise BimriError(
+                    f"audit witness refused unexpected subdirectory {relative}."
+                )
+            if not path.is_file():
+                raise BimriError(
+                    f"audit witness refused non-file path {relative}."
+                )
+            try:
+                digest = sha256_bytes(path.read_bytes())
+            except OSError as exc:
+                raise BimriError(
+                    f"audit witness could not read {relative}: {exc}"
+                ) from exc
+            manifest.append({"path": relative, "sha256": digest})
+    manifest.sort(key=lambda item: item["path"])
+    return manifest
+
+
+def audit_witness_run_facts(paths, state):
+    """Return only governance-relevant facts from high-churn run logs."""
+    for log in sorted(paths.logs.glob("R*.md")):
+        if RUN_RE.fullmatch(log.stem) and (
+            path_is_redirected(log) or not log.is_file()
+        ):
+            raise BimriError(f"run log is missing or unsafe: {log.name}")
+    records, issues, closed_by_run = logged_proposal_records(
+        paths, state, include_run_status=True
+    )
+    if issues:
+        raise BimriError(" | ".join(issues[:3]))
+    marker_by_proposal = {
+        proposal_id: (run_id, closed)
+        for proposal_id, run_id, closed in records
+    }
+    proposal_files = {
+        path.stem
+        for path in paths.proposals.glob("R*-Q*.json")
+        if PROPOSAL_RE.fullmatch(path.stem)
+    }
+    proposal_ids = sorted(set(marker_by_proposal) | proposal_files)
+    facts = []
+    for proposal_id in proposal_ids:
+        run_id = proposal_id.split("-Q", 1)[0]
+        marker = marker_by_proposal.get(proposal_id)
+        facts.append({
+            "proposal_id": proposal_id,
+            "run_id": run_id,
+            "file_present": proposal_id in proposal_files,
+            "marker_present": bool(marker and marker[0] == run_id),
+            "closed": bool(closed_by_run.get(run_id, False)),
+        })
+    return facts
+
+
+def audit_witness_proposal_runs(run_facts, state):
+    """Bind bases only for proposal-bearing runs that remain active."""
+    active = state.get("active_runs", {})
+    return sorted({
+        record["run_id"] for record in run_facts
+        if record["run_id"] in active
+    })
+
+
+def audit_witness_state_payload(state, proposal_runs):
+    """Select current authority state while excluding lifecycle-only churn."""
+    active_bases = {
+        run_id: state.get("active_runs", {}).get(run_id, {}).get("base_revision")
+        for run_id in proposal_runs
+    }
+    return {
+        "bimri_version": state["bimri_version"],
+        "project_id": state["project_id"],
+        "head_revision": state["head_revision"],
+        "head_hash": state["head_hash"],
+        "conflict_count": state["conflict_count"],
+        "pattern_count": state["pattern_count"],
+        "cold_current": state["cold_current"],
+        "prune_policy": state["prune_policy"],
+        "flag_threshold": state["flag_threshold"],
+        "limits": limits_profile(state),
+        "active_proposal_bases": active_bases,
+    }
+
+
+def audit_witness_state_hash(state, proposal_runs):
+    return audit_witness_digest(
+        audit_witness_state_payload(state, proposal_runs)
+    )
+
+
+def state_audit_epoch(state):
+    """Return the optional v5.1.1 cache epoch (absent in v5.1.0 stores)."""
+    value = state.get("_audit_epoch", 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise BimriError("state _audit_epoch must be a non-negative integer.")
+    return value
+
+
+def audit_witness_write_state_payload(state):
+    """Bind every state input that can influence an authority transition."""
+    payload = copy.deepcopy(state)
+    # These timestamps are display/liveness bookkeeping. They never select,
+    # authorize, age, or render shared memory and may change on a journal-only
+    # lifecycle write without forcing a checkpoint rewrite.
+    payload.pop("last_started_at", None)
+    payload.pop("last_closed_at", None)
+    payload.pop("_audit_epoch", None)
+    active_runs = payload.get("active_runs", {})
+    if isinstance(active_runs, dict):
+        for metadata in active_runs.values():
+            if isinstance(metadata, dict):
+                metadata.pop("last_activity_at", None)
+    return payload
+
+
+def audit_witness_write_state_hash(state):
+    return audit_witness_digest(audit_witness_write_state_payload(state))
+
+
+def audit_witness_digest(value):
+    encoded = json.dumps(
+        value, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return sha256_bytes(encoded)
+
+
+def audit_record_seal(record, seal_field):
+    """Detect standalone cache edits; coordinated forgery is outside scope."""
+    payload = {
+        key: value for key, value in record.items() if key != seal_field
+    }
+    return audit_witness_digest(payload)
+
+
+def discard_audit_witness(paths):
+    """Remove the derived witness without following an unsafe replacement."""
+    paths.validated_audit_witness = None
+    path = paths.audit_witness
+    try:
+        if path.is_symlink() or (path.exists() and not path.is_dir()):
+            path.unlink()
+            fsync_directory(path.parent)
+    except OSError:
+        # A derived cache must never turn a valid authority operation into a
+        # failure. An unreadable witness simply leaves the slow audit active.
+        pass
+
+
+def normalize_audit_manifest(manifest):
+    if not isinstance(manifest, list):
+        raise BimriError("audit manifest must be a list.")
+    normalized = []
+    seen_paths = set()
+    for item in manifest:
+        if not isinstance(item, dict) or set(item) != {"path", "sha256"}:
+            raise BimriError("audit manifest row fields are invalid.")
+        relative = clean_scalar(item.get("path"), "audit manifest path", 1000)
+        digest = item.get("sha256")
+        if (
+            relative in seen_paths
+            or not isinstance(digest, str)
+            or not HASH_RE.fullmatch(digest)
+        ):
+            raise BimriError("audit manifest row is invalid or duplicated.")
+        seen_paths.add(relative)
+        normalized.append({"path": relative, "sha256": digest})
+    if normalized != sorted(normalized, key=lambda item: item["path"]):
+        raise BimriError("audit manifest paths are not sorted.")
+    return normalized
+
+
+def validate_sealed_audit_witness_record(witness):
+    """Validate a compact checkpoint record from live or blocked evidence."""
+    try:
+        expected_fields = {
+            "witness_schema", "engine_version", "memory_format_version",
+            "policy_version", "created_at", "head_revision", "head_hash",
+            "state_hash", "write_state_hash", "audit_epoch",
+            "run_authority_hash", "manifest_hash", "manifest_count",
+            "proposal_runs", "witness_hash",
+        }
+        if set(witness) != expected_fields:
+            return None
+        if witness.get("witness_hash") != audit_record_seal(
+            witness, "witness_hash"
+        ):
+            return None
+        if (
+            witness.get("witness_schema") != AUDIT_WITNESS_SCHEMA
+            or witness.get("engine_version") != ENGINE_VERSION
+            or witness.get("memory_format_version") != MEMORY_FORMAT_VERSION
+            or witness.get("policy_version") != AUTHORITY_POLICY_VERSION
+        ):
+            return None
+        parse_timestamp(witness.get("created_at"), "audit witness timestamp")
+        validate_revision_number(
+            witness.get("head_revision"), "audit witness head revision"
+        )
+        for field in (
+            "head_hash", "state_hash", "write_state_hash",
+            "run_authority_hash", "manifest_hash"
+        ):
+            value = witness.get(field)
+            if not isinstance(value, str) or not HASH_RE.fullmatch(value):
+                return None
+        count = witness.get("manifest_count")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            return None
+        epoch = witness.get("audit_epoch")
+        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+            return None
+        proposal_runs = witness.get("proposal_runs")
+        if (
+            not isinstance(proposal_runs, list)
+            or proposal_runs != sorted(set(proposal_runs))
+        ):
+            return None
+        for run_id in proposal_runs:
+            validate_fixed_id(run_id, RUN_RE, "audit witness proposal run ID")
+        return witness
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        return None
+
+
+def reconcile_engine_checkpoint_for_exact_read(paths):
+    """Finish only a sealed engine transition under the existing read lock."""
+    if not (paths.audit_transition.exists() or paths.audit_transition.is_symlink()):
+        return False
+    marker = load_audit_transition(paths)
+    if marker is None or marker["kind"] not in {"lifecycle", "authority"}:
+        return False
+    if path_is_redirected(paths.state) or not paths.state.is_file():
+        raise BimriError("lifecycle checkpoint state is missing or unsafe.")
+    raw = read_json_strict(paths.state, "state.json")
+    if raw.get("bimri_version") != MEMORY_FORMAT_VERSION:
+        raise BimriError("lifecycle checkpoint requires current-format state.")
+    require_complete_v5_state(raw)
+    state = fresh_state()
+    state.update(raw)
+    validate_state(state)
+    reconcile_audit_transition(paths, state)
+    return not (
+        paths.audit_transition.exists() or paths.audit_transition.is_symlink()
+    )
+
+
+def load_sealed_audit_witness(paths):
+    """Load the compact checkpoint without consulting authority/history files."""
+    path = paths.audit_witness
+    if path_is_redirected(path) or not path.is_file():
+        return None
+    try:
+        witness = read_json_strict(path, "audit witness")
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        return None
+    return validate_sealed_audit_witness_record(witness)
+
+
+def load_valid_audit_witness(paths, state, state_hash=None):
+    """Validate a fixed-cost read checkpoint against state and accepted head."""
+    paths.validated_audit_witness = None
+    # A durable transition is the write-ahead marker for a checkpoint change.
+    # Even an otherwise valid old/new witness is non-readable until that
+    # marker has been reconciled while holding the engine lock.
+    if paths.audit_transition.exists() or paths.audit_transition.is_symlink():
+        return None
+    witness = load_sealed_audit_witness(paths)
+    if witness is None:
+        return None
+    del state_hash  # Compatibility with the transitional private call surface.
+    try:
+        current_state_hash = audit_witness_state_hash(
+            state, witness["proposal_runs"]
+        )
+    except (BimriError, KeyError, TypeError, ValueError):
+        return None
+    if (
+        witness["head_revision"] != state["head_revision"]
+        or witness["head_hash"] != state["head_hash"]
+        or witness["state_hash"] != current_state_hash
+        or witness["audit_epoch"] != state_audit_epoch(state)
+    ):
+        return None
+    paths.validated_audit_witness = witness
+    return witness
+
+
+def audit_manifest_generation_path(paths, manifest_hash):
+    if not isinstance(manifest_hash, str) or not HASH_RE.fullmatch(manifest_hash):
+        raise BimriError("audit manifest generation hash is invalid.")
+    return paths.audit_manifests / f"{manifest_hash}.json"
+
+
+def load_audit_manifest_evidence(paths, witness, manifest_override=None):
+    if manifest_override is not None:
+        manifest = normalize_audit_manifest(manifest_override)
+        if (
+            witness.get("manifest_hash") != audit_witness_digest(manifest)
+            or witness.get("manifest_count") != len(manifest)
+        ):
+            raise BimriError(
+                "preserved audit manifest does not match its checkpoint."
+            )
+        return manifest
+    generation = audit_manifest_generation_path(
+        paths, witness.get("manifest_hash")
+    )
+    # Transitional v5.1.1 installs may only have the fixed current alias.
+    # Once read successfully, the next publication creates the generation.
+    path = generation if generation.is_file() else paths.audit_manifest
+    if path_is_redirected(path) or not path.is_file():
+        raise BimriError("audit manifest evidence is missing or unsafe.")
+    record = read_json_strict(path, "audit manifest")
+    expected = {
+        "manifest_schema", "created_at", "manifest", "manifest_hash",
+        "manifest_count", "manifest_file_hash",
+    }
+    if set(record) != expected:
+        raise BimriError("audit manifest evidence fields are invalid.")
+    if record.get("manifest_schema") != AUDIT_MANIFEST_SCHEMA:
+        raise BimriError("audit manifest evidence schema is invalid.")
+    parse_timestamp(record.get("created_at"), "audit manifest timestamp")
+    if record.get("manifest_file_hash") != audit_record_seal(
+        record, "manifest_file_hash"
+    ):
+        raise BimriError("audit manifest evidence seal is invalid.")
+    manifest = normalize_audit_manifest(record.get("manifest"))
+    manifest_hash = audit_witness_digest(manifest)
+    if (
+        record.get("manifest_hash") != manifest_hash
+        or record.get("manifest_count") != len(manifest)
+        or witness.get("manifest_hash") != manifest_hash
+        or witness.get("manifest_count") != len(manifest)
+    ):
+        raise BimriError("audit manifest evidence does not match its checkpoint.")
+    return manifest
+
+
+def write_audit_manifest_generation(paths, manifest_record):
+    generation = audit_manifest_generation_path(
+        paths, manifest_record["manifest_hash"]
+    )
+    if path_is_redirected(paths.audit_manifests):
+        raise BimriError("audit manifest generation directory is redirected.")
+    ensure_directory_durable(paths.audit_manifests)
+    encoded = canonical_json_bytes(manifest_record)
+    if generation.exists() or generation.is_symlink():
+        if path_is_redirected(generation) or not generation.is_file():
+            raise BimriError("audit manifest generation conflicts with evidence.")
+        existing = read_json_strict(generation, "audit manifest generation")
+        existing_manifest = normalize_audit_manifest(existing.get("manifest"))
+        if (
+            set(existing) != {
+                "manifest_schema", "created_at", "manifest", "manifest_hash",
+                "manifest_count", "manifest_file_hash",
+            }
+            or existing.get("manifest_schema") != AUDIT_MANIFEST_SCHEMA
+            or existing.get("manifest_file_hash")
+            != audit_record_seal(existing, "manifest_file_hash")
+            or existing.get("manifest_hash") != manifest_record["manifest_hash"]
+            or existing.get("manifest_count") != manifest_record["manifest_count"]
+            or existing_manifest != manifest_record["manifest"]
+        ):
+            raise BimriError("audit manifest generation conflicts with evidence.")
+    else:
+        exclusive_write_bytes(generation, encoded)
+    return generation
+
+
+def ensure_audit_manifest_generation(paths, witness, manifest=None):
+    """Make the manifest named by a prior checkpoint crash-addressable."""
+    generation = audit_manifest_generation_path(
+        paths, witness["manifest_hash"]
+    )
+    if manifest is None and generation.is_file() and not path_is_redirected(
+        generation
+    ):
+        record = read_json_strict(generation, "audit manifest generation")
+        candidate = normalize_audit_manifest(record.get("manifest"))
+        if (
+            set(record) == {
+                "manifest_schema", "created_at", "manifest", "manifest_hash",
+                "manifest_count", "manifest_file_hash",
+            }
+            and record.get("manifest_schema") == AUDIT_MANIFEST_SCHEMA
+            and record.get("manifest_file_hash")
+            == audit_record_seal(record, "manifest_file_hash")
+            and record.get("manifest_hash") == witness["manifest_hash"]
+            and record.get("manifest_count") == witness["manifest_count"]
+            and audit_witness_digest(candidate) == witness["manifest_hash"]
+        ):
+            return candidate
+        raise BimriError("audit manifest generation conflicts with its checkpoint.")
+    manifest = load_audit_manifest_evidence(
+        paths, witness, manifest_override=manifest
+    )
+    record = {
+        "manifest_schema": AUDIT_MANIFEST_SCHEMA,
+        "created_at": witness["created_at"],
+        "manifest": manifest,
+        "manifest_hash": witness["manifest_hash"],
+        "manifest_count": witness["manifest_count"],
+    }
+    record["manifest_file_hash"] = audit_record_seal(
+        record, "manifest_file_hash"
+    )
+    write_audit_manifest_generation(paths, record)
+    return manifest
+
+
+def clear_audit_transition(paths):
+    path = paths.audit_transition
+    if path_is_redirected(path):
+        raise BimriError("audit transition marker is redirected.")
+    if path.exists():
+        if not path.is_file():
+            raise BimriError("audit transition marker is not a regular file.")
+        path.unlink()
+        fsync_directory(path.parent)
+
+
+def load_audit_transition(paths):
+    path = paths.audit_transition
+    if not (path.exists() or path.is_symlink()):
+        return None
+    if path_is_redirected(path) or not path.is_file():
+        raise BimriError("audit transition marker is missing or unsafe.")
+    marker = read_json_strict(path, "audit transition marker")
+    expected = {
+        "transition_schema", "created_at", "kind", "operation", "run_id",
+        "scope", "prior_witness", "prior_witness_hash",
+        "prior_manifest_hash", "epoch_before", "epoch_after",
+        "pre_write_state", "pre_write_state_hash", "post_write_state_hash", "log_path",
+        "pre_log_hash", "post_log_hash", "log_append", "transition_hash",
+    }
+    if set(marker) != expected:
+        raise BimriError("audit transition marker fields are invalid.")
+    if marker.get("transition_schema") != AUDIT_TRANSITION_SCHEMA:
+        raise BimriError("audit transition marker schema is invalid.")
+    parse_timestamp(marker.get("created_at"), "audit transition timestamp")
+    if marker.get("kind") not in {"authority", "lifecycle"}:
+        raise BimriError("audit transition kind is invalid.")
+    clean_scalar(marker.get("operation"), "audit transition operation", 80)
+    run_id = marker.get("run_id")
+    if run_id is not None:
+        validate_fixed_id(run_id, RUN_RE, "audit transition run ID")
+    if not isinstance(marker.get("scope"), dict):
+        raise BimriError("audit transition scope is invalid.")
+    if marker.get("kind") == "authority":
+        validate_frozen_authority_transition_scope(marker["scope"])
+    prior = validate_sealed_audit_witness_record(marker.get("prior_witness"))
+    if (
+        prior is None
+        or marker.get("prior_witness_hash") != prior.get("witness_hash")
+        or marker.get("prior_manifest_hash") != prior.get("manifest_hash")
+    ):
+        raise BimriError("audit transition prior checkpoint is invalid.")
+    for field in ("epoch_before", "epoch_after"):
+        value = marker.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise BimriError(f"audit transition {field} is invalid.")
+    for field in ("pre_write_state_hash", "post_write_state_hash"):
+        value = marker.get(field)
+        if value is not None and (
+            not isinstance(value, str) or not HASH_RE.fullmatch(value)
+        ):
+            raise BimriError(f"audit transition {field} is invalid.")
+    pre_write_state = marker.get("pre_write_state")
+    if (
+        not isinstance(pre_write_state, dict)
+        or audit_witness_digest(pre_write_state)
+        != marker.get("pre_write_state_hash")
+    ):
+        raise BimriError("audit transition pre-write state is invalid.")
+    for field in ("pre_log_hash", "post_log_hash"):
+        value = marker.get(field)
+        if value is not None and value != "absent" and (
+            not isinstance(value, str) or not HASH_RE.fullmatch(value)
+        ):
+            raise BimriError(f"audit transition {field} is invalid.")
+    log_path = marker.get("log_path")
+    log_append = marker.get("log_append")
+    if marker["kind"] == "lifecycle":
+        if (
+            not isinstance(log_path, str)
+            or not isinstance(log_append, str)
+            or marker.get("post_write_state_hash") is None
+            or marker.get("pre_log_hash") is None
+            or marker.get("post_log_hash") is None
+            or marker["epoch_before"] != marker["epoch_after"]
+        ):
+            raise BimriError("lifecycle audit transition fields are invalid.")
+        pure = PurePosixPath(log_path)
+        if (
+            pure.is_absolute()
+            or ".." in pure.parts
+            or tuple(pure.parts[:2]) != (".bimri", "log")
+            or len(pure.parts) != 3
+            or not RUN_RE.fullmatch(PurePosixPath(log_path).stem)
+        ):
+            raise BimriError("lifecycle audit transition log path is invalid.")
+        if len(log_append) > 25000:
+            raise BimriError("lifecycle audit transition log append is too large.")
+    elif any(
+        marker.get(field) is not None
+        for field in (
+            "post_write_state_hash", "log_path", "pre_log_hash",
+            "post_log_hash", "log_append",
+        )
+    ) or marker["epoch_after"] != marker["epoch_before"] + 1:
+        raise BimriError("authority audit transition fields are invalid.")
+    if marker.get("transition_hash") != audit_record_seal(
+        marker, "transition_hash"
+    ):
+        raise BimriError("audit transition marker seal is invalid.")
+    return marker
+
+
+def write_audit_transition(paths, marker):
+    if paths.audit_transition.exists() or paths.audit_transition.is_symlink():
+        raise BimriError(
+            "an earlier audit transition is incomplete; run doctor before retrying."
+        )
+    marker = dict(marker)
+    marker["transition_hash"] = audit_record_seal(
+        marker, "transition_hash"
+    )
+    if path_is_redirected(paths.audit_transition):
+        raise BimriError("audit transition destination is redirected.")
+    atomic_write_json(paths.audit_transition, marker)
+    return load_audit_transition(paths)
+
+
+def referenced_audit_manifest_hashes(paths):
+    hashes = set()
+    witness = load_sealed_audit_witness(paths)
+    if witness is not None:
+        hashes.add(witness["manifest_hash"])
+    try:
+        blocked = load_audit_blocked_record(paths)
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        blocked = None
+    if blocked and blocked.get("prior_witness"):
+        hashes.add(blocked["prior_witness"]["manifest_hash"])
+    try:
+        transition = load_audit_transition(paths)
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        transition = None
+    if transition:
+        hashes.add(transition["prior_manifest_hash"])
+    return hashes
+
+
+def prune_audit_manifest_generations(paths):
+    """Bound derived evidence after every completed publication."""
+    keep = referenced_audit_manifest_hashes(paths)
+    try:
+        children = list(paths.audit_manifests.iterdir())
+    except (FileNotFoundError, OSError):
+        return
+    for path in children:
+        if (
+            path_is_redirected(path)
+            or not path.is_file()
+            or not HASH_RE.fullmatch(path.stem)
+            or path.suffix != ".json"
+            or path.stem in keep
+        ):
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            continue
+    fsync_directory(paths.audit_manifests)
+
+
+def write_audit_drift_receipt(
+    paths, reasons, marker=None, prior_witness=None, state=None
+):
+    """Preserve unexplained-drift evidence without pausing the store.
+
+    Drift that a passing full audit could not condemn is recorded as
+    append-only derived evidence and surfaced by doctor. Evidence writing
+    must never take down the operation it describes, so every failure here
+    degrades to returning None.
+    """
+    reasons = [str(reason) for reason in reasons if reason][:40]
+    if not reasons:
+        return None
+    try:
+        newest = list_audit_drift_receipts(paths)[-1:]
+        if newest:
+            existing = read_json_strict(newest[0], newest[0].name)
+            if existing.get("reasons") == reasons:
+                # A repeated attempt against the same divergence adds no
+                # evidence; the newest receipt already carries it.
+                return newest[0]
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        pass
+    try:
+        record = {
+            "drift_schema": AUDIT_DRIFT_SCHEMA,
+            "created_at": now_iso(),
+            "reasons": reasons,
+            "prior_witness_hash": (
+                prior_witness.get("witness_hash")
+                if isinstance(prior_witness, dict) else None
+            ),
+            "head_revision": state.get("head_revision") if state else None,
+            "head_hash": state.get("head_hash") if state else None,
+            "audit_epoch": state_audit_epoch(state) if state else None,
+            "transition_marker": marker,
+        }
+        if path_is_redirected(paths.audit_drift):
+            return None
+        ensure_directory_durable(paths.audit_drift)
+        digest = sha256_bytes(canonical_json_bytes(record))[:16]
+        stamp = record["created_at"].replace(":", "").replace("-", "")
+        path = paths.audit_drift / f"D{stamp}-{digest}.json"
+        if not path.exists() and not path.is_symlink():
+            atomic_write_json(path, record)
+        prune_audit_drift_receipts(paths)
+        return path
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError, KeyError):
+        return None
+
+
+def list_audit_drift_receipts(paths):
+    try:
+        return sorted(
+            (
+                path for path in paths.audit_drift.iterdir()
+                if not path.is_symlink()
+                and path.is_file()
+                and path.name.startswith("D")
+                and path.suffix == ".json"
+            ),
+            key=lambda item: item.name,
+        )
+    except (FileNotFoundError, OSError):
+        return []
+
+
+def prune_audit_drift_receipts(paths):
+    """Bound drift evidence to the most recent receipts."""
+    for path in list_audit_drift_receipts(paths)[:-AUDIT_DRIFT_KEEP]:
+        with contextlib.suppress(OSError):
+            path.unlink()
+
+
+def audit_drift_summary(paths, limit=3):
+    """Total receipt count plus the newest receipts, for reporting."""
+    children = list_audit_drift_receipts(paths)
+    records = []
+    for path in reversed(children[-max(0, int(limit)):]):
+        try:
+            record = read_json_strict(path, path.name)
+        except (BimriError, OSError, UnicodeError):
+            continue
+        if record.get("drift_schema") == AUDIT_DRIFT_SCHEMA:
+            record["receipt_name"] = path.name
+            records.append(record)
+    return len(children), records
+
+
+def write_audit_witness(paths, state, conflicts=None, manifest=None, run_facts=None):
+    """Publish detailed audit evidence, then its compact read checkpoint."""
+    del conflicts  # Read projections never come from the checkpoint.
+    try:
+        if authority_has_unsettled_records(paths):
+            paths.validated_audit_witness = None
+            if not (
+                paths.audit_transition.exists()
+                or paths.audit_transition.is_symlink()
+            ):
+                discard_audit_witness(paths)
+            return False
+        if run_facts is None:
+            run_facts = audit_witness_run_facts(paths, state)
+        if manifest is None:
+            manifest = audit_witness_manifest(paths)
+        manifest = normalize_audit_manifest(manifest)
+        manifest_hash = audit_witness_digest(manifest)
+        transition = load_audit_transition(paths)
+        frozen_completion = (
+            transition.get("scope", {}).get("completion")
+            if transition is not None and transition["kind"] == "authority"
+            else None
+        )
+        created_at = (
+            frozen_completion["witness"]["created_at"]
+            if frozen_completion is not None
+            else now_iso()
+        )
+        manifest_record = {
+            "manifest_schema": AUDIT_MANIFEST_SCHEMA,
+            "created_at": created_at,
+            "manifest": manifest,
+            "manifest_hash": manifest_hash,
+            "manifest_count": len(manifest),
+        }
+        manifest_record["manifest_file_hash"] = audit_record_seal(
+            manifest_record, "manifest_file_hash"
+        )
+        proposal_runs = audit_witness_proposal_runs(run_facts, state)
+        witness = {
+            "witness_schema": AUDIT_WITNESS_SCHEMA,
+            "engine_version": ENGINE_VERSION,
+            "memory_format_version": MEMORY_FORMAT_VERSION,
+            "policy_version": AUTHORITY_POLICY_VERSION,
+            "created_at": created_at,
+            "head_revision": state["head_revision"],
+            "head_hash": state["head_hash"],
+            "state_hash": audit_witness_state_hash(state, proposal_runs),
+            "write_state_hash": audit_witness_write_state_hash(state),
+            "audit_epoch": state_audit_epoch(state),
+            "run_authority_hash": audit_witness_digest(run_facts),
+            "manifest_hash": manifest_hash,
+            "manifest_count": len(manifest),
+            "proposal_runs": proposal_runs,
+        }
+        witness["witness_hash"] = audit_record_seal(witness, "witness_hash")
+        if (
+            frozen_completion is not None
+            and witness != frozen_completion["witness"]
+        ):
+            raise BimriError(
+                "live authority no longer matches its frozen completed checkpoint."
+            )
+        # Freeze the exact M1/run/state/head closure before either M1 or W1 is
+        # published. Recovery compares against this record and never expands
+        # scope from the post-crash tree.
+        seal_authority_transition_completion(paths, state, witness)
+        if path_is_redirected(paths.audit_manifest):
+            raise BimriError("audit manifest destination is redirected.")
+        if paths.audit_manifest.exists() and paths.audit_manifest.is_dir():
+            raise BimriError("audit manifest destination is a directory.")
+        # Publish immutable evidence first. The fixed alias remains for
+        # operators and transitional installs; checkpoints resolve the
+        # content-addressed generation so replacing the alias cannot strand
+        # an older witness after a crash.
+        write_audit_manifest_generation(paths, manifest_record)
+        atomic_write_json(paths.audit_manifest, manifest_record)
+        if path_is_redirected(paths.audit_witness):
+            raise BimriError("audit witness destination is redirected.")
+        if paths.audit_witness.exists() and paths.audit_witness.is_dir():
+            raise BimriError("audit witness destination is a directory.")
+        atomic_write_json(paths.audit_witness, witness)
+        paths.validated_audit_witness = witness
+        return True
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        paths.validated_audit_witness = None
+        if not (
+            paths.audit_transition.exists()
+            or paths.audit_transition.is_symlink()
+        ):
+            discard_audit_witness(paths)
+        return False
+
+
+def sealed_witness_matches_state(witness, state, include_write_state=True):
+    try:
+        if (
+            witness["head_revision"] != state["head_revision"]
+            or witness["head_hash"] != state["head_hash"]
+            or witness["audit_epoch"] != state_audit_epoch(state)
+            or witness["state_hash"] != audit_witness_state_hash(
+                state, witness["proposal_runs"]
+            )
+        ):
+            return False
+        if include_write_state and witness["write_state_hash"] != (
+            audit_witness_write_state_hash(state)
+        ):
+            return False
+        return True
+    except (BimriError, KeyError, TypeError, ValueError):
+        return False
+
+
+def frozen_authority_transition_scope(paths, operation, run_id, scope):
+    """Freeze immutable authority inputs before the first transition write."""
+    frozen = copy.deepcopy(scope or {})
+    proposal_ids = set()
+    for value in frozen.get("proposal_ids", []):
+        proposal_ids.add(validate_fixed_id(
+            value, PROPOSAL_RE, "audit transition proposal ID"
+        ))
+    if operation in {"sync", "close-authority-run"} and run_id:
+        proposal_ids.update(
+            path.stem
+            for path in paths.proposals.glob(f"{run_id}-Q*.json")
+            if PROPOSAL_RE.fullmatch(path.stem)
+        )
+    conflict_id = frozen.get("conflict_id")
+    if operation == "resolve" and conflict_id:
+        conflict_id = validate_fixed_id(
+            conflict_id, CONFLICT_RE, "audit transition conflict ID"
+        )
+        cpath = conflict_path(paths, conflict_id)
+        if path_is_redirected(cpath) or not cpath.is_file():
+            raise BimriError("cannot freeze a missing or unsafe conflict.")
+        conflict = validate_conflict_record(
+            paths,
+            read_json_strict(cpath, cpath.name),
+            expected_conflict_id=conflict_id,
+            verify_candidates=False,
+        )
+        proposal_ids.update(conflict["proposal_ids"])
+    proposal_ids = sorted(proposal_ids)
+    provided_hashes = frozen.get("proposal_hashes", {})
+    if not isinstance(provided_hashes, dict):
+        raise BimriError("audit transition proposal hashes are invalid.")
+    proposal_hashes = {}
+    for proposal_id in proposal_ids:
+        path = proposal_path(paths, proposal_id)
+        if path_is_redirected(path):
+            raise BimriError(
+                f"cannot freeze redirected proposal {proposal_id}."
+            )
+        if path.is_file():
+            digest = sha256_bytes(path.read_bytes())
+            supplied = provided_hashes.get(proposal_id)
+            if supplied is not None and supplied != digest:
+                raise BimriError(
+                    f"audit transition proposal hash changed for {proposal_id}."
+                )
+            proposal_hashes[proposal_id] = digest
+        else:
+            digest = provided_hashes.get(proposal_id)
+            if not isinstance(digest, str) or not HASH_RE.fullmatch(digest):
+                raise BimriError(
+                    f"new proposal {proposal_id} lacks its exact intended hash."
+                )
+            proposal_hashes[proposal_id] = digest
+    if set(provided_hashes) - set(proposal_ids):
+        raise BimriError("audit transition contains an unscoped proposal hash.")
+    frozen["proposal_ids"] = proposal_ids
+    frozen["proposal_hashes"] = proposal_hashes
+    # The exact post-effect checkpoint is sealed after all engine effects are
+    # durable but before manifest/witness publication. A crash before that seal
+    # remains an incomplete transition and is never inferred from live files.
+    frozen["completion"] = None
+    return frozen
+
+
+def validate_frozen_authority_transition_scope(scope):
+    if not isinstance(scope, dict):
+        raise BimriError("audit transition scope is invalid.")
+    proposal_ids = scope.get("proposal_ids")
+    proposal_hashes = scope.get("proposal_hashes")
+    if (
+        not isinstance(proposal_ids, list)
+        or proposal_ids != sorted(set(proposal_ids))
+        or not isinstance(proposal_hashes, dict)
+        or set(proposal_hashes) != set(proposal_ids)
+    ):
+        raise BimriError("audit transition frozen proposal scope is invalid.")
+    for proposal_id in proposal_ids:
+        validate_fixed_id(
+            proposal_id, PROPOSAL_RE, "audit transition proposal ID"
+        )
+        digest = proposal_hashes[proposal_id]
+        if not isinstance(digest, str) or not HASH_RE.fullmatch(digest):
+            raise BimriError("audit transition proposal hash is invalid.")
+    completion = scope.get("completion")
+    if completion is not None:
+        if set(completion) != {"state_file_hash", "witness"}:
+            raise BimriError("audit transition completion fields are invalid.")
+        state_file_hash = completion.get("state_file_hash")
+        if (
+            not isinstance(state_file_hash, str)
+            or not HASH_RE.fullmatch(state_file_hash)
+            or validate_sealed_audit_witness_record(completion.get("witness"))
+            is None
+        ):
+            raise BimriError("audit transition completion is invalid.")
+    return scope
+
+
+def seal_authority_transition_completion(paths, state, witness):
+    """Bind the exact completed state/inventory/run facts before W1 publish."""
+    marker = load_audit_transition(paths)
+    if marker is None or marker["kind"] != "authority":
+        return
+    if path_is_redirected(paths.state) or not paths.state.is_file():
+        raise BimriError("cannot seal authority completion without safe state.")
+    validate_frozen_authority_transition_scope(marker["scope"])
+    for proposal_id, expected_hash in marker["scope"]["proposal_hashes"].items():
+        path = proposal_path(paths, proposal_id)
+        if (
+            path_is_redirected(path)
+            or not path.is_file()
+            or sha256_bytes(path.read_bytes()) != expected_hash
+        ):
+            raise BimriError(
+                f"authority transition proposal changed outside scope: {proposal_id}."
+            )
+    completion = {
+        "state_file_hash": sha256_bytes(paths.state.read_bytes()),
+        "witness": witness,
+    }
+    existing = marker["scope"].get("completion")
+    if existing is not None and existing != completion:
+        raise BimriError("authority transition completed bytes changed before publish.")
+    if existing is None:
+        marker["scope"]["completion"] = completion
+        marker["transition_hash"] = audit_record_seal(marker, "transition_hash")
+        atomic_write_json(paths.audit_transition, marker)
+        # Re-read the durable marker so malformed or truncated evidence cannot
+        # be followed by checkpoint publication.
+        load_audit_transition(paths)
+
+
+def begin_authority_checkpoint_transition(
+    paths, state, operation, run_id=None, scope=None
+):
+    """Persist W0/M0 and dirty the state epoch before authority mutation."""
+    prior = paths.validated_audit_witness or load_sealed_audit_witness(paths)
+    if prior is None or not sealed_witness_matches_state(prior, state):
+        raise BimriError(
+            "cannot begin an authority transition without an intact checkpoint."
+        )
+    ensure_audit_manifest_generation(paths, prior)
+    before = state_audit_epoch(state)
+    frozen_scope = frozen_authority_transition_scope(
+        paths, operation, run_id, scope
+    )
+    marker = write_audit_transition(paths, {
+        "transition_schema": AUDIT_TRANSITION_SCHEMA,
+        "created_at": now_iso(),
+        "kind": "authority",
+        "operation": clean_scalar(operation, "audit transition operation", 80),
+        "run_id": run_id,
+        "scope": frozen_scope,
+        "prior_witness": prior,
+        "prior_witness_hash": prior["witness_hash"],
+        "prior_manifest_hash": prior["manifest_hash"],
+        "epoch_before": before,
+        "epoch_after": before + 1,
+        "pre_write_state_hash": audit_witness_write_state_hash(state),
+        "pre_write_state": audit_witness_write_state_payload(state),
+        "post_write_state_hash": None,
+        "log_path": None,
+        "pre_log_hash": None,
+        "post_log_hash": None,
+        "log_append": None,
+    })
+    state["_audit_epoch"] = marker["epoch_after"]
+    # The epoch is the durable dirty bit. A crash after this replace makes W0
+    # unreadable while W0 and its content-addressed M0 remain recoverable.
+    save_state(paths, state)
+    paths.validated_audit_witness = None
+    return marker
+
+
+def complete_authority_checkpoint_transition(paths):
+    marker = load_audit_transition(paths)
+    if marker is None:
+        return
+    if marker["kind"] != "authority":
+        raise BimriError("cannot complete authority through a lifecycle marker.")
+    clear_audit_transition(paths)
+    prune_audit_manifest_generations(paths)
+
+
+def begin_lifecycle_checkpoint_transition(
+    paths, state, post_state, operation, run_id, log_path, post_log_text
+):
+    """Write ahead one bounded start/close state+log transition."""
+    prior = paths.validated_audit_witness
+    if prior is None or not sealed_witness_matches_state(prior, state):
+        return None
+    validate_state(post_state)
+    ensure_audit_manifest_generation(paths, prior)
+    relative_log = log_path.relative_to(paths.root).as_posix()
+    if path_is_redirected(log_path):
+        raise BimriError("lifecycle run log is redirected.")
+    if log_path.exists():
+        if not log_path.is_file():
+            raise BimriError("lifecycle run log is not a regular file.")
+        pre_bytes = log_path.read_bytes()
+        pre_hash = sha256_bytes(pre_bytes)
+        try:
+            pre_text = pre_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise BimriError("lifecycle run log is not UTF-8.") from exc
+    else:
+        pre_text = ""
+        pre_hash = "absent"
+    if not post_log_text.startswith(pre_text):
+        raise BimriError("lifecycle log update is not an exact append.")
+    append = post_log_text[len(pre_text):]
+    marker = write_audit_transition(paths, {
+        "transition_schema": AUDIT_TRANSITION_SCHEMA,
+        "created_at": now_iso(),
+        "kind": "lifecycle",
+        "operation": clean_scalar(operation, "audit transition operation", 80),
+        "run_id": validate_fixed_id(run_id, RUN_RE, "run ID"),
+        "scope": {},
+        "prior_witness": prior,
+        "prior_witness_hash": prior["witness_hash"],
+        "prior_manifest_hash": prior["manifest_hash"],
+        "epoch_before": state_audit_epoch(state),
+        "epoch_after": state_audit_epoch(post_state),
+        "pre_write_state_hash": audit_witness_write_state_hash(state),
+        "pre_write_state": audit_witness_write_state_payload(state),
+        "post_write_state_hash": audit_witness_write_state_hash(post_state),
+        "log_path": relative_log,
+        "pre_log_hash": pre_hash,
+        "post_log_hash": sha256_text(post_log_text),
+        "log_append": append,
+    })
+    paths.pending_checkpoint_witness = prior
+    return marker
+
+
+def lifecycle_log_hash(path):
+    if path_is_redirected(path):
+        raise BimriError("lifecycle run log is redirected.")
+    if not path.exists():
+        return "absent"
+    if not path.is_file():
+        raise BimriError("lifecycle run log is not a regular file.")
+    return sha256_bytes(path.read_bytes())
+
+
+def publish_lifecycle_checkpoint(paths, state, marker):
+    prior = marker["prior_witness"]
+    if (
+        state_audit_epoch(state) != marker["epoch_after"]
+        or audit_witness_write_state_hash(state)
+        != marker["post_write_state_hash"]
+        or state["head_revision"] != prior["head_revision"]
+        or state["head_hash"] != prior["head_hash"]
+    ):
+        raise BimriError("lifecycle state does not match its durable transition.")
+    witness = dict(prior)
+    witness.update({
+        "state_hash": audit_witness_state_hash(
+            state, witness["proposal_runs"]
+        ),
+        "write_state_hash": audit_witness_write_state_hash(state),
+        "audit_epoch": state_audit_epoch(state),
+    })
+    witness["witness_hash"] = audit_record_seal(witness, "witness_hash")
+    ensure_audit_manifest_generation(paths, prior)
+    atomic_write_json(paths.audit_witness, witness)
+    paths.validated_audit_witness = witness
+    clear_audit_transition(paths)
+    paths.pending_checkpoint_witness = None
+    prune_audit_manifest_generations(paths)
+    return True
+
+
+def finish_lifecycle_log(paths, marker):
+    log_path = paths.root.joinpath(*PurePosixPath(marker["log_path"]).parts)
+    current_hash = lifecycle_log_hash(log_path)
+    if current_hash == marker["post_log_hash"]:
+        return
+    if current_hash != marker["pre_log_hash"]:
+        raise BimriError("lifecycle run log changed outside its transition.")
+    if current_hash == "absent":
+        exclusive_write_text(log_path, marker["log_append"])
+    else:
+        current = log_path.read_text(encoding="utf-8")
+        atomic_write_text(log_path, current + marker["log_append"])
+    if lifecycle_log_hash(log_path) != marker["post_log_hash"]:
+        raise BimriError("lifecycle run log did not reach its intended bytes.")
+
+
+def authority_transition_state_issues(marker, state):
+    """Reject state deltas outside the engine operation recorded pre-write."""
+    before = copy.deepcopy(marker["pre_write_state"])
+    current = audit_witness_write_state_payload(state)
+    operation = marker["operation"]
+    allowed_top = set()
+    if operation in {
+        "sync", "close-authority-run", "resolve",
+        "recover-interrupted-authority", "authority-recovery",
+    }:
+        allowed_top.update({
+            "head_revision", "head_hash", "conflict_count", "pattern_count",
+            "cold_current", "last_revision_reason",
+        })
+    elif operation == "recover-manual-hot-edit":
+        allowed_top.add("conflict_count")
+    for field in allowed_top:
+        before.pop(field, None)
+        current.pop(field, None)
+    run_id = marker.get("run_id")
+    if operation in {"sync", "close-authority-run"} and run_id:
+        before_active = before.get("active_runs", {})
+        current_active = current.get("active_runs", {})
+        if operation == "sync":
+            before_meta = before_active.get(run_id)
+            current_meta = current_active.get(run_id)
+            if isinstance(before_meta, dict) and isinstance(current_meta, dict):
+                before_meta.pop("base_revision", None)
+                current_meta.pop("base_revision", None)
+        else:
+            before_active.pop(run_id, None)
+            current_active.pop(run_id, None)
+            before_sessions = before.get("session_runs", {})
+            current_sessions = current.get("session_runs", {})
+            for key, value in list(before_sessions.items()):
+                if value == run_id:
+                    before_sessions.pop(key, None)
+            for key, value in list(current_sessions.items()):
+                if value == run_id:
+                    current_sessions.pop(key, None)
+    if before != current:
+        return [
+            "interrupted authority transition contains an out-of-scope state change"
+        ]
+    return []
+
+
+def authority_transition_proposal_ids(paths, marker):
+    del paths
+    validate_frozen_authority_transition_scope(marker.get("scope"))
+    return set(marker["scope"]["proposal_ids"])
+
+
+def authority_transition_allowed_manifest_paths(paths, state, marker):
+    """Return only graph paths provably tied to the recorded operation scope."""
+    allowed = set()
+    proposal_ids = authority_transition_proposal_ids(paths, marker)
+    for proposal_id in proposal_ids:
+        if marker["operation"] == "propose":
+            allowed.add(f".bimri/proposals/{proposal_id}.json")
+        dpath = decision_path(paths, proposal_id)
+        if dpath.is_file() and not path_is_redirected(dpath):
+            try:
+                decision = validate_decision(
+                    read_json_strict(dpath, dpath.name), proposal_id
+                )
+            except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+                continue
+            allowed.add(f".bimri/decisions/{proposal_id}.json")
+            for field in ("revision", "revision_before"):
+                revision = decision.get(field)
+                if isinstance(revision, int) and not isinstance(revision, bool):
+                    allowed.add(f".bimri/revisions/V{revision:06d}.md")
+            conflict_id = decision.get("conflict_id") or decision.get(
+                "resolution_id"
+            )
+            if isinstance(conflict_id, str) and CONFLICT_RE.fullmatch(conflict_id):
+                allowed.add(f".bimri/conflicts/{conflict_id}.json")
+                allowed.add(f".bimri/resolutions/{conflict_id}.json")
+    conflict_id = marker.get("scope", {}).get("conflict_id")
+    if isinstance(conflict_id, str) and CONFLICT_RE.fullmatch(conflict_id):
+        allowed.add(f".bimri/resolutions/{conflict_id}.json")
+    if marker["operation"] == "recover-manual-hot-edit":
+        hot_hash = marker.get("scope", {}).get("hot_hash")
+        if isinstance(hot_hash, str) and HASH_RE.fullmatch(hot_hash):
+            allowed.update({
+                f".bimri/recovery/manual-hot-{hot_hash}.md",
+                f".bimri/recovery/manual-hot-{hot_hash}.bin",
+            })
+        for path in paths.conflicts.glob("C*.json"):
+            if CONFLICT_RE.fullmatch(path.stem):
+                allowed.add(f".bimri/conflicts/{path.name}")
+    return allowed
+
+
+def authority_transition_completion_issues(
+    paths, state, marker, manifest, run_facts
+):
+    completion = marker.get("scope", {}).get("completion")
+    if completion is not None:
+        try:
+            validate_frozen_authority_transition_scope(marker["scope"])
+            expected = completion["witness"]
+            exact_issues = []
+            if audit_witness_digest(manifest) != expected["manifest_hash"]:
+                exact_issues.append(
+                    "completed authority inventory differs from its frozen closure"
+                )
+            if len(manifest) != expected["manifest_count"]:
+                exact_issues.append(
+                    "completed authority inventory count differs from its frozen closure"
+                )
+            if audit_witness_digest(run_facts) != expected["run_authority_hash"]:
+                exact_issues.append(
+                    "completed authority run facts differ from their frozen closure"
+                )
+            if (
+                path_is_redirected(paths.state)
+                or not paths.state.is_file()
+                or sha256_bytes(paths.state.read_bytes())
+                != completion["state_file_hash"]
+            ):
+                exact_issues.append(
+                    "completed authority state bytes differ from their frozen closure"
+                )
+            if not sealed_witness_matches_state(expected, state):
+                exact_issues.append(
+                    "completed authority state/head differs from its frozen closure"
+                )
+            for proposal_id, expected_hash in marker["scope"][
+                "proposal_hashes"
+            ].items():
+                path = proposal_path(paths, proposal_id)
+                if (
+                    path_is_redirected(path)
+                    or not path.is_file()
+                    or sha256_bytes(path.read_bytes()) != expected_hash
+                ):
+                    exact_issues.append(
+                        "completed authority proposal differs from frozen intent: "
+                        + proposal_id
+                    )
+            conflicts, conflict_issues = scan_open_conflicts(paths, state)
+            del conflicts
+            semantic_issues = authority_storage_issues(
+                paths, state, allow_recoverable_applying=True
+            )
+            if authority_has_unsettled_records(paths):
+                semantic_issues.append(
+                    "interrupted authority transition still has applying or failed records"
+                )
+            return list(dict.fromkeys(
+                exact_issues + semantic_issues + conflict_issues
+            ))
+        except (BimriError, OSError, UnicodeError, ValueError, TypeError) as exc:
+            return [f"frozen authority completion is invalid: {exc}"]
+
+    allowed = authority_transition_allowed_manifest_paths(paths, state, marker)
+    # Accepted replacements append displaced entries to cold archive months
+    # as a routine engine effect. Existing archive files are therefore
+    # transition-explained; a deleted month still surfaces as drift.
+    with contextlib.suppress(OSError):
+        for archive_path in paths.archive.glob("*.md"):
+            if not archive_path.is_symlink():
+                allowed.add(f".bimri/archive/{archive_path.name}")
+    mismatch = audit_checkpoint_mismatch_issues(
+        paths,
+        state,
+        marker["prior_witness"],
+        manifest,
+        run_facts,
+        allowed_manifest_paths=allowed,
+        allow_audit_epoch_advance=True,
+    )
+    # Head/current/run facts are expected to move inside a scoped transition;
+    # their *content* is re-proven below. Inventory paths and state scope are
+    # the independent checks that prevent unrelated drift from riding along.
+    mismatch = [
+        issue for issue in mismatch
+        if not issue.startswith((
+            "current authority state differs",
+            "authority-influencing state differs",
+            "accepted head differs",
+            "governance-relevant run facts differ",
+            "audit epoch differs",
+        ))
+    ]
+    state_issues = authority_transition_state_issues(marker, state)
     conflicts, conflict_issues = scan_open_conflicts(paths, state)
+    del conflicts
+    semantic_issues = authority_storage_issues(
+        paths, state, allow_recoverable_applying=True
+    )
+    unsettled = authority_has_unsettled_records(paths)
+    if unsettled:
+        semantic_issues.append(
+            "interrupted authority transition still has applying or failed records"
+        )
+    return list(dict.fromkeys(
+        ["interrupted authority transition has no frozen post-effect closure"]
+        + mismatch + state_issues + semantic_issues + conflict_issues
+    ))
+
+
+def preserve_corrupt_audit_transition(paths):
+    """Move an unreadable transition marker aside as exact-byte evidence."""
+    path = paths.audit_transition
+    try:
+        if path.is_symlink():
+            raw = os.fsencode(os.readlink(path))
+        elif path.is_file():
+            raw = path.read_bytes()
+        else:
+            return None
+        ensure_directory_durable(paths.audit_drift)
+        digest = sha256_bytes(raw)
+        target = paths.audit_drift / f"corrupt-transition-{digest[:16]}.bin"
+        if not target.exists() and not target.is_symlink():
+            exclusive_write_bytes(target, raw)
+        path.unlink()
+        fsync_directory(path.parent)
+        return target.relative_to(paths.root).as_posix()
+    except (OSError, UnicodeError):
+        return None
+
+
+def reconcile_audit_transition(paths, state):
+    """Complete a proven lifecycle cutpoint or preserve an authority baseline."""
+    try:
+        marker = load_audit_transition(paths)
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError) as exc:
+        # A corrupt write-ahead marker must never wedge recovery itself.
+        # Preserve its exact bytes as drift evidence, then rebuild trust
+        # through the full audit.
+        preserved = preserve_corrupt_audit_transition(paths)
+        reasons = [f"audit transition marker was invalid: {exc}"]
+        if preserved:
+            reasons.append(f"marker bytes preserved at {preserved}")
+        discard_audit_witness(paths)
+        write_audit_drift_receipt(paths, reasons, state=state)
+        return state
+    if marker is None:
+        return state
+    prior = marker["prior_witness"]
+    with contextlib.suppress(
+        BimriError, OSError, UnicodeError, ValueError, TypeError
+    ):
+        ensure_audit_manifest_generation(paths, prior)
+    if marker["kind"] == "lifecycle":
+        current_hash = audit_witness_write_state_hash(state)
+        log_path = paths.root.joinpath(*PurePosixPath(marker["log_path"]).parts)
+        current_log_hash = lifecycle_log_hash(log_path)
+        if (
+            current_hash == marker["pre_write_state_hash"]
+            and state_audit_epoch(state) == marker["epoch_before"]
+            and current_log_hash == marker["pre_log_hash"]
+        ):
+            # Marker durable, first state replace not reached.
+            atomic_write_json(paths.audit_witness, prior)
+            clear_audit_transition(paths)
+            paths.validated_audit_witness = prior
+            prune_audit_manifest_generations(paths)
+            return state
+        if (
+            current_hash == marker["post_write_state_hash"]
+            and state_audit_epoch(state) == marker["epoch_after"]
+            and current_log_hash in {
+                marker["pre_log_hash"], marker["post_log_hash"]
+            }
+        ):
+            finish_lifecycle_log(paths, marker)
+            publish_lifecycle_checkpoint(paths, state, marker)
+            return state
+        reasons = [
+            f"incomplete {marker['operation']} lifecycle transition for "
+            f"{marker['run_id']} does not match its intended state/log bytes"
+        ]
+        # Cache-miss semantics: preserve the evidence, retire the reconciled
+        # marker, and let the full semantic audit decide the store's fate.
+        write_audit_drift_receipt(
+            paths, reasons, marker=marker, prior_witness=prior, state=state
+        )
+        discard_audit_witness(paths)
+        clear_audit_transition(paths)
+        prune_audit_manifest_generations(paths)
+        return state
+
+    # If W1 reached disk and only marker cleanup was interrupted, its complete
+    # state binding is enough to finish the transaction without graph replay.
+    live = load_sealed_audit_witness(paths)
+    if live is not None and sealed_witness_matches_state(live, state):
+        try:
+            load_audit_manifest_evidence(paths, live)
+        except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+            pass
+        else:
+            paths.validated_audit_witness = live
+            clear_audit_transition(paths)
+            prune_audit_manifest_generations(paths)
+            return state
+
+    manifest = None
+    run_facts = None
+    reasons = []
+    try:
+        manifest = audit_witness_manifest(paths)
+        run_facts = audit_witness_run_facts(paths, state)
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError) as exc:
+        reasons.append(f"interrupted authority transition audit failed: {exc}")
+    if manifest is not None and run_facts is not None:
+        reasons.extend(authority_transition_completion_issues(
+            paths, state, marker, manifest, run_facts
+        ))
+    if not reasons:
+        # The full graph and exact scoped state/inventory delta prove either
+        # the pre-mutation cutpoint or a completely accepted engine effect.
+        if write_audit_witness(
+            paths, state, manifest=manifest, run_facts=run_facts
+        ):
+            clear_audit_transition(paths)
+            prune_audit_manifest_generations(paths)
+            return state
+        reasons.append("interrupted authority checkpoint could not be republished")
+    unsettled_reason = (
+        "interrupted authority transition still has applying or failed records"
+    )
+    incomplete_reason = (
+        "interrupted authority transition has no frozen post-effect closure"
+    )
+    if set(reasons) <= {incomplete_reason, unsettled_reason}:
+        # A consistent applying record is the engine's durable intent. The
+        # existing recovery/retry path may finish it under this same marker.
+        return state
+    if marker["operation"] == "resolve":
+        conflict_id = marker.get("scope", {}).get("conflict_id")
+        target_prefix = f"resolution {conflict_id} ("
+        retry_marker = "resolution status is failed; explicit retry is required."
+        non_retry_reasons = [
+            reason for reason in reasons
+            if not (
+                reason in {incomplete_reason, unsettled_reason}
+                or (
+                    isinstance(conflict_id, str)
+                    and reason.startswith(target_prefix)
+                    and retry_marker in reason
+                )
+            )
+        ]
+        if not non_retry_reasons:
+            # Keep W0 invalid and retain the transition, but do not manufacture
+            # a general block: only an explicit retry of this exact conflict is
+            # permitted by require_governance_for_resolution_retry.
+            return state
+    write_audit_drift_receipt(
+        paths, reasons, marker=marker, prior_witness=prior, state=state
+    )
+    discard_audit_witness(paths)
+    clear_audit_transition(paths)
+    prune_audit_manifest_generations(paths)
+    return state
+
+
+def refresh_audit_checkpoint_after_state_write(paths, state):
+    """Retain a verdict when a lifecycle write changed no authority state."""
+    try:
+        marker = load_audit_transition(paths)
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        marker = None
+    if marker is not None:
+        if marker["kind"] != "lifecycle":
+            return False
+        return publish_lifecycle_checkpoint(paths, state, marker)
+    witness = paths.pending_checkpoint_witness or paths.validated_audit_witness
+    paths.pending_checkpoint_witness = None
+    if witness is None:
+        return False
+    try:
+        if (
+            witness["head_revision"] != state["head_revision"]
+            or witness["head_hash"] != state["head_hash"]
+            or witness["state_hash"] != audit_witness_state_hash(
+                state, witness["proposal_runs"]
+            )
+            or witness["write_state_hash"]
+            != audit_witness_write_state_hash(state)
+            or witness["audit_epoch"] != state_audit_epoch(state)
+        ):
+            paths.validated_audit_witness = None
+            return False
+        paths.validated_audit_witness = witness
+        return True
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        discard_audit_witness(paths)
+        return False
+
+
+def prepare_audit_checkpoint_state_write(paths):
+    """Remember a checkpoint across a lifecycle-only state mutation."""
+    witness = paths.validated_audit_witness
+    paths.pending_checkpoint_witness = None
+    if witness is None:
+        return False
+    paths.pending_checkpoint_witness = witness
+    return True
+
+
+def invalidate_audit_witness_before_authority_write(paths):
+    """Strict crash marker: no authority byte changes while a verdict survives."""
+    paths.validated_audit_witness = None
+    path = paths.audit_witness
+    if path_is_redirected(path):
+        raise BimriError("audit witness is redirected and cannot be invalidated.")
+    if path.exists():
+        if not path.is_file():
+            raise BimriError("audit witness is not a regular file.")
+        path.unlink()
+        fsync_directory(path.parent)
+    if path.exists() or path.is_symlink():
+        raise BimriError("audit witness invalidation did not complete.")
+
+
+def authority_has_recoverable_applying(paths):
+    """Detect the only case where the recovery audit is weaker than normal."""
+    for directory, field, value in (
+        (paths.decisions, "outcome", "applying"),
+        (paths.resolutions, "status", "applying"),
+    ):
+        for path in sorted(directory.glob("*.json")):
+            if path_is_redirected(path) or not path.is_file():
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                continue
+            if isinstance(data, dict) and data.get(field) == value:
+                return True
+    return False
+
+
+def authority_has_unsettled_records(paths):
+    """Return true while authority needs recovery or completion, not caching."""
+    for directory, field, values in (
+        (paths.decisions, "outcome", {"applying"}),
+        (paths.resolutions, "status", {"applying", "failed"}),
+    ):
+        for path in sorted(directory.glob("*.json")):
+            if path_is_redirected(path) or not path.is_file():
+                return True
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                return True
+            if isinstance(data, dict) and data.get(field) in values:
+                return True
+    return False
+
+
+def load_audit_blocked_record(paths):
+    path = paths.audit_blocked
+    if not (path.exists() or path.is_symlink()):
+        return None
+    if path_is_redirected(path) or not path.is_file():
+        raise BimriError("audit checkpoint is blocked by an unsafe marker")
+    record = read_json_strict(path, "audit blocked marker")
+    expected = {
+        "blocked_schema", "created_at", "reasons", "prior_witness",
+        "prior_witness_hash", "prior_manifest", "marker_hash",
+    }
+    if set(record) != expected:
+        raise BimriError("audit blocked marker fields are invalid.")
+    if record.get("blocked_schema") != AUDIT_BLOCKED_SCHEMA:
+        raise BimriError("audit blocked marker schema is invalid.")
+    parse_timestamp(record.get("created_at"), "audit blocked timestamp")
+    reasons = record.get("reasons")
+    if (
+        not isinstance(reasons, list)
+        or not reasons
+        or not all(isinstance(reason, str) and reason for reason in reasons)
+    ):
+        raise BimriError("audit blocked reasons are invalid.")
+    prior_hash = record.get("prior_witness_hash")
+    prior_witness = record.get("prior_witness")
+    if prior_witness is None:
+        if prior_hash is not None or record.get("prior_manifest") is not None:
+            raise BimriError("audit blocked prior witness hash is orphaned.")
+    else:
+        validated = validate_sealed_audit_witness_record(prior_witness)
+        if (
+            validated is None
+            or prior_hash != validated.get("witness_hash")
+        ):
+            raise BimriError("audit blocked prior witness evidence is invalid.")
+        prior_manifest = record.get("prior_manifest")
+        if prior_manifest is not None:
+            load_audit_manifest_evidence(
+                paths, validated, manifest_override=prior_manifest
+            )
+    if record.get("marker_hash") != audit_record_seal(
+        record, "marker_hash"
+    ):
+        raise BimriError("audit blocked marker seal is invalid.")
+    return record
+
+
+def load_audit_blocked_issues(paths):
+    try:
+        record = load_audit_blocked_record(paths)
+        if record is None:
+            return []
+        return [
+            f"audit checkpoint blocked: {reason}"
+            for reason in record["reasons"]
+        ]
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError) as exc:
+        return [f"audit checkpoint blocked marker is invalid: {exc}"]
+
+
+def load_audit_blocked_prior_witness(paths):
+    try:
+        record = load_audit_blocked_record(paths)
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        return None
+    return record.get("prior_witness") if record is not None else None
+
+
+def load_audit_blocked_prior_manifest(paths):
+    try:
+        record = load_audit_blocked_record(paths)
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        return None
+    return record.get("prior_manifest") if record is not None else None
+
+
+def record_audit_blocked(paths, witness, reasons, prior_manifest=None):
+    reasons = list(dict.fromkeys(str(reason) for reason in reasons if reason))
+    if witness is not None and prior_manifest is None:
+        try:
+            existing = load_audit_blocked_record(paths)
+        except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+            existing = None
+        if (
+            existing is not None
+            and existing.get("prior_witness_hash") == witness.get("witness_hash")
+        ):
+            prior_manifest = existing.get("prior_manifest")
+        if prior_manifest is None:
+            try:
+                prior_manifest = load_audit_manifest_evidence(paths, witness)
+            except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+                prior_manifest = None
+    record = {
+        "blocked_schema": AUDIT_BLOCKED_SCHEMA,
+        "created_at": now_iso(),
+        "reasons": reasons[:20] or ["protected audit evidence changed"],
+        "prior_witness": witness,
+        "prior_witness_hash": (
+            witness.get("witness_hash") if witness is not None else None
+        ),
+        "prior_manifest": prior_manifest,
+    }
+    record["marker_hash"] = audit_record_seal(record, "marker_hash")
+    if path_is_redirected(paths.audit_blocked):
+        raise BimriError("audit blocked marker destination is redirected.")
+    atomic_write_json(paths.audit_blocked, record)
+
+
+def clear_audit_blocked(paths):
+    path = paths.audit_blocked
+    if path_is_redirected(path):
+        raise BimriError("audit blocked marker is redirected.")
+    if path.exists():
+        if not path.is_file():
+            raise BimriError("audit blocked marker is not a regular file.")
+        path.unlink()
+        fsync_directory(path.parent)
+
+
+def audit_checkpoint_mismatch_issues(
+    paths,
+    state,
+    witness,
+    manifest,
+    run_facts,
+    allowed_manifest_paths=None,
+    prior_manifest_override=None,
+    allow_audit_epoch_advance=False,
+):
+    if witness is None:
+        return []
+    issues = []
+    try:
+        prior_manifest = load_audit_manifest_evidence(
+            paths, witness, manifest_override=prior_manifest_override
+        )
+    except (BimriError, OSError, UnicodeError) as exc:
+        return [f"prior audit manifest evidence is invalid: {exc}"]
+    if prior_manifest != manifest:
+        allowed_manifest_paths = set(allowed_manifest_paths or ())
+        prior_by_path = {
+            item["path"]: item["sha256"] for item in prior_manifest
+        }
+        current_by_path = {
+            item["path"]: item["sha256"] for item in manifest
+        }
+        changed = sorted(
+            path for path in prior_by_path.keys() & current_by_path.keys()
+            if (
+                prior_by_path[path] != current_by_path[path]
+                and path not in allowed_manifest_paths
+            )
+        )
+        added = sorted(
+            path for path in current_by_path.keys() - prior_by_path.keys()
+            if path not in allowed_manifest_paths
+        )
+        deleted = sorted(
+            path for path in prior_by_path.keys() - current_by_path.keys()
+            if path not in allowed_manifest_paths
+        )
+        details = []
+        for label, values in (
+            ("changed", changed), ("added", added), ("deleted", deleted)
+        ):
+            if values:
+                sample = ", ".join(values[:3])
+                suffix = f", +{len(values) - 3} more" if len(values) > 3 else ""
+                details.append(f"{label} {len(values)}: {sample}{suffix}")
+        if details:
+            issues.append(
+                "protected path/hash inventory differs from the prior audit witness"
+                + " (" + "; ".join(details) + ")"
+            )
+    try:
+        state_hash = audit_witness_state_hash(
+            state, witness.get("proposal_runs", [])
+        )
+    except (BimriError, KeyError, TypeError, ValueError) as exc:
+        issues.append(f"state could not be compared with prior audit: {exc}")
+    else:
+        if witness.get("state_hash") != state_hash:
+            issues.append("current authority state differs from the prior audit witness")
+    try:
+        write_state_hash = audit_witness_write_state_hash(state)
+    except (BimriError, KeyError, TypeError, ValueError) as exc:
+        issues.append(
+            f"authority-influencing state could not be compared with prior audit: {exc}"
+        )
+    else:
+        if witness.get("write_state_hash") != write_state_hash:
+            issues.append(
+                "authority-influencing state differs from the prior audit witness"
+            )
+    try:
+        current_epoch = state_audit_epoch(state)
+        prior_epoch = witness.get("audit_epoch")
+        epoch_matches = current_epoch == prior_epoch
+        if allow_audit_epoch_advance:
+            epoch_matches = (
+                isinstance(prior_epoch, int) and current_epoch >= prior_epoch
+            )
+        if not epoch_matches:
+            issues.append("audit epoch differs from the prior audit witness")
+    except (BimriError, TypeError, ValueError) as exc:
+        issues.append(f"audit epoch could not be compared with prior audit: {exc}")
+    if (
+        witness.get("head_revision") != state.get("head_revision")
+        or witness.get("head_hash") != state.get("head_hash")
+    ):
+        issues.append("accepted head differs from the prior audit witness")
+    if witness.get("run_authority_hash") != audit_witness_digest(run_facts):
+        issues.append("governance-relevant run facts differ from the prior audit witness")
+    return issues
+
+
+def refresh_audit_witness_after_trusted_write(paths, state):
+    """Publish a new verdict only after a pre-audited authority mutation."""
+    if not paths.authority_write_mode:
+        return False
+    try:
+        if not paths.authority_write_audit_healthy:
+            return False
+        if authority_has_unsettled_records(paths):
+            # W0 is retained as crash/recovery evidence. The advanced state
+            # epoch plus live transition makes it unreadable; deleting it
+            # would only discard the baseline needed by an explicit retry.
+            paths.validated_audit_witness = None
+            return False
+        published = write_audit_witness(paths, state)
+        if published:
+            complete_authority_checkpoint_transition(paths)
+        return published
+    finally:
+        paths.authority_write_mode = False
+        paths.authority_write_audit_healthy = False
+        paths.full_audit_manifest = None
+        paths.full_audit_run_facts = None
+
+
+def governance_snapshot(
+    paths,
+    state,
+    allow_recoverable_applying=False,
+    use_witness=True,
+    write_witness=True,
+    strict_prior_comparison=False,
+    audit_blocked=False,
+    recover_blocked=False,
+    prior_witness_override=None,
+    prior_manifest_override=None,
+    allowed_manifest_paths=None,
+    allow_audit_epoch_advance=False,
+):
+    blocked_issues = load_audit_blocked_issues(paths)
+    if blocked_issues and not audit_blocked:
+        return [], blocked_issues
+    if paths.authority_write_mode:
+        return scan_open_conflicts(paths, state)
+    if use_witness:
+        if paths.validated_audit_witness is not None:
+            return [], []
+        witness = load_valid_audit_witness(paths, state)
+        if witness is not None:
+            return [], []
+    live_prior_witness = load_sealed_audit_witness(paths)
+    blocked_prior_witness = load_audit_blocked_prior_witness(paths)
+    blocked_prior_manifest = load_audit_blocked_prior_manifest(paths)
+    if prior_witness_override is not None:
+        prior_witness = prior_witness_override
+        if (
+            prior_manifest_override is None
+            and blocked_prior_witness is not None
+            and blocked_prior_witness.get("witness_hash")
+            == prior_witness.get("witness_hash")
+        ):
+            prior_manifest_override = blocked_prior_manifest
+    elif live_prior_witness is not None:
+        prior_witness = live_prior_witness
+    else:
+        prior_witness = blocked_prior_witness
+        prior_manifest_override = blocked_prior_manifest
+    manifest = None
+    run_facts = None
+    inventory_issues = []
+    try:
+        manifest = audit_witness_manifest(paths)
+    except (BimriError, OSError, UnicodeError) as exc:
+        inventory_issues.append(f"protected inventory audit failed: {exc}")
+    try:
+        run_facts = audit_witness_run_facts(paths, state)
+    except (BimriError, OSError, UnicodeError) as exc:
+        inventory_issues.append(f"run authority audit failed: {exc}")
+    conflicts, conflict_issues = scan_open_conflicts(paths, state)
+    mismatch_issues = []
+    if manifest is not None and run_facts is not None:
+        mismatch_issues = audit_checkpoint_mismatch_issues(
+            paths,
+            state,
+            prior_witness,
+            manifest,
+            run_facts,
+            allowed_manifest_paths=allowed_manifest_paths,
+            prior_manifest_override=prior_manifest_override,
+            allow_audit_epoch_advance=allow_audit_epoch_advance,
+        )
+    if not strict_prior_comparison:
+        # Checkpoint divergence is a cache miss, never an issue: the full
+        # semantic audit is the authority on this store. Unexplained
+        # divergence is preserved as a drift receipt at publication.
+        paths.last_audit_drift = list(mismatch_issues)
     issues = list(dict.fromkeys(
         authority_storage_issues(
             paths,
@@ -3911,7 +5854,158 @@ def governance_snapshot(paths, state, allow_recoverable_applying=False):
             allow_recoverable_applying=allow_recoverable_applying,
         )
         + conflict_issues
+        + inventory_issues
+        + (mismatch_issues if strict_prior_comparison else [])
     ))
+    clear_block_after_publish = False
+    if blocked_issues:
+        if recover_blocked and prior_witness is not None and not issues:
+            clear_block_after_publish = True
+        elif not issues:
+            issues = blocked_issues
+    paths.full_audit_manifest = manifest
+    paths.full_audit_run_facts = run_facts
+    if issues:
+        if write_witness and prior_witness is None:
+            discard_audit_witness(paths)
+    elif write_witness and (
+        not allow_recoverable_applying
+        or not authority_has_recoverable_applying(paths)
+    ):
+        published = write_audit_witness(
+            paths,
+            state,
+            conflicts,
+            manifest=manifest,
+            run_facts=run_facts,
+        )
+        if not published:
+            # Unsettled records legitimately refuse a fresh checkpoint. The
+            # audit itself passed, so the caller proceeds; operations simply
+            # stay on the full-audit path until the store settles, and any
+            # recovery baseline stays uncleared.
+            pass
+        else:
+            if not strict_prior_comparison and mismatch_issues:
+                write_audit_drift_receipt(
+                    paths,
+                    mismatch_issues,
+                    prior_witness=prior_witness,
+                    state=state,
+                )
+            if clear_block_after_publish:
+                clear_audit_blocked(paths)
+                try:
+                    transition = load_audit_transition(paths)
+                except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+                    transition = None
+                if transition is not None and transition["kind"] == "authority":
+                    clear_audit_transition(paths)
+                prune_audit_manifest_generations(paths)
+    return conflicts, issues
+
+
+def verify_intact_audit_evidence(paths, state, prior_witness):
+    """Compare live bytes with an intact prior verdict without semantic replay."""
+    inventory_issues = []
+    manifest = None
+    run_facts = None
+    try:
+        manifest = audit_witness_manifest(paths)
+    except (BimriError, OSError, UnicodeError) as exc:
+        inventory_issues.append(f"protected inventory audit failed: {exc}")
+    try:
+        run_facts = audit_witness_run_facts(paths, state)
+    except (BimriError, OSError, UnicodeError) as exc:
+        inventory_issues.append(f"run authority audit failed: {exc}")
+    mismatch_issues = []
+    if manifest is not None and run_facts is not None:
+        mismatch_issues = audit_checkpoint_mismatch_issues(
+            paths, state, prior_witness, manifest, run_facts
+        )
+    return manifest, run_facts, list(dict.fromkeys(
+        inventory_issues + mismatch_issues
+    ))
+
+
+def begin_authority_write(
+    paths,
+    state,
+    allow_degraded=False,
+    operation="authority-write",
+    run_id=None,
+    scope=None,
+):
+    """Verify prior evidence, then durably invalidate before mutation."""
+    blocked_issues = load_audit_blocked_issues(paths)
+    if blocked_issues:
+        raise BimriError(
+            "authority recovery is required; shared-memory writes are paused: "
+            + " | ".join(blocked_issues[:3])
+        )
+    existing_transition = load_audit_transition(paths)
+    if paths.authority_write_mode and existing_transition is not None:
+        if existing_transition["kind"] != "authority":
+            raise BimriError("cannot resume authority through a lifecycle marker.")
+        return [], []
+    prior_witness = load_sealed_audit_witness(paths)
+    if prior_witness is not None:
+        manifest, run_facts, mismatch = verify_intact_audit_evidence(
+            paths, state, prior_witness
+        )
+        if not mismatch:
+            paths.full_audit_manifest = manifest
+            paths.full_audit_run_facts = run_facts
+            begin_authority_checkpoint_transition(
+                paths, state, operation, run_id=run_id, scope=scope
+            )
+            paths.authority_write_mode = True
+            paths.authority_write_audit_healthy = True
+            return [], []
+        # Divergence from the prior verdict is a cache miss, never a latch.
+        # Preserve it as drift evidence, then rebuild trust below with the
+        # complete semantic authority audit. The stale witness file stays on
+        # disk: warm reads keep serving inside the documented boundary, and
+        # a failed audit leaves W0 as the recovery baseline for quarantine.
+        write_audit_drift_receipt(
+            paths, mismatch, prior_witness=prior_witness, state=state
+        )
+
+    # Missing, corrupt or diverged derived evidence has no prior verdict to
+    # reuse. Rebuild trust once with the complete semantic authority audit.
+    conflicts, issues = governance_snapshot(
+        paths,
+        state,
+        use_witness=False,
+        write_witness=False,
+    )
+    if issues and not allow_degraded:
+        raise BimriError(
+            "authority recovery is required; shared-memory writes are paused: "
+            + " | ".join(issues[:3])
+        )
+    if not issues:
+        if write_audit_witness(
+            paths,
+            state,
+            conflicts,
+            manifest=paths.full_audit_manifest,
+            run_facts=paths.full_audit_run_facts,
+        ):
+            begin_authority_checkpoint_transition(
+                paths, state, operation, run_id=run_id, scope=scope
+            )
+        else:
+            # Unsettled records legitimately refuse a fresh checkpoint even
+            # though the audit passed. Invalidate durably and proceed; the
+            # post-write refresh publishes once the store settles.
+            invalidate_audit_witness_before_authority_write(paths)
+    else:
+        # Degraded proposal staging has no healthy verdict to preserve. It is
+        # already recovery-gated and cannot publish a new checkpoint.
+        invalidate_audit_witness_before_authority_write(paths)
+    paths.authority_write_mode = True
+    paths.authority_write_audit_healthy = not issues
     return conflicts, issues
 
 
@@ -3923,6 +6017,137 @@ def require_governance_healthy(paths, state):
             + " | ".join(issues[:3])
         )
     return conflicts
+
+
+def require_full_governance_healthy(paths, state):
+    """Audit authority and prior inventory evidence at an explicit boundary."""
+    conflicts, issues = governance_snapshot(
+        paths,
+        state,
+        use_witness=False,
+    )
+    if issues:
+        raise BimriError(
+            "authority recovery is required; shared-memory writes are paused: "
+            + " | ".join(issues[:3])
+        )
+    return conflicts
+
+
+def require_governance_for_resolution_retry(
+    paths, state, conflict_id
+):
+    """Permit only the failed target resolution through its repair command."""
+    blocked_issues = load_audit_blocked_issues(paths)
+    if blocked_issues:
+        raise BimriError(
+            "authority recovery is required; shared-memory writes are paused: "
+            + " | ".join(blocked_issues[:3])
+        )
+    transition = load_audit_transition(paths)
+    if (
+        transition is not None
+        and transition["kind"] == "authority"
+        and transition["operation"] == "resolve"
+        and transition.get("scope", {}).get("conflict_id") == conflict_id
+    ):
+        prior = transition["prior_witness"]
+        try:
+            manifest = audit_witness_manifest(paths)
+            run_facts = audit_witness_run_facts(paths, state)
+            issues = authority_transition_completion_issues(
+                paths, state, transition, manifest, run_facts
+            )
+        except (BimriError, OSError, UnicodeError, ValueError, TypeError) as exc:
+            issues = [f"resolution retry transition audit failed: {exc}"]
+        retry_marker = "resolution status is failed; explicit retry is required."
+        target_prefix = f"resolution {conflict_id} ("
+        unsettled_reason = (
+            "interrupted authority transition still has applying or failed records"
+        )
+        incomplete_reason = (
+            "interrupted authority transition has no frozen post-effect closure"
+        )
+        remaining = [
+            issue for issue in issues
+            if not (
+                issue in {incomplete_reason, unsettled_reason}
+                or (
+                    issue.startswith(target_prefix)
+                    and retry_marker in issue
+                )
+            )
+        ]
+        if not remaining:
+            conflicts, conflict_issues = scan_open_conflicts(paths, state)
+            if conflict_issues:
+                raise BimriError(
+                    "authority recovery is required; shared-memory writes are paused: "
+                    + " | ".join(conflict_issues[:3])
+                )
+            return conflicts
+        # The retry window was disturbed beyond its own frozen closure.
+        # Preserve the divergence, then let the full semantic audit below
+        # decide whether this exact retry may still proceed.
+        write_audit_drift_receipt(
+            paths,
+            remaining,
+            marker=transition,
+            prior_witness=prior,
+            state=state,
+        )
+    prior_witness = load_sealed_audit_witness(paths)
+    if prior_witness is not None:
+        manifest, run_facts, mismatch = verify_intact_audit_evidence(
+            paths, state, prior_witness
+        )
+        if not mismatch:
+            paths.full_audit_manifest = manifest
+            paths.full_audit_run_facts = run_facts
+            return []
+        write_audit_drift_receipt(
+            paths, mismatch, prior_witness=prior_witness, state=state
+        )
+    conflicts, issues = governance_snapshot(
+        paths,
+        state,
+        use_witness=False,
+        write_witness=False,
+    )
+    retry_marker = "resolution status is failed; explicit retry is required."
+    target_prefix = f"resolution {conflict_id} ("
+    remaining = [
+        issue for issue in issues
+        if not (
+            issue.startswith(target_prefix)
+            and retry_marker in issue
+        )
+    ]
+    if remaining:
+        raise BimriError(
+            "authority recovery is required; shared-memory writes are paused: "
+            + " | ".join(remaining[:3])
+        )
+    return conflicts
+
+
+def enter_authority_write_after_audit(
+    paths, state=None, operation="authority-recovery", scope=None
+):
+    """Durably mark a mutation after its full audit and semantic preflight."""
+    existing = load_audit_transition(paths)
+    if existing is None and state is not None:
+        prior = paths.validated_audit_witness or load_sealed_audit_witness(paths)
+        if prior is not None and sealed_witness_matches_state(prior, state):
+            begin_authority_checkpoint_transition(
+                paths, state, operation, scope=scope
+            )
+        else:
+            invalidate_audit_witness_before_authority_write(paths)
+    elif existing is None:
+        invalidate_audit_witness_before_authority_write(paths)
+    paths.authority_write_mode = True
+    paths.authority_write_audit_healthy = True
 
 
 def open_conflicts(paths, state):
@@ -4654,6 +6879,7 @@ def exact_effect_reflected_at_head(paths, state, proposal, current):
                 state,
                 base_entry["raw"],
                 state["head_revision"],
+                skip_validation_id=proposal["proposal_id"],
             )
         )
     if proposal["operation"] == "touch":
@@ -5055,7 +7281,10 @@ def validate_proposal(
             "observed_key_hash",
         }:
             raise BimriError("proposal preflight receipt fields are invalid.")
-        accepted_receipt_engines = {ENGINE_VERSION}
+        accepted_receipt_engines = {
+            ENGINE_VERSION,
+            V5_1_0_ENGINE_VERSION,
+        }
         if proposal.get("bimri_version") == V5_0_2_VERSION:
             accepted_receipt_engines.add("5.0.3")
         if receipt.get("engine_release") not in accepted_receipt_engines:
@@ -6265,6 +8494,114 @@ def validate_current_residency(paths, state, hot_entries=None):
     return True
 
 
+def validate_selected_cold_archive_binding(paths, key, cold):
+    """Prove one cold-current key against only its recorded archive month."""
+    month = cold["archived_on"][:7]
+    target = paths.archive / f"{month}.md"
+    if path_is_redirected(target) or not target.is_file():
+        raise BimriError(
+            f"cold-current archive month {month} is missing or unsafe."
+        )
+    exact = 0
+    for number, line in enumerate(
+        target.read_text(encoding="utf-8").splitlines(), 1
+    ):
+        if not line.startswith("[ARCHIVED:"):
+            continue
+        try:
+            record = parse_archive_record(line)
+        except BimriError as exc:
+            raise BimriError(
+                f"cold-current archive {target.name}:{number} is invalid: {exc}"
+            ) from exc
+        if (
+            record["proposal_id"] == cold["archived_by"]
+            and record["reason"] == "cooled"
+            and record["raw_line"] == cold["raw_line"]
+        ):
+            exact += 1
+    if exact != 1:
+        raise BimriError(
+            f"cold-current subject {key} is not bound to exactly one "
+            "immutable cooled archive record."
+        )
+    return True
+
+
+def validate_checkpoint_head(paths, state):
+    """Validate bounded accepted-head truth without traversing cold history."""
+    head = revision_path(paths, state["head_revision"])
+    if path_is_redirected(head) or not head.is_file():
+        raise BimriError("accepted head is missing or unsafe.")
+    try:
+        head_bytes = head.read_bytes()
+        content = head_bytes.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise BimriError(f"accepted head is unreadable: {exc}") from exc
+    _, entries, errors, _ = validate_hot_content(
+        content, state, allow_legacy_overflow=True
+    )
+    if errors:
+        raise BimriError(
+            "accepted head memory grammar is invalid: " + "; ".join(errors)
+        )
+    if sha256_bytes(head_bytes) != state["head_hash"]:
+        raise BimriError("state head hash does not match the accepted head revision.")
+    return entries
+
+
+def load_exact_checkpoint_state(paths, key):
+    """Load a warm exact read from fixed files plus one selected cold binding."""
+    if path_is_redirected(paths.state) or not paths.state.is_file():
+        return None
+    try:
+        state_bytes = paths.state.read_bytes()
+        raw = json.loads(state_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict) or raw.get("bimri_version") != MEMORY_FORMAT_VERSION:
+        return None
+    try:
+        require_complete_v5_state(raw)
+        state = fresh_state()
+        state.update(raw)
+        if (
+            isinstance(state.get("head_revision"), bool)
+            or not isinstance(state.get("head_revision"), int)
+            or state["head_revision"] < 0
+            or not isinstance(state.get("head_hash"), str)
+            or not HASH_RE.fullmatch(state["head_hash"])
+        ):
+            return None
+        witness = load_valid_audit_witness(paths, state)
+        if witness is None or load_audit_blocked_issues(paths):
+            return None
+        entries = validate_checkpoint_head(paths, state)
+        hot = [entry for entry in entries if entry.get("key") == key]
+        cold_record = state.get("cold_current", {}).get(key)
+        if hot and cold_record is not None:
+            raise BimriError(
+                f"memory key {key} exists in both hot and cold-current state."
+            )
+        if cold_record is not None:
+            validate_cold_current({key: cold_record})
+            validate_selected_cold_archive_binding(paths, key, cold_record)
+            cold_entry_value = parse_entry_line(cold_record["raw_line"])
+            if any(entry["id"] == cold_entry_value["id"] for entry in entries):
+                raise BimriError(
+                    f"current memory ID {cold_entry_value['id']} is duplicated "
+                    "across residency."
+                )
+            pointer_error = pointer_validation_error(paths, cold_entry_value)
+            if pointer_error:
+                raise BimriError(
+                    f"cold-current subject {key} pointer is invalid: {pointer_error}"
+                )
+        return state, entries, witness
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        return None
+
+
 def exact_archive_effect(paths, raw_line, reason="closed", proposal_id=None):
     raw_line = clean_scalar(
         raw_line, "archived line", MAX_SERIALIZED_ENTRY_CHARS
@@ -6585,6 +8922,14 @@ def process_run_proposals(paths, state, run_id):
     return results
 
 
+def run_has_authority_proposals(paths, run_id, log_content):
+    """Use the checkpoint plus one run log to classify a close operation."""
+    witness = paths.validated_audit_witness
+    if witness is not None and run_id in witness.get("proposal_runs", []):
+        return True
+    return LOG_PROPOSAL_RE.search(log_content) is not None
+
+
 def build_index(paths, state):
     content = revision_path(paths, state["head_revision"]).read_text(encoding="utf-8")
     _, entries, errors = parse_hot(content)
@@ -6654,19 +8999,6 @@ def build_index(paths, state):
     text = header + "\n".join("\t".join(row) for row in safe_rows)
     atomic_write_text(paths.index, text.rstrip() + "\n")
     return len(safe_rows)
-
-
-def rebuild_index_best_effort(paths, state):
-    try:
-        return build_index(paths, state)
-    except Exception as exc:
-        print(
-            "BIMRI WARNING: the durable operation succeeded, but the derived "
-            f"index could not be rebuilt: {exc}. Run `doctor` after repairing "
-            "the reported file.",
-            file=sys.stderr,
-        )
-        return None
 
 
 def print_authority_recovery(issues):
@@ -7111,23 +9443,6 @@ def print_brief(
                 stale.append(rid)
         except (KeyError, ValueError):
             stale.append(rid)
-    for log in sorted(paths.logs.glob("R*.md")):
-        rid = log.stem
-        if rid in state["active_runs"] or not re.fullmatch(r"R\d+", rid):
-            continue
-        if log.is_symlink():
-            stale.append(rid)
-            continue
-        try:
-            log_text = log.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, OSError):
-            stale.append(rid)
-            continue
-        if not any(
-            line.strip().startswith("[CLOSED:")
-            for line in log_text.splitlines()
-        ):
-            stale.append(rid)
     stale = sorted(set(stale))
     if stale:
         print("ORPHAN CANDIDATES (never auto-closed): " + ", ".join(stale))
@@ -7161,45 +9476,68 @@ def cmd_start(paths, actor, session=None):
                     authority_issues=authority_issues,
                 )
                 return existing
-        existing_numbers = [
-            int(path.stem[1:]) for path in paths.logs.glob("R*.md")
-            if RUN_RE.fullmatch(path.stem)
-        ]
+        existing_numbers = []
+        if paths.validated_audit_witness is None:
+            existing_numbers = [
+                int(path.stem[1:]) for path in paths.logs.glob("R*.md")
+                if RUN_RE.fullmatch(path.stem)
+            ]
         number = max([state["run_count"]] + existing_numbers + [0]) + 1
         while True:
             if number > 999999:
                 raise BimriError("BIMRI has exhausted its six-digit run ID space.")
             run_id = f"R{number:06d}"
             log = run_log_path(paths, run_id)
-            try:
-                exclusive_write_text(
-                    log,
-                    f"# Run {run_id} | {now_iso()} | actor:{actor} | "
-                    f"base:V{state['head_revision']:06d}\n\n"
-                    "## Journal\n\n"
-                    "<!-- Use the host-only argv_prefix recorded in "
-                    ".bimri/runtime.local.json with "
-                    f"`journal --run {run_id} --text \"...\"` "
-                    "for durable detail. -->\n\n"
-                    "## Proposals\n\n"
-                    "## Outcome\n\n",
-                )
-                break
-            except FileExistsError:
+            if log.exists() or log.is_symlink():
                 number += 1
-        state["run_count"] = number
-        state["run_dates"][run_id] = today()
-        state["active_runs"][run_id] = {
+                continue
+            break
+        started_at = now_iso()
+        log_text = (
+            f"# Run {run_id} | {started_at} | actor:{actor} | "
+            f"base:V{state['head_revision']:06d}\n\n"
+            "## Journal\n\n"
+            "<!-- Use the host-only argv_prefix recorded in "
+            ".bimri/runtime.local.json with "
+            f"`journal --run {run_id} --text \"...\"` "
+            "for durable detail. -->\n\n"
+            "## Proposals\n\n"
+            "## Outcome\n\n"
+        )
+        post_state = copy.deepcopy(state)
+        post_state["run_count"] = number
+        post_state["run_dates"][run_id] = today()
+        post_state["active_runs"][run_id] = {
             "actor": actor,
             "session_key": skey,
-            "started_at": now_iso(),
-            "last_activity_at": now_iso(),
+            "started_at": started_at,
+            "last_activity_at": started_at,
             "base_revision": state["head_revision"],
         }
         if skey:
-            state["session_runs"][skey] = run_id
-        state["last_started_at"] = now_iso()
-        save_state(paths, state)
+            post_state["session_runs"][skey] = run_id
+        post_state["last_started_at"] = started_at
+        prepare_state_for_save(paths, post_state)
+        marker = begin_lifecycle_checkpoint_transition(
+            paths,
+            state,
+            post_state,
+            "start",
+            run_id,
+            log,
+            log_text,
+        )
+        if marker is None:
+            # Recovery-degraded starts have no healthy verdict to carry.
+            exclusive_write_text(log, log_text)
+            save_state(paths, post_state)
+        else:
+            # State first: the durable marker can recreate the exact log if
+            # the process dies before its exclusive create.
+            save_state(paths, post_state)
+            exclusive_write_text(log, log_text)
+        state = post_state
+        refresh_audit_checkpoint_after_state_write(paths, state)
         print(f"BIMRI RUN HANDLE: {run_id}", flush=True)
         print_brief(
             paths,
@@ -7208,7 +9546,6 @@ def cmd_start(paths, actor, session=None):
             conflicts=conflicts,
             authority_issues=authority_issues,
         )
-        rebuild_index_best_effort(paths, state)
         return run_id
 
 
@@ -7230,9 +9567,32 @@ def cmd_journal(paths, run_id, text, importance=3):
         state = load_or_initialize(paths)
         log = require_active_run(paths, state, run_id)
         entry_id = next_entry_id(paths, run_id)
-        append_line(log, f"[ID:{entry_id}] [I:{importance}] {text}")
-        state["active_runs"][run_id]["last_activity_at"] = now_iso()
-        save_state(paths, state)
+        line = f"[ID:{entry_id}] [I:{importance}] {text}"
+        post_state = copy.deepcopy(state)
+        post_state["active_runs"][run_id]["last_activity_at"] = now_iso()
+        prepare_state_for_save(paths, post_state)
+        marker = None
+        if audit_witness_write_state_hash(post_state) != (
+            audit_witness_write_state_hash(state)
+        ):
+            current_log = log.read_text(encoding="utf-8")
+            marker = begin_lifecycle_checkpoint_transition(
+                paths,
+                state,
+                post_state,
+                "journal-state-maintenance",
+                run_id,
+                log,
+                current_log + line.rstrip() + "\n",
+            )
+        if marker is None:
+            append_line(log, line)
+            save_state(paths, post_state)
+        else:
+            save_state(paths, post_state)
+            finish_lifecycle_log(paths, marker)
+        state = post_state
+        refresh_audit_checkpoint_after_state_write(paths, state)
     print(entry_id)
     return entry_id
 
@@ -7458,6 +9818,21 @@ def cmd_propose(paths, args):
         # Preflight validates the complete current-head binding, exact effect,
         # authority policy, and deterministic residency before any durable write.
         if proposal is not None:
+            begin_authority_write(
+                paths,
+                state,
+                allow_degraded=True,
+                operation="propose",
+                run_id=run_id,
+                scope={
+                    "proposal_ids": [proposal_id],
+                    "proposal_hashes": {
+                        proposal_id: sha256_text(
+                            json.dumps(proposal, indent=2, sort_keys=True) + "\n"
+                        )
+                    },
+                },
+            )
             append_line(log, f"[ID:{entry_id}] [I:{importance}] {rationale}")
             exclusive_write_text(
                 proposal_path(paths, proposal_id),
@@ -7470,6 +9845,7 @@ def cmd_propose(paths, args):
             )
             state["active_runs"][run_id]["last_activity_at"] = now_iso()
             save_state(paths, state)
+            refresh_audit_witness_after_trusted_write(paths, state)
     print(proposal_id)
     return proposal_id
 
@@ -7510,13 +9886,19 @@ def cmd_sync(paths, run_id):
     with engine_lock(paths):
         state = load_or_initialize(paths)
         sync_generated_view(paths, state)
-        require_governance_healthy(paths, state)
         require_active_run(paths, state, run_id)
+        begin_authority_write(
+            paths,
+            state,
+            operation="sync",
+            run_id=run_id,
+            scope={"run_id": run_id},
+        )
         results = process_run_proposals(paths, state, run_id)
         state["active_runs"][run_id]["base_revision"] = state["head_revision"]
         state["active_runs"][run_id]["last_activity_at"] = now_iso()
         save_state(paths, state)
-        rebuild_index_best_effort(paths, state)
+        refresh_audit_witness_after_trusted_write(paths, state)
         notices = new_conflict_notices(paths, state, results)
         held_notices = new_held_notices(results)
     for notice in notices:
@@ -7545,7 +9927,6 @@ def cmd_close(paths, run_id=None, actor=None, session=None,
     with engine_lock(paths):
         state = load_or_initialize(paths)
         sync_generated_view(paths, state)
-        require_governance_healthy(paths, state)
         rid = resolve_run_from_args(
             state,
             run_id,
@@ -7556,21 +9937,72 @@ def cmd_close(paths, run_id=None, actor=None, session=None,
         if rid is None:
             return None
         log = require_active_run(paths, state, rid)
-        results = process_run_proposals(paths, state, rid)
         text = log.read_text(encoding="utf-8")
-        if not any(
+        _conflicts, authority_issues = governance_snapshot(paths, state)
+        if authority_issues:
+            raise BimriError(
+                "authority recovery is required; shared-memory writes are paused: "
+                + " | ".join(authority_issues[:3])
+            )
+        authority_close = run_has_authority_proposals(
+            paths, rid, text
+        )
+        if authority_close:
+            begin_authority_write(
+                paths,
+                state,
+                operation="close-authority-run",
+                run_id=rid,
+                scope={"run_id": rid},
+            )
+            results = process_run_proposals(paths, state, rid)
+        else:
+            results = []
+        needs_close_marker = not any(
             line.strip().startswith("[CLOSED:")
             for line in text.splitlines()
-        ):
+        )
+        close_at = now_iso()
+        if authority_close and needs_close_marker:
             append_line(log, f"[OUTCOME:{outcome}] {summary}")
-            append_line(log, f"[CLOSED:{rid} {now_iso()}]")
-        meta = state["active_runs"].pop(rid)
+            append_line(log, f"[CLOSED:{rid} {close_at}]")
+        post_state = copy.deepcopy(state)
+        meta = post_state["active_runs"].pop(rid)
         skey = meta.get("session_key")
-        if skey and state["session_runs"].get(skey) == rid:
-            del state["session_runs"][skey]
-        state["last_closed_at"] = now_iso()
-        save_state(paths, state)
-        rebuild_index_best_effort(paths, state)
+        if skey and post_state["session_runs"].get(skey) == rid:
+            del post_state["session_runs"][skey]
+        post_state["last_closed_at"] = close_at
+        prepare_state_for_save(paths, post_state)
+        if authority_close:
+            state = post_state
+            save_state(paths, state)
+            refresh_audit_witness_after_trusted_write(paths, state)
+        else:
+            log_append = ""
+            if needs_close_marker:
+                log_append = (
+                    f"[OUTCOME:{outcome}] {summary}\n"
+                    f"[CLOSED:{rid} {close_at}]\n"
+                )
+            marker = begin_lifecycle_checkpoint_transition(
+                paths,
+                state,
+                post_state,
+                "close",
+                rid,
+                log,
+                text + log_append,
+            )
+            if marker is None:
+                if needs_close_marker:
+                    append_line(log, f"[OUTCOME:{outcome}] {summary}")
+                    append_line(log, f"[CLOSED:{rid} {close_at}]")
+                save_state(paths, post_state)
+            else:
+                save_state(paths, post_state)
+                finish_lifecycle_log(paths, marker)
+            state = post_state
+            refresh_audit_checkpoint_after_state_write(paths, state)
         notices = new_conflict_notices(paths, state, results)
         held_notices = new_held_notices(results)
     for notice in notices:
@@ -7766,7 +10198,7 @@ def recover_interrupted_authority(paths, state):
         validate_decision_effect(paths, state, accepted)
         changed = True
     if changed:
-        rebuild_index_best_effort(paths, state)
+        refresh_audit_witness_after_trusted_write(paths, state)
     return changed
 
 
@@ -7840,6 +10272,12 @@ def accepted_archive_effect_by_revision(
             or proposal["key"] != archived_entry.get("key")
         ):
             continue
+        if proposal_id == skip_validation_id:
+            # The decision under replay is still `applying` by definition.
+            # The archived row bound to its exact base line, plus the line
+            # already being absent from current residency, is the
+            # precommitted effect the replay finalizes.
+            return True
         path = decision_path(paths, proposal_id)
         if path.is_symlink() or not path.is_file():
             continue
@@ -8212,7 +10650,9 @@ def cmd_resolve(paths, conflict_id, choice, human_approved=False):
     with engine_lock(paths):
         state = load_or_initialize(paths)
         sync_generated_view(paths, state)
-        require_governance_healthy(paths, state)
+        require_governance_for_resolution_retry(
+            paths, state, conflict_id
+        )
         cpath = conflict_path(paths, conflict_id)
         if not cpath.exists():
             raise BimriError(f"unknown conflict: {conflict_id}")
@@ -8245,8 +10685,11 @@ def cmd_resolve(paths, conflict_id, choice, human_approved=False):
         validate_conflict_candidate_decisions(paths, conflict, existing)
         if existing and existing["status"] == "resolved":
             validate_resolution_effect(paths, state, conflict, existing)
+            enter_authority_write_after_audit(
+                paths, state, operation="resolve", scope={"conflict_id": conflict_id}
+            )
             finalize_conflict_decisions(paths, existing)
-            rebuild_index_best_effort(paths, state)
+            refresh_audit_witness_after_trusted_write(paths, state)
             print(
                 f"BIMRI: {conflict_id} already resolved as "
                 f"{existing['choice']}."
@@ -8328,9 +10771,12 @@ def cmd_resolve(paths, conflict_id, choice, human_approved=False):
                 expected_conflict_id=conflict_id,
             )
             validate_resolution_effect(paths, state, conflict, resolution)
+            enter_authority_write_after_audit(
+                paths, state, operation="resolve", scope={"conflict_id": conflict_id}
+            )
             atomic_write_json(resolution_path, resolution)
             finalize_conflict_decisions(paths, resolution)
-            rebuild_index_best_effort(paths, state)
+            refresh_audit_witness_after_trusted_write(paths, state)
             print(f"BIMRI: {conflict_id} resolved with {choice}.")
             return resolution
         if choice in proposal_ids:
@@ -8407,9 +10853,15 @@ def cmd_resolve(paths, conflict_id, choice, human_approved=False):
                 validate_resolution_effect(
                     paths, state, conflict, resolution
                 )
+                enter_authority_write_after_audit(
+                    paths,
+                    state,
+                    operation="resolve",
+                    scope={"conflict_id": conflict_id},
+                )
                 atomic_write_json(resolution_path, resolution)
                 finalize_conflict_decisions(paths, resolution)
-                rebuild_index_best_effort(paths, state)
+                refresh_audit_witness_after_trusted_write(paths, state)
                 print(f"BIMRI: {conflict_id} resolved with {choice}.")
                 return resolution
 
@@ -8457,6 +10909,9 @@ def cmd_resolve(paths, conflict_id, choice, human_approved=False):
             expected_conflict_id=conflict_id,
         )
         validate_resolution_state_bounds(paths, state, resolution)
+        enter_authority_write_after_audit(
+            paths, state, operation="resolve", scope={"conflict_id": conflict_id}
+        )
         atomic_write_json(resolution_path, resolution)
         try:
             if choice in {"current", "dismiss"}:
@@ -8487,6 +10942,11 @@ def cmd_resolve(paths, conflict_id, choice, human_approved=False):
             )
             validate_resolution_state_bounds(paths, state, resolution)
             atomic_write_json(resolution_path, resolution)
+            # Retain W0/M0 as evidence. The epoch and still-live resolve
+            # transition make W0 unreadable until this exact conflict retries.
+            paths.validated_audit_witness = None
+            paths.authority_write_mode = False
+            paths.authority_write_audit_healthy = False
             raise
         resolution.update({
             "status": "resolved",
@@ -8502,7 +10962,7 @@ def cmd_resolve(paths, conflict_id, choice, human_approved=False):
         validate_resolution_effect(paths, state, conflict, resolution)
         atomic_write_json(resolution_path, resolution)
         finalize_conflict_decisions(paths, resolution)
-        rebuild_index_best_effort(paths, state)
+        refresh_audit_witness_after_trusted_write(paths, state)
     print(f"BIMRI: {conflict_id} resolved with {choice}.")
     return resolution
 
@@ -8579,6 +11039,10 @@ def validate_authority_record_data(
                 data,
                 expected_conflict_id=record_id,
             )
+            if resolution["status"] == "failed":
+                raise BimriError(
+                    "resolution status is failed; explicit retry is required."
+                )
             validate_resolution_state_bounds(paths, state, resolution)
             return resolution
         cpath = conflict_path(paths, record_id)
@@ -8595,6 +11059,10 @@ def validate_authority_record_data(
             conflict=conflict,
             expected_conflict_id=record_id,
         )
+        if resolution["status"] == "failed":
+            raise BimriError(
+                "resolution status is failed; explicit retry is required."
+            )
         validate_resolution_effect(paths, state, conflict, resolution)
         if verify_dependencies:
             validate_conflict_candidate_decisions(
@@ -8617,6 +11085,18 @@ def cmd_quarantine_authority(
         )
     with engine_lock(paths):
         state = load_or_initialize(paths)
+        blocked_prior = load_audit_blocked_prior_witness(paths)
+        recovery_prior = blocked_prior or load_sealed_audit_witness(paths)
+        recovery_prior_manifest = (
+            load_audit_blocked_prior_manifest(paths)
+            if blocked_prior is not None
+            else None
+        )
+        recovery_baseline_issues = []
+        if recovery_prior is not None and blocked_prior is None:
+            _manifest, _run_facts, recovery_baseline_issues = (
+                verify_intact_audit_evidence(paths, state, recovery_prior)
+            )
         path = authority_record_path(paths, kind, record_id)
         reviewed_link_target = None
         original_type = "file"
@@ -8693,6 +11173,23 @@ def cmd_quarantine_authority(
                     "authority record is valid; BIMRI refuses "
                     "to quarantine it as corruption."
                 )
+        # Owner-authorized quarantine is itself the recovery boundary. Preserve
+        # W0/M0 before the first recovery/evidence byte changes, including when
+        # this command is the first operation to discover unrelated drift.
+        if recovery_prior is not None:
+            record_audit_blocked(
+                paths,
+                recovery_prior,
+                recovery_baseline_issues or [
+                    f"owner-authorized quarantine pending for {kind} {record_id}"
+                ],
+                prior_manifest=recovery_prior_manifest,
+            )
+            state["_audit_epoch"] = state_audit_epoch(state) + 1
+            save_state(paths, state)
+            paths.validated_audit_witness = None
+        else:
+            discard_audit_witness(paths)
         digest = sha256_bytes(raw)
         recovery = paths.recovery / (
             f"authority-{kind}-{record_id}-{digest}.json"
@@ -8772,6 +11269,7 @@ def validate_authority_replacement_graph(
             "proposals",
             "decisions",
             "revisions",
+            "archive",
             "conflicts",
             "resolutions",
             "recovery",
@@ -8792,7 +11290,12 @@ def validate_authority_replacement_graph(
             shadow_paths, kind, record_id
         )
         atomic_write_json(shadow_target, replacement_data)
-        _, issues = governance_snapshot(shadow_paths, state)
+        _, issues = governance_snapshot(
+            shadow_paths,
+            state,
+            use_witness=False,
+            write_witness=False,
+        )
     semantic_issues = [
         issue for issue in issues if "quarantined" not in issue.lower()
     ]
@@ -8880,6 +11383,43 @@ def matching_restore_receipt(
     return matches[-1] if matches else None
 
 
+def owner_repair_session_paths(paths):
+    """Paths belonging to the open owner-repair session, all quarantines included.
+
+    A multi-record repair quarantines several records before restoring them
+    one at a time. Each sibling stub, its preserved evidence, and its restore
+    receipts are part of the same owner-approved surgery, so the strict
+    baseline comparison must not read them as unrelated drift.
+    """
+    allowed = set()
+    for directory in (
+        paths.proposals, paths.decisions, paths.conflicts, paths.resolutions
+    ):
+        try:
+            children = list(directory.glob("*.json"))
+        except OSError:
+            continue
+        for path in children:
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, ValueError):
+                continue
+            if is_quarantine_stub(record):
+                allowed.add(path.relative_to(paths.root).as_posix())
+    try:
+        children = list(paths.recovery.iterdir())
+    except OSError:
+        children = []
+    for path in children:
+        if path.is_symlink() or not path.is_file():
+            continue
+        if path.name.startswith("authority-"):
+            allowed.add(path.relative_to(paths.root).as_posix())
+    return allowed
+
+
 def cmd_restore_authority(
     paths, kind, record_id, replacement, human_approved=False
 ):
@@ -8898,6 +11438,11 @@ def cmd_restore_authority(
     replacement_hash = sha256_bytes(replacement_bytes)
     with engine_lock(paths):
         state = load_or_initialize(paths)
+        repair_prior_witness = (
+            load_audit_blocked_prior_witness(paths)
+            or load_sealed_audit_witness(paths)
+        )
+        repair_prior_manifest = load_audit_blocked_prior_manifest(paths)
         path = authority_record_path(paths, kind, record_id)
         target_path = path.relative_to(paths.root).as_posix()
         current = read_json_strict(path, path.name)
@@ -8913,7 +11458,30 @@ def cmd_restore_authority(
             validate_authority_replacement_graph(
                 paths, state, kind, record_id, replacement_data
             )
-            _, remaining_issues = governance_snapshot(paths, state)
+            receipt_file = restore_receipt_path(
+                paths,
+                kind,
+                record_id,
+                receipt["original_sha256"],
+                replacement_hash,
+            )
+            allowed_repair_paths = {
+                target_path,
+                receipt["recovery_file"],
+                receipt_file.relative_to(paths.root).as_posix(),
+            } | owner_repair_session_paths(paths)
+            _, remaining_issues = governance_snapshot(
+                paths,
+                state,
+                use_witness=False,
+                strict_prior_comparison=True,
+                audit_blocked=True,
+                recover_blocked=True,
+                prior_witness_override=repair_prior_witness,
+                prior_manifest_override=repair_prior_manifest,
+                allowed_manifest_paths=allowed_repair_paths,
+                allow_audit_epoch_advance=True,
+            )
             if remaining_issues:
                 print(
                     f"BIMRI: {kind} {record_id} already restored from an "
@@ -8973,9 +11541,37 @@ def cmd_restore_authority(
                 target_path,
             )
         else:
+            state["_audit_epoch"] = state_audit_epoch(state) + 1
+            save_state(paths, state)
+            paths.validated_audit_witness = None
             exclusive_write_bytes(receipt_path, canonical_json_bytes(receipt))
+        if receipt_path.exists() and state_audit_epoch(state) == (
+            repair_prior_witness.get("audit_epoch", -1)
+            if repair_prior_witness is not None else -1
+        ):
+            # A pre-existing receipt can still precede the first replacement
+            # byte (for example, a caught failure after receipt publication).
+            state["_audit_epoch"] = state_audit_epoch(state) + 1
+            save_state(paths, state)
+            paths.validated_audit_witness = None
         atomic_write_json(path, replacement_data)
-        _, remaining_issues = governance_snapshot(paths, state)
+        allowed_repair_paths = {
+            target_path,
+            stub["recovery_file"],
+            receipt_path.relative_to(paths.root).as_posix(),
+        } | owner_repair_session_paths(paths)
+        _, remaining_issues = governance_snapshot(
+            paths,
+            state,
+            use_witness=False,
+            strict_prior_comparison=True,
+            audit_blocked=True,
+            recover_blocked=True,
+            prior_witness_override=repair_prior_witness,
+            prior_manifest_override=repair_prior_manifest,
+            allowed_manifest_paths=allowed_repair_paths,
+            allow_audit_epoch_advance=True,
+        )
         unexpected_issues = [
             issue
             for issue in remaining_issues
@@ -9036,6 +11632,85 @@ def retention_order(entry, state):
         entry.get("key", ""),
         entry.get("id", ""),
     )
+
+
+def exact_current_recall_records(paths, state, key, hot_entries=None):
+    """Read one exact subject from current hot/cold storage only."""
+    if hot_entries is None:
+        content = revision_path(
+            paths, state["head_revision"]
+        ).read_text(encoding="utf-8")
+        _, hot_entries, errors = parse_hot(content)
+        if errors:
+            raise BimriError(
+                "cannot recall malformed hot memory: " + "; ".join(errors)
+            )
+    records = []
+    for entry in hot_entries:
+        if entry.get("key") != key:
+            continue
+        records.append({
+            "location": "HOT",
+            "key": key,
+            "id": entry["id"],
+            "detail": entry.get("text", ""),
+            "reason": "current",
+            "trust": entry.get("trust", ""),
+            "source": entry.get("source", ""),
+        })
+    cold = state.get("cold_current", {}).get(key)
+    if cold is not None:
+        entry = parse_entry_line(cold["raw_line"])
+        records.append({
+            "location": "COLD",
+            "key": key,
+            "id": entry["id"],
+            "detail": entry.get("text", ""),
+            "reason": "current",
+            "trust": entry.get("trust", ""),
+            "source": entry.get("source", ""),
+        })
+    return records
+
+
+def held_recall_records(paths, state, key=None):
+    """Build held candidates live from authority, optionally for one key."""
+    content = revision_path(
+        paths, state["head_revision"]
+    ).read_text(encoding="utf-8")
+    _, hot_entries, errors = parse_hot(content)
+    if errors:
+        raise BimriError("cannot recall malformed hot memory: " + "; ".join(errors))
+    current_by_key = {
+        entry["key"]: entry for entry in hot_entries if entry.get("key")
+    }
+    for current_key, cold in state.get("cold_current", {}).items():
+        current_by_key[current_key] = parse_entry_line(cold["raw_line"])
+    records = []
+    for path in sorted(paths.decisions.glob("R*-Q*.json")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        decision_data = read_json_strict(path, path.name)
+        if decision_data.get("outcome") != "held":
+            continue
+        decision = validate_decision(decision_data, path.stem)
+        proposal = authority_proposal(paths, state, path.stem)
+        if key is not None and proposal["key"] != key:
+            continue
+        if proposal_equivalent(
+            proposal, current_by_key.get(proposal["key"])
+        ):
+            continue
+        records.append({
+            "location": "HELD",
+            "key": proposal["key"],
+            "id": proposal["proposal_id"],
+            "detail": proposal["text"],
+            "reason": decision["reason"],
+            "trust": proposal.get("trust", ""),
+            "source": proposal.get("source", ""),
+        })
+    return records
 
 
 def recall_records(paths, state):
@@ -9143,14 +11818,37 @@ def cmd_recall(paths, key=None, query=None, history=True, limit=20):
     if search_text is not None and (not search_tokens or len(search_tokens) > 32):
         raise BimriError("recall query must contain 1 to 32 lexical tokens.")
     with existing_store_lock(paths):
-        state = load_current_state_read_only(paths)
-        _conflicts, authority_issues = governance_snapshot(paths, state)
+        authority_issues = []
+        checkpoint = None
+        if exact_key is not None and not history:
+            checkpoint = load_exact_checkpoint_state(paths, exact_key)
+            if checkpoint is None and reconcile_engine_checkpoint_for_exact_read(
+                paths
+            ):
+                checkpoint = load_exact_checkpoint_state(paths, exact_key)
+        if checkpoint is not None:
+            state, hot_entries, _witness = checkpoint
+            records = exact_current_recall_records(
+                paths, state, exact_key, hot_entries=hot_entries
+            )
+        else:
+            state = load_current_state_read_only(paths)
+            _conflicts, authority_issues = governance_snapshot(
+                paths,
+                state,
+                use_witness=False,
+            )
+            if exact_key is not None and not history:
+                records = exact_current_recall_records(
+                    paths, state, exact_key
+                )
+            else:
+                records = recall_records(paths, state)
         if authority_issues:
             raise BimriError(
                 "recall stopped because authority recovery is required: "
                 + "; ".join(authority_issues[:3])
             )
-        records = recall_records(paths, state)
     matches = []
     for record in records:
         if exact_key is not None:
@@ -9205,7 +11903,7 @@ def cmd_maintain(paths):
     with engine_lock(paths):
         state = load_or_initialize(paths)
         sync_generated_view(paths, state)
-        require_governance_healthy(paths, state)
+        require_full_governance_healthy(paths, state)
         content = revision_path(paths, state["head_revision"]).read_text(encoding="utf-8")
         _, entries, errors = parse_hot(content)
         if errors:
@@ -9238,6 +11936,8 @@ def cmd_maintain(paths):
             )
         else:
             print("Residency is healthy; no pressure action is needed.")
+        index_count = build_index(paths, state)
+        print(f"BIMRI: index rebuilt with {index_count} rows.")
 
 
 def cmd_review(paths, conflict_id=None, show_all=False, offset=0, limit=20):
@@ -9253,7 +11953,11 @@ def cmd_review(paths, conflict_id=None, show_all=False, offset=0, limit=20):
         )
     with existing_store_lock(paths):
         state = load_current_state_read_only(paths)
-        conflicts, authority_issues = governance_snapshot(paths, state)
+        conflicts, authority_issues = governance_snapshot(
+            paths,
+            state,
+            use_witness=False,
+        )
         if authority_issues:
             print_authority_recovery(authority_issues)
             return 1
@@ -9328,7 +12032,11 @@ def cmd_status(paths):
     with engine_lock(paths):
         state = load_or_initialize(paths)
         sync_generated_view(paths, state)
-        conflicts, authority_issues = governance_snapshot(paths, state)
+        conflicts, authority_issues = governance_snapshot(
+            paths,
+            state,
+            use_witness=False,
+        )
         content = revision_path(
             paths, state["head_revision"]
         ).read_text(encoding="utf-8")
@@ -9578,6 +12286,19 @@ def doctor_errors(
         "recovery evidence is damaged: " + issue
         for issue in restore_receipt_issues(paths)
     )
+    drift_total, drift_records = audit_drift_summary(paths, limit=1)
+    if drift_total:
+        newest = drift_records[0] if drift_records else {}
+        newest_line = "; ".join(newest.get("reasons", [])[:2])
+        warnings.append(
+            f"{drift_total} unexplained-drift receipt(s) on record; newest "
+            f"({newest.get('created_at', 'unknown time')}): {newest_line}"
+        )
+    if paths.last_audit_drift:
+        warnings.append(
+            "this audit observed checkpoint drift: "
+            + "; ".join(paths.last_audit_drift[:3])
+        )
     if governance_issues:
         errors.extend(
             "authority recovery needed: " + issue
@@ -9826,13 +12547,39 @@ def read_only_store_audit(paths, accepted_versions=None):
     state = load_current_state_read_only(
         paths, accepted_versions=accepted_versions
     )
-    _, governance_issues = governance_snapshot(paths, state)
+    _, governance_issues = governance_snapshot(
+        paths,
+        state,
+        use_witness=False,
+        write_witness=False,
+        audit_blocked=True,
+    )
+    transition_note = None
+    if paths.audit_transition.exists() or paths.audit_transition.is_symlink():
+        try:
+            marker = load_audit_transition(paths)
+            detail = (
+                f"{marker['operation']} {marker.get('run_id') or ''}"
+            ).strip()
+            # A loadable in-flight marker is recoverable state, not damage:
+            # the next writable command reconciles it. Read-only audit
+            # reports it without failing the store.
+            transition_note = (
+                "audit transition is incomplete; the next writable command "
+                f"reconciles it: {detail}"
+            )
+        except (BimriError, OSError, UnicodeError, ValueError, TypeError) as exc:
+            governance_issues.insert(
+                0, f"audit transition marker is invalid: {exc}"
+            )
     errors, warnings = doctor_errors(
         paths,
         state,
         governance_issues=governance_issues,
         repair_generated_view=False,
     )
+    if transition_note:
+        warnings.insert(0, transition_note)
     return state, errors, warnings, governance_issues
 
 
@@ -9847,12 +12594,20 @@ def cmd_doctor(paths, read_only=False):
     else:
         with engine_lock(paths):
             state = load_or_initialize(paths)
+            # Doctor proves the store from authority even when a matching
+            # derived witness exists.
             sync_error = None
             try:
                 sync_generated_view(paths, state)
             except (BimriError, OSError, UnicodeError) as exc:
                 sync_error = str(exc)
-            _, governance_issues = governance_snapshot(paths, state)
+            _, governance_issues = governance_snapshot(
+                paths,
+                state,
+                use_witness=False,
+                audit_blocked=True,
+                recover_blocked=True,
+            )
             if sync_error:
                 governance_issues.insert(
                     0, "generated view recovery failed: " + sync_error
@@ -10055,7 +12810,7 @@ def rendered_hooks_snippet(template, python_executable):
                 subcommand,
             ]:
                 raise KeyError(event)
-            if command.get("timeout") != 15:
+            if command.get("timeout") != HOOK_TIMEOUT_SECONDS:
                 raise KeyError(event)
             command["command"] = python_executable
             rendered += 1
@@ -11091,6 +13846,7 @@ def code_update_receipt_identity(manifest):
     )
     if identity not in {
         ("5.0.3", V5_0_2_VERSION),
+        (V5_1_0_ENGINE_VERSION, MEMORY_FORMAT_VERSION),
         (ENGINE_VERSION, MEMORY_FORMAT_VERSION),
     }:
         raise BimriError(
@@ -11408,8 +14164,15 @@ def _recover_prepared_code_updates(paths, policy, backup_root):
         if status == "prepared-for-authority-activation":
             prepared_projection = dict(manifest)
             prepared_projection["status"] = "prepared"
+            receipt_engine, receipt_memory = code_update_receipt_identity(
+                manifest
+            )
             _validate_prepared_code_update_manifest(
-                paths, manifest_path.parent, prepared_projection
+                paths,
+                manifest_path.parent,
+                prepared_projection,
+                expected_engine=receipt_engine,
+                expected_memory=receipt_memory,
             )
             backup = _safe_code_update_backup_file(
                 manifest_path.parent, manifest.get("state_backup")
@@ -12368,7 +15131,7 @@ def main(argv=None):
             with engine_lock(paths):
                 state = load_or_initialize(paths)
                 sync_generated_view(paths, state)
-                require_governance_healthy(paths, state)
+                require_full_governance_healthy(paths, state)
                 count = build_index(paths, state)
             print(f"BIMRI: index rebuilt with {count} rows.")
         elif command == "maintain":
@@ -12377,7 +15140,7 @@ def main(argv=None):
             with engine_lock(paths):
                 state = load_or_initialize(paths)
                 sync_generated_view(paths, state)
-                require_governance_healthy(paths, state)
+                require_full_governance_healthy(paths, state)
                 build_index(paths, state)
                 migration_errors, migration_warnings = doctor_errors(
                     paths, state

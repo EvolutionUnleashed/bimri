@@ -3,6 +3,62 @@
 This file records the public BIMRI architecture history. Historical instruction
 files are preserved under [`legacy/`](legacy/) and are not current installers.
 
+## 5.1.1
+
+- Kept the performance work as an engine-only patch. The authority and
+  mutable-state formats remain v5.1.0, and the readable hot-memory grammar
+  remains v5.0.2.
+- Added a compact engine-managed audit checkpoint bound to the v5.1.0 current
+  authority, with the detailed protected path-and-hash inventory stored as
+  separate audit evidence. Warm exact-current reads and ordinary lifecycle
+  bookkeeping no longer enumerate or hash the historical authority tree.
+  Behavior change: warm reads defer whole-tree verification to
+  authority-changing writes and explicit audit, review, search, and
+  historical-recall boundaries, so an out-of-engine edit to unrelated history
+  is seen at the next such boundary rather than on every read.
+- The checkpoint is a derived cache, never an authority record. Divergence
+  from it forces the full semantic audit; when that audit passes over changes
+  the engine cannot attribute to its own recorded operation, the engine
+  preserves a bounded append-only receipt under `.bimri/audit-drift/`,
+  rebaselines, and continues, and `doctor` reports the receipt count and the
+  newest reasons. A failed semantic audit refuses into the existing
+  damaged-authority recovery lane. Interrupted operations self-heal exactly as
+  in v5.1.0; no drift or crash state ever requires hand deletion of derived
+  files. `audit-blocked.json` now appears only while an owner-approved
+  quarantine holds its pre-repair baseline, and restoration clears it.
+- Unknown files inside witnessed roots — crash-orphaned engine temp files
+  included — are never deleted or blocked on. They enter the audited
+  inventory, cost at most one full re-audit when they first appear, and stay
+  visible through drift receipts and doctor litter reporting. The engine
+  cannot prove a temp-named file is its own, so it preserves it.
+- Added a direct current-key path for `get --key` and `recall --key` without
+  `--history`. Behavior change: it returns only the accepted current
+  generation (hot or cold-current); held candidates and history remain
+  reachable through `--history`, `--query`, and `review`. It validates at
+  most the bounded hot head plus one selected cold archive month.
+- Removed automatic derived-index rebuilds from start, commit, and resolution
+  hot paths. `index`, `maintain`, `doctor`, installation, and migration remain
+  the explicit rebuild points; the index remains non-authoritative.
+- Increased the example Claude hook timeout to 90 seconds so a cold first audit
+  on an established store has enough time to complete and seed its witness.
+  Dimension this against your store: the cold first audit measured 32.4 s on a
+  ~200-revision store and 77.5 s on a 10x synthetic store (2026-08-23, Windows
+  11 desktop), so a very large store may need a larger hook timeout for its
+  first run after installing this release.
+- Made a `failed` owner-resolution record fail closed as an explicit recovery
+  condition. Ordinary retrieval and shared-memory writes pause until the owner
+  explicitly retries the recorded conflict choice; a failed attempt can no
+  longer be mistaken for a healthy audited store.
+- Reworked the public README around BIMRI's open-source, local-first persistent
+  memory protocol, cross-session retrieval, human-governed provenance, agent
+  runtime support, and explicit same-lock-domain concurrency boundary.
+- Measured before and after on the live development store (~198 revisions,
+  433 run logs, Windows 11 desktop, 2026-08-23): `recall --key` warm
+  engine-side p50 11 ms (was ~21.3 s), warm CLI end-to-end p50 282 ms;
+  `start` 0.36 s (was 51.8 s); one-line `journal` ~0.30 s (was ~23.4 s);
+  `close` 0.35 s (was 43.8 s). On a 10x synthetic store, warm reads held
+  p50 11 ms and p99 18 ms.
+
 ## 5.1.0
 
 - Restored normal Tier 1 authoring and confirmed-memory updates. Direct

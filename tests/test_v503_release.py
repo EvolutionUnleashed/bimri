@@ -1,4 +1,4 @@
-"""Owner-visible release regressions for BIMRI engine v5.1.0.
+"""Owner-visible release regressions for BIMRI engine v5.1.1.
 
 These tests focus on the owner-visible contract: routine work stays quiet,
 only proven incompatible concurrency becomes a pull-based review, tier targets
@@ -141,7 +141,7 @@ class V510ReleaseContractTest(unittest.TestCase):
         self.start()
         status = self.cli("status")
 
-        self.assertIn("BIMRI engine v5.1.0", status.stdout)
+        self.assertIn("BIMRI engine v5.1.1", status.stdout)
         self.assertIn("memory format v5.1.0", status.stdout)
         self.assertEqual(self.state()["bimri_version"], "5.1.0")
         self.assertIn(
@@ -324,7 +324,7 @@ class V510ReleaseContractTest(unittest.TestCase):
             root=REPOSITORY,
             timeout=60,
         )
-        self.assertIn("BIMRI 5.1.0 installed.", installed.stdout)
+        self.assertIn("BIMRI 5.1.1 installed.", installed.stdout)
         self.assertIn("Existing authority store v5.1.0 verified", installed.stdout)
         self.assertIn("Memory preservation: PASSED", installed.stdout)
         self.assertEqual(self.authority_snapshot(target), before)
@@ -339,6 +339,51 @@ class V510ReleaseContractTest(unittest.TestCase):
         )
         self.assertIn("BIMRI doctor (read-only): PASSED", second_audit.stdout)
         self.assertEqual(self.authority_snapshot(target), before)
+
+        manifests = list(
+            target.joinpath(".bimri-update-backups").glob(
+                "*/install-manifest.json"
+            )
+        )
+        self.assertEqual(len(manifests), 1)
+        prior_patch_receipt = json.loads(manifests[0].read_text("utf-8"))
+        self.assertEqual(prior_patch_receipt["engine_release"], "5.1.1")
+        self.assertEqual(prior_patch_receipt["memory_format"], "5.1.0")
+        prior_patch_receipt["engine_release"] = "5.1.0"
+        manifests[0].write_text(
+            json.dumps(prior_patch_receipt, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        repeated = self.cli(
+            "install",
+            "--target",
+            target,
+            "--quiescent",
+            root=REPOSITORY,
+            timeout=60,
+        )
+        self.assertIn("BIMRI 5.1.1 installed.", repeated.stdout)
+        receipts = [
+            json.loads(path.read_text("utf-8"))
+            for path in target.joinpath(".bimri-update-backups").glob(
+                "*/install-manifest.json"
+            )
+        ]
+        self.assertIn(
+            ("5.1.0", "5.1.0"),
+            {
+                (receipt["engine_release"], receipt["memory_format"])
+                for receipt in receipts
+            },
+        )
+        self.assertIn(
+            ("5.1.1", "5.1.0"),
+            {
+                (receipt["engine_release"], receipt["memory_format"])
+                for receipt in receipts
+            },
+        )
 
 
 if __name__ == "__main__":
