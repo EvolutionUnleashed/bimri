@@ -19,13 +19,35 @@ files are preserved under [`legacy/`](legacy/) and are not current installers.
 - The checkpoint is a derived cache, never an authority record. Divergence
   from it forces the full semantic audit; when that audit passes over changes
   the engine cannot attribute to its own recorded operation, the engine
-  preserves a bounded append-only receipt under `.bimri/audit-drift/`,
-  rebaselines, and continues, and `doctor` reports the receipt count and the
-  newest reasons. A failed semantic audit refuses into the existing
-  damaged-authority recovery lane. Interrupted operations self-heal exactly as
-  in v5.1.0; no drift or crash state ever requires hand deletion of derived
-  files. `audit-blocked.json` now appears only while an owner-approved
-  quarantine holds its pre-repair baseline, and restoration clears it.
+  preserves a sealed drift receipt under `.bimri/audit-drift/` — every
+  diverging path with its prior and current hash, monotonic sequence,
+  bounded to the newest 200 — rebaselines, and continues, and `doctor`
+  reports the receipt count and the newest reasons. A failed semantic audit
+  refuses into the existing damaged-authority recovery lane. Interrupted
+  operations self-heal exactly as in v5.1.0; no drift or crash state ever
+  requires hand deletion of derived files. `audit-blocked.json` now appears
+  only while an owner-approved quarantine holds its pre-repair baseline, and
+  restoration clears it. Owner-ruled 2026-08-27: this receipts contract
+  replaces the earlier normative fail-closed rule in the protocol, and the
+  current-only exact recall plus deferred warm-read verification below are
+  confirmed semantics.
+- An obstruction on the audit-transition marker path that is not a regular
+  file or symlink is a hard error on every surface; doctor never reports
+  health past it, and the checkpoint is left untouched until the owner
+  removes the obstruction.
+- During interrupted-transition recovery an archive month counts as the
+  operation's own effect only when its change is byte-provably the prior
+  witnessed content plus appended rows stamped by the operation's scope.
+  Any other archive change is preserved as drift evidence.
+- Read-only doctor and warm exact reads enforce the same legacy-lineage
+  refusals as writable load: marker and state must claim each other, and
+  unclaimed legacy root files refuse the read.
+- Authority-changing writes still re-verify the complete evidence inventory:
+  propose 1.31 s, sync 1.26 s and authority close 1.24 s measured on the
+  ~500-run live-size store. This exceeds the design brief's one-second
+  entry-point target and is recorded as a known, owner-accepted deviation
+  (2026-08-27); incremental authenticated manifests are the planned v5.2
+  fix. Reads and lifecycle bookkeeping are unaffected.
 - Unknown files inside witnessed roots — crash-orphaned engine temp files
   included — are never deleted or blocked on. They enter the audited
   inventory, cost at most one full re-audit when they first appear, and stay

@@ -63,6 +63,8 @@ AUDIT_BLOCKED_SCHEMA = 1
 AUDIT_DRIFT_SCHEMA = 1
 AUDIT_TRANSITION_SCHEMA = 1
 AUDIT_DRIFT_KEEP = 200
+AUDIT_DRIFT_DELTA_CAP = 2000
+AUDIT_DRIFT_BLOB_KEEP = 20
 AUTHORITY_POLICY_VERSION = "5.1.1-authority-1"
 HOOK_TIMEOUT_SECONDS = 90
 PREVIOUS_V5_VERSION = "5.0"
@@ -1811,6 +1813,31 @@ def _retire_legacy_sources(paths, marker, revision_bytes):
             )
         source.unlink()
         fsync_directory(source.parent)
+
+
+def require_read_only_legacy_lineage(paths, state):
+    """Pure legacy-lineage refusal for read paths; never mutates anything.
+
+    Read-only surfaces must be exactly as strict as writable load about
+    competing or forged legacy authority: the migration marker and the v5
+    state must claim each other, a present marker must validate, and
+    unclaimed legacy root files refuse the read.
+    """
+    marker_path = paths.migrations / "legacy-to-v5.json"
+    if not (marker_path.exists() or marker_path.is_symlink()):
+        if state.get("legacy_migration") == "legacy-to-v5":
+            raise BimriError(
+                "v5 state requires legacy-to-v5.json, but the durable migration "
+                "marker is missing. Restore it from recovery before continuing."
+            )
+    else:
+        if state.get("legacy_migration") != "legacy-to-v5":
+            raise BimriError(
+                "legacy-to-v5.json exists, but v5 state does not claim that migration."
+            )
+        marker = read_json_strict(marker_path, marker_path.name)
+        _validate_legacy_marker(paths, marker, state)
+    reject_unclaimed_legacy_roots(paths)
 
 
 def finalize_legacy_migration(paths, state):
@@ -4583,24 +4610,81 @@ def prune_audit_manifest_generations(paths):
     fsync_directory(paths.audit_manifests)
 
 
+def audit_checkpoint_drift_delta(
+    prior_manifest, manifest, allowed_manifest_paths=None
+):
+    """Complete per-path divergence between two witnessed inventories."""
+    allowed = set(allowed_manifest_paths or ())
+    prior_by_path = {item["path"]: item["sha256"] for item in prior_manifest}
+    current_by_path = {item["path"]: item["sha256"] for item in manifest}
+    changed = [
+        {
+            "path": path,
+            "prior_sha256": prior_by_path[path],
+            "sha256": current_by_path[path],
+        }
+        for path in sorted(prior_by_path.keys() & current_by_path.keys())
+        if prior_by_path[path] != current_by_path[path]
+        and path not in allowed
+    ]
+    added = [
+        {"path": path, "sha256": current_by_path[path]}
+        for path in sorted(current_by_path.keys() - prior_by_path.keys())
+        if path not in allowed
+    ]
+    deleted = [
+        {"path": path, "prior_sha256": prior_by_path[path]}
+        for path in sorted(prior_by_path.keys() - current_by_path.keys())
+        if path not in allowed
+    ]
+    return {"changed": changed, "added": added, "deleted": deleted}
+
+
+def next_audit_drift_sequence(paths):
+    last = 0
+    for path in list_audit_drift_receipts(paths):
+        match = re.match(r"D(\d{6})-", path.name)
+        if match:
+            last = max(last, int(match.group(1)))
+    return last + 1
+
+
 def write_audit_drift_receipt(
-    paths, reasons, marker=None, prior_witness=None, state=None
+    paths, reasons, marker=None, prior_witness=None, state=None, delta=None
 ):
     """Preserve unexplained-drift evidence without pausing the store.
 
-    Drift that a passing full audit could not condemn is recorded as
-    append-only derived evidence and surfaced by doctor. Evidence writing
-    must never take down the operation it describes, so every failure here
-    degrades to returning None.
+    Drift that a passing full audit could not condemn is recorded as sealed,
+    self-contained derived evidence: every diverging path with its prior and
+    current hash, so the record needs no other file to stay meaningful.
+    Retention is a bounded rolling window of the newest AUDIT_DRIFT_KEEP
+    receipts in monotonic sequence order. Evidence writing must never take
+    down the operation it describes, so every failure here degrades to
+    returning None.
     """
     reasons = [str(reason) for reason in reasons if reason][:40]
-    if not reasons:
+    if not reasons and not delta:
         return None
+    truncated = {}
+    if isinstance(delta, dict):
+        bounded = {}
+        for section in ("changed", "added", "deleted"):
+            items = list(delta.get(section) or ())
+            if len(items) > AUDIT_DRIFT_DELTA_CAP:
+                truncated[section] = len(items) - AUDIT_DRIFT_DELTA_CAP
+                items = items[:AUDIT_DRIFT_DELTA_CAP]
+            bounded[section] = items
+        delta = bounded
+        if not any(delta.values()) and not reasons:
+            return None
     try:
         newest = list_audit_drift_receipts(paths)[-1:]
         if newest:
             existing = read_json_strict(newest[0], newest[0].name)
-            if existing.get("reasons") == reasons:
+            if (
+                existing.get("reasons") == reasons
+                and existing.get("delta") == delta
+            ):
                 # A repeated attempt against the same divergence adds no
                 # evidence; the newest receipt already carries it.
                 return newest[0]
@@ -4609,8 +4693,11 @@ def write_audit_drift_receipt(
     try:
         record = {
             "drift_schema": AUDIT_DRIFT_SCHEMA,
+            "sequence": next_audit_drift_sequence(paths),
             "created_at": now_iso(),
             "reasons": reasons,
+            "delta": delta,
+            "truncated": truncated,
             "prior_witness_hash": (
                 prior_witness.get("witness_hash")
                 if isinstance(prior_witness, dict) else None
@@ -4620,12 +4707,14 @@ def write_audit_drift_receipt(
             "audit_epoch": state_audit_epoch(state) if state else None,
             "transition_marker": marker,
         }
+        record["receipt_hash"] = audit_record_seal(record, "receipt_hash")
         if path_is_redirected(paths.audit_drift):
             return None
         ensure_directory_durable(paths.audit_drift)
-        digest = sha256_bytes(canonical_json_bytes(record))[:16]
-        stamp = record["created_at"].replace(":", "").replace("-", "")
-        path = paths.audit_drift / f"D{stamp}-{digest}.json"
+        digest = sha256_bytes(canonical_json_bytes(record))[:12]
+        path = paths.audit_drift / (
+            f"D{record['sequence']:06d}-{digest}.json"
+        )
         if not path.exists() and not path.is_symlink():
             atomic_write_json(path, record)
         prune_audit_drift_receipts(paths)
@@ -4651,8 +4740,23 @@ def list_audit_drift_receipts(paths):
 
 
 def prune_audit_drift_receipts(paths):
-    """Bound drift evidence to the most recent receipts."""
+    """Bound drift evidence to the newest receipts and preserved blobs."""
     for path in list_audit_drift_receipts(paths)[:-AUDIT_DRIFT_KEEP]:
+        with contextlib.suppress(OSError):
+            path.unlink()
+    try:
+        blobs = sorted(
+            (
+                path for path in paths.audit_drift.iterdir()
+                if not path.is_symlink()
+                and path.is_file()
+                and path.name.startswith("corrupt-transition-")
+            ),
+            key=lambda item: item.stat().st_mtime,
+        )
+    except (FileNotFoundError, OSError):
+        return
+    for path in blobs[:-AUDIT_DRIFT_BLOB_KEEP]:
         with contextlib.suppress(OSError):
             path.unlink()
 
@@ -5173,6 +5277,71 @@ def authority_transition_allowed_manifest_paths(paths, state, marker):
     return allowed
 
 
+def archive_paths_explained_by_transition(paths, marker):
+    """Archive months whose only change is appends stamped by the scoped op.
+
+    Proof, not exemption: the current bytes must reduce to the prior
+    witnessed hash by stripping whole trailing rows, and every stripped row
+    must carry a [BY:<id>] stamp from the transition's own scope. A new
+    month must consist entirely of such rows. Deleted months are never
+    explained, and a torn or foreign tail leaves the month as drift.
+    """
+    explained = set()
+    scoped_ids = set(authority_transition_proposal_ids(paths, marker))
+    conflict_id = marker.get("scope", {}).get("conflict_id")
+    if isinstance(conflict_id, str) and CONFLICT_RE.fullmatch(conflict_id):
+        scoped_ids.add(conflict_id)
+    if not scoped_ids:
+        return explained
+    try:
+        prior_manifest = load_audit_manifest_evidence(
+            paths, marker["prior_witness"]
+        )
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        return explained
+    prior_by_path = {
+        item["path"]: item["sha256"] for item in prior_manifest
+    }
+    stamps = tuple(
+        f"[BY:{scoped}]".encode("utf-8") for scoped in sorted(scoped_ids)
+    )
+    try:
+        children = sorted(paths.archive.glob("*.md"))
+    except OSError:
+        return explained
+    for path in children:
+        if path.is_symlink() or not path.is_file():
+            continue
+        relative = path.relative_to(paths.root).as_posix()
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            continue
+        prior_hash = prior_by_path.get(relative)
+        if prior_hash is not None and sha256_bytes(raw) == prior_hash:
+            continue
+        remainder = raw
+        proven = False
+        for _ in range(64):
+            if prior_hash is None:
+                if remainder == b"":
+                    proven = True
+                    break
+            elif sha256_bytes(remainder) == prior_hash:
+                proven = True
+                break
+            if not remainder.endswith(b"\n"):
+                break
+            cut = remainder.rfind(b"\n", 0, len(remainder) - 1)
+            line = remainder[cut + 1:]
+            if not any(stamp in line for stamp in stamps):
+                break
+            remainder = remainder[:cut + 1]
+        if proven:
+            explained.add(relative)
+    return explained
+
+
 def authority_transition_completion_issues(
     paths, state, marker, manifest, run_facts
 ):
@@ -5237,12 +5406,10 @@ def authority_transition_completion_issues(
 
     allowed = authority_transition_allowed_manifest_paths(paths, state, marker)
     # Accepted replacements append displaced entries to cold archive months
-    # as a routine engine effect. Existing archive files are therefore
-    # transition-explained; a deleted month still surfaces as drift.
-    with contextlib.suppress(OSError):
-        for archive_path in paths.archive.glob("*.md"):
-            if not archive_path.is_symlink():
-                allowed.add(f".bimri/archive/{archive_path.name}")
+    # as a routine engine effect. A month is transition-explained only when
+    # its change is byte-provably the prior content plus appended rows
+    # stamped by this operation's own scope; anything else stays drift.
+    allowed |= archive_paths_explained_by_transition(paths, marker)
     mismatch = audit_checkpoint_mismatch_issues(
         paths,
         state,
@@ -5309,10 +5476,23 @@ def reconcile_audit_transition(paths, state):
     try:
         marker = load_audit_transition(paths)
     except (BimriError, OSError, UnicodeError, ValueError, TypeError) as exc:
-        # A corrupt write-ahead marker must never wedge recovery itself.
-        # Preserve its exact bytes as drift evidence, then rebuild trust
-        # through the full audit.
+        # A corrupt write-ahead marker must never wedge recovery itself:
+        # preserve its exact bytes as drift evidence, then rebuild trust
+        # through the full audit. An obstruction that cannot be preserved
+        # and retired (for example a directory squatting on the marker
+        # path) is a hard error — no command may report health while the
+        # marker path is unusable, and the witness stays untouched.
         preserved = preserve_corrupt_audit_transition(paths)
+        if preserved is None and (
+            paths.audit_transition.exists()
+            or paths.audit_transition.is_symlink()
+        ):
+            raise BimriError(
+                "audit transition marker path is obstructed by something "
+                "that is not a regular file and could not be preserved for "
+                f"recovery: {exc}. Remove or restore "
+                ".bimri/audit-transition.json, then run doctor."
+            ) from exc
         reasons = [f"audit transition marker was invalid: {exc}"]
         if preserved:
             reasons.append(f"marker bytes preserved at {preserved}")
@@ -5887,11 +6067,28 @@ def governance_snapshot(
             pass
         else:
             if not strict_prior_comparison and mismatch_issues:
+                drift_delta = None
+                if prior_witness is not None and manifest is not None:
+                    try:
+                        prior_m = load_audit_manifest_evidence(
+                            paths,
+                            prior_witness,
+                            manifest_override=prior_manifest_override,
+                        )
+                        drift_delta = audit_checkpoint_drift_delta(
+                            prior_m, manifest, allowed_manifest_paths
+                        )
+                    except (
+                        BimriError, OSError, UnicodeError, ValueError,
+                        TypeError,
+                    ):
+                        drift_delta = None
                 write_audit_drift_receipt(
                     paths,
                     mismatch_issues,
                     prior_witness=prior_witness,
                     state=state,
+                    delta=drift_delta,
                 )
             if clear_block_after_publish:
                 clear_audit_blocked(paths)
@@ -5967,8 +6164,21 @@ def begin_authority_write(
         # complete semantic authority audit. The stale witness file stays on
         # disk: warm reads keep serving inside the documented boundary, and
         # a failed audit leaves W0 as the recovery baseline for quarantine.
+        drift_delta = None
+        if manifest is not None:
+            try:
+                prior_m = load_audit_manifest_evidence(paths, prior_witness)
+                drift_delta = audit_checkpoint_drift_delta(prior_m, manifest)
+            except (
+                BimriError, OSError, UnicodeError, ValueError, TypeError,
+            ):
+                drift_delta = None
         write_audit_drift_receipt(
-            paths, mismatch, prior_witness=prior_witness, state=state
+            paths,
+            mismatch,
+            prior_witness=prior_witness,
+            state=state,
+            delta=drift_delta,
         )
 
     # Missing, corrupt or diverged derived evidence has no prior verdict to
@@ -6105,8 +6315,21 @@ def require_governance_for_resolution_retry(
             paths.full_audit_manifest = manifest
             paths.full_audit_run_facts = run_facts
             return []
+        drift_delta = None
+        if manifest is not None:
+            try:
+                prior_m = load_audit_manifest_evidence(paths, prior_witness)
+                drift_delta = audit_checkpoint_drift_delta(prior_m, manifest)
+            except (
+                BimriError, OSError, UnicodeError, ValueError, TypeError,
+            ):
+                drift_delta = None
         write_audit_drift_receipt(
-            paths, mismatch, prior_witness=prior_witness, state=state
+            paths,
+            mismatch,
+            prior_witness=prior_witness,
+            state=state,
+            delta=drift_delta,
         )
     conflicts, issues = governance_snapshot(
         paths,
@@ -8573,6 +8796,10 @@ def load_exact_checkpoint_state(paths, key):
             or not HASH_RE.fullmatch(state["head_hash"])
         ):
             return None
+        # Warm reads are exactly as strict as every other surface about
+        # competing legacy authority; a refusal here degrades to the slow
+        # path, which raises the same lineage error.
+        require_read_only_legacy_lineage(paths, state)
         witness = load_valid_audit_witness(paths, state)
         if witness is None or load_audit_blocked_issues(paths):
             return None
@@ -12218,6 +12445,7 @@ def load_current_state_read_only(paths, accepted_versions=None):
     state = validate_state(
         merged, accepted_versions=accepted_versions
     )
+    require_read_only_legacy_lineage(paths, state)
     head = revision_path(paths, state["head_revision"])
     if path_is_redirected(head) or not head.is_file():
         raise BimriError(

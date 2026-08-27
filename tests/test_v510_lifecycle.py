@@ -3270,6 +3270,37 @@ class V510LifecycleTest(unittest.TestCase):
         self.assertIn(chosen_text, self.cli("recall", "--key", key).stdout)
         self.assertIn("PASSED", self.cli("doctor", "--read-only").stdout)
 
+    def test_v510_engine_refuses_store_with_decided_v511_proposals(self):
+        run_id, _ = self.start("downgrade-contract")
+        staged = self.propose_set(
+            run_id,
+            "downgrade.contract",
+            "Decided v5.1.1 proposals keep their receipts as immutable authority.",
+            new_subject=True,
+        )
+        proposal = re.search(r"R\d{6}-Q\d{3}", staged.stdout).group(0)
+        self.cli("sync", "--run", run_id)
+        self.assertEqual(self.decision(proposal)["outcome"], "accepted")
+
+        old_package = self.materialize_release(
+            "2b34cbc", self.root / "_v510_source"
+        )
+        previous_engine = old_package / "bimri-engine.py"
+        refused = self.cli(
+            "doctor",
+            "--read-only",
+            engine=previous_engine,
+            check=False,
+        )
+        # The documented one-way contract: even decided v5.1.1 proposals
+        # remain immutable authority that a v5.1.0 engine keeps validating,
+        # so rollback exists only through the pre-update backup.
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn(
+            "preflight receipt engine release",
+            (refused.stdout + refused.stderr).lower(),
+        )
+
     def test_populated_code_update_preserves_preexisting_memory_bytes(self):
         shutil.copytree(POPULATED_FIXTURE, self.root, dirs_exist_ok=True)
         before = self.protected_snapshot(self.root)

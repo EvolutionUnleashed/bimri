@@ -79,7 +79,7 @@ bimri.md                       generated view of accepted memory
   audit-manifest.json          detailed reference-engine audit evidence
   audit-manifests/             retained manifest generations for audit evidence
   audit-transition.json        write-ahead marker for a checkpoint change
-  audit-drift/                 bounded append-only receipts of unexplained divergence
+  audit-drift/                 bounded rolling receipts of unexplained divergence
   audit-blocked.json           owner-repair baseline while a quarantine is open
   log/R000001.md               append-only log for one run
   revisions/V000000.md         immutable shared-memory snapshots
@@ -128,8 +128,10 @@ explicit audit, review, search, and historical retrieval perform the full
 check. The checkpoint is a derived cache: divergence from it is a cache miss
 that forces the full semantic audit, never a stored verdict of its own. When
 that audit passes over divergence the engine cannot attribute to its own
-recorded operation, it preserves an append-only receipt under
-`.bimri/audit-drift/` and continues; when the audit fails, the store refuses
+recorded operation, it preserves a sealed drift receipt (bounded to the
+newest 200, each carrying every diverging path with its prior and current
+hash) under `.bimri/audit-drift/` and continues; when the audit fails, the
+store refuses
 into damaged-authority recovery exactly as it would without a checkpoint.
 `audit-blocked.json` appears only while an owner-approved quarantine holds its
 pre-repair baseline; restoration, or a clean doctor pass after it, clears it.
@@ -920,8 +922,12 @@ containment, and index shape.
 The reference engine performs a full protected-tree audit before an
 authority-changing write and for explicit doctor, review, task-language search,
 and historical retrieval. When intact prior path-and-hash evidence disagrees
-with that audit, it MUST retain the prior evidence and fail closed rather than
-silently bless the new bytes. A normal current-only exact read is not required
+with that audit, the engine MUST NOT silently bless the new bytes: it MUST
+re-prove the complete semantic authority graph, and only a passing proof may
+adopt the new inventory as its baseline, while recording a durable drift
+receipt that preserves every diverging path with its prior and current hash.
+A failing proof MUST refuse into damaged-authority recovery with the prior
+evidence retained. A normal current-only exact read is not required
 to traverse unrelated historical authority; every non-engine filesystem writer
 therefore remains outside the supported cooperative lock protocol.
 

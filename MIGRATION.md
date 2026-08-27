@@ -1,11 +1,12 @@
 # BIMRI Migration and the v5.1.0 Lifecycle Upgrade
 
 Engine v5.1.1 uses authority format v5.1.0 while retaining the readable v5.0.2
-hot-memory grammar. The upgrade from v5.1.0 is one-way for new work: v5.1.1
-stamps its own engine release into proposal preflight receipts, and a v5.1.0
-engine rejects those receipts, so proposals staged by v5.1.1 cannot be
-processed by an older engine. Roll back only through the update backup, before
-new proposals are staged, or after pending v5.1.1 proposals are decided. The
+hot-memory grammar. The upgrade from v5.1.0 is one-way: v5.1.1 stamps its
+own engine release into proposal preflight receipts, and every proposal —
+pending or decided — remains an immutable authority record that a v5.1.0
+engine keeps validating, so it rejects the store permanently once any
+v5.1.1 proposal has been staged. Safe rollback exists only by restoring the
+complete pre-update backup taken before the first v5.1.1 proposal. The
 engine automatically migrates explicitly versioned v1-v3
 tiered Markdown and the engine-based v4 format. This canonical repository publicly
 distributed the original v1 and streamlined v3 instructions; the parser also

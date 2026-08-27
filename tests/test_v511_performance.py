@@ -2486,9 +2486,12 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         recovered = self.cli("get", "--key", "archive-scope.stable")
 
         self.assertIn("archive-scope.stable", recovered.stdout)
-        # The same-month append survives inside the transition-explained
-        # window: that is the documented coordinated-writer boundary, and
-        # the store completes its interrupted checkpoint instead of dying.
+        # This forged row impersonates the interrupted operation's own
+        # [BY:] stamp inside its crash window, which is the narrowed
+        # documented boundary: append-shaped rows carrying the scoped stamp
+        # are byte-provably indistinguishable from the operation's own
+        # effect. Anything without the scoped stamp is drift evidence (see
+        # test_unscoped_archive_edit_in_crash_window_is_receipted).
         self.assertIn(forged_append, archive_path.read_text("utf-8"))
         self.assert_no_audit_block()
 
@@ -2823,6 +2826,140 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
 
         rewarmed = self.cli("get", "--key", "witness.seed")
         self.assertIn("witness.seed", rewarmed.stdout)
+
+    def test_marker_path_obstruction_is_a_hard_error_never_false_health(self):
+        self.seed_authority_graph()
+        witness_before = self.witness_path().read_bytes()
+        obstruction = self.root / ".bimri" / "audit-transition.json"
+        obstruction.mkdir()
+
+        doctored = self.cli("doctor", check=False)
+        self.assertEqual(
+            doctored.returncode, 2, doctored.stdout + doctored.stderr
+        )
+        self.assertIn(
+            "obstructed", (doctored.stdout + doctored.stderr).lower()
+        )
+        self.assertTrue(obstruction.is_dir())
+        self.assertEqual(self.witness_path().read_bytes(), witness_before)
+
+        gated = self.cli("get", "--key", "witness.seed", check=False)
+        self.assertEqual(gated.returncode, 2)
+
+        obstruction.rmdir()
+        repaired = self.cli("doctor")
+        self.assertIn("BIMRI doctor: PASSED", repaired.stdout)
+        recalled = self.cli("get", "--key", "witness.seed")
+        self.assertIn("witness.seed", recalled.stdout)
+
+    def test_unscoped_archive_edit_in_crash_window_is_receipted(self):
+        stable_run = self.start("archive-drift-stable")
+        self.apply_set(
+            stable_run,
+            "archive-drift.stable",
+            "Stable value used to probe unscoped archive drift.",
+            new_subject=True,
+        )
+        target_run = self.start("archive-drift-target")
+        self.apply_set(
+            target_run,
+            "archive-drift.target",
+            "Value legitimately closed by the interrupted sync.",
+            new_subject=True,
+        )
+        close_run = self.start("archive-drift-closer")
+        self.propose(
+            close_run,
+            "archive-drift.target",
+            "",
+            operation="close",
+        )
+
+        crashed = self.worker(
+            "witness_crash_before_replace",
+            "sync",
+            "--run",
+            close_run,
+            check=False,
+        )
+        self.assertEqual(
+            crashed.returncode, 110, crashed.stdout + crashed.stderr
+        )
+        archive_files = sorted(
+            self.root.joinpath(".bimri", "archive").glob("*.md")
+        )
+        self.assertTrue(archive_files)
+        foreign = (
+            "[ARCHIVED:2026-08-22] [BY:R999999-Q999] [closed] "
+            "[T2][K:archive-drift.foreign][I:3][S:agent][Q:working] "
+            "Foreign row without a scoped stamp.\n"
+        )
+        with archive_files[0].open("a", encoding="utf-8", newline="\n") as f:
+            f.write(foreign)
+
+        recovered = self.cli("get", "--key", "archive-drift.stable")
+        self.assertIn("archive-drift.stable", recovered.stdout)
+        # The foreign row is preserved and evidenced, never silently
+        # baselined as the operation's own effect.
+        self.assertIn(foreign, archive_files[0].read_text("utf-8"))
+        self.assert_no_audit_block()
+        self.assert_drift_receipt(pattern=r"archive|inventory")
+
+    def test_read_paths_refuse_unclaimed_legacy_roots(self):
+        self.seed_authority_graph()
+        legacy = self.root / "BIMRI-backup.md"
+        legacy.write_text("# legacy rolling backup\n", encoding="utf-8")
+
+        gated = self.cli("get", "--key", "witness.seed", check=False)
+        self.assertEqual(gated.returncode, 2, gated.stdout + gated.stderr)
+        self.assertIn(
+            "unclaimed legacy", (gated.stdout + gated.stderr).lower()
+        )
+        audited = self.cli("doctor", "--read-only", check=False)
+        self.assertNotEqual(audited.returncode, 0)
+        self.assertIn(
+            "unclaimed legacy", (audited.stdout + audited.stderr).lower()
+        )
+
+        legacy.unlink()
+        recalled = self.cli("get", "--key", "witness.seed")
+        self.assertIn("witness.seed", recalled.stdout)
+
+    def test_drift_receipt_seals_every_diverging_path_with_hashes(self):
+        records = self.seed_authority_graph()
+        strays = []
+        for index in range(5):
+            stray = self.root / ".bimri" / "archive" / f"stray-{index}.bin"
+            stray.write_bytes(f"stray {index}\n".encode())
+            strays.append(stray)
+        edited = records["decisions"]
+        edited_relative = edited.relative_to(self.root).as_posix()
+        prior_hash = hashlib.sha256(edited.read_bytes()).hexdigest()
+        edited.write_bytes(edited.read_bytes() + b"\n")
+        current_hash = hashlib.sha256(edited.read_bytes()).hexdigest()
+
+        repaired = self.cli("doctor")
+        self.assertIn("BIMRI doctor: PASSED", repaired.stdout)
+        receipts = self.assert_drift_receipt()
+        record = json.loads(receipts[-1].read_text("utf-8"))
+        self.assertEqual(record["sequence"], 1)
+        self.assertTrue(record["receipt_hash"])
+        self.assertEqual(record["truncated"], {})
+        added_paths = {item["path"] for item in record["delta"]["added"]}
+        for stray in strays:
+            self.assertIn(
+                stray.relative_to(self.root).as_posix(), added_paths
+            )
+        for item in record["delta"]["added"]:
+            self.assertRegex(item["sha256"], r"^[0-9a-f]{64}$")
+        # Changed paths seal both sides, so the receipt stays meaningful
+        # after the prior manifest generation is pruned.
+        changed = {
+            item["path"]: item for item in record["delta"]["changed"]
+        }
+        self.assertIn(edited_relative, changed)
+        self.assertEqual(changed[edited_relative]["prior_sha256"], prior_hash)
+        self.assertEqual(changed[edited_relative]["sha256"], current_hash)
 
     def test_unknown_preflight_receipt_release_is_refused(self):
         self.seed_authority_graph()
