@@ -4584,6 +4584,9 @@ def referenced_audit_manifest_hashes(paths):
         transition = None
     if transition:
         hashes.add(transition["prior_manifest_hash"])
+    # A truncated drift receipt stays complete only while its referenced
+    # prior manifest generation survives beside it.
+    hashes |= retained_drift_receipt_references(paths)[0]
     return hashes
 
 
@@ -4650,19 +4653,25 @@ def next_audit_drift_sequence(paths):
 
 
 def write_audit_drift_receipt(
-    paths, reasons, marker=None, prior_witness=None, state=None, delta=None
+    paths, reasons, marker=None, prior_witness=None, state=None, delta=None,
+    preserved_evidence=(),
 ):
-    """Preserve unexplained-drift evidence without pausing the store.
+    """Preserve unexplained-drift evidence as a rebaseline precondition.
 
-    Drift that a passing full audit could not condemn is recorded as sealed,
-    self-contained derived evidence: every diverging path with its prior and
-    current hash, so the record needs no other file to stay meaningful.
-    Retention is a bounded rolling window of the newest AUDIT_DRIFT_KEEP
-    receipts in monotonic sequence order. Evidence writing must never take
-    down the operation it describes, so every failure here degrades to
-    returning None.
+    Drift that a passing full audit could not condemn is recorded as sealed
+    derived evidence: the diverging paths with their prior and current
+    hashes, complete up to AUDIT_DRIFT_DELTA_CAP entries per section with
+    any remainder counted explicitly; a truncated receipt's referenced
+    prior manifest generation is retained while the receipt is retained,
+    so the complete inventory stays recoverable. Retention is a bounded
+    rolling window of the newest AUDIT_DRIFT_KEEP receipts in monotonic
+    sequence order. Returning None means no durable receipt exists —
+    callers MUST treat that as a refusal to proceed, never as success.
     """
     reasons = [str(reason) for reason in reasons if reason][:40]
+    preserved_evidence = sorted(
+        str(item) for item in preserved_evidence if item
+    )
     if not reasons and not delta:
         return None
     truncated = {}
@@ -4684,6 +4693,9 @@ def write_audit_drift_receipt(
             if (
                 existing.get("reasons") == reasons
                 and existing.get("delta") == delta
+                and existing.get("preserved_evidence", []) == (
+                    preserved_evidence
+                )
             ):
                 # A repeated attempt against the same divergence adds no
                 # evidence; the newest receipt already carries it.
@@ -4698,8 +4710,13 @@ def write_audit_drift_receipt(
             "reasons": reasons,
             "delta": delta,
             "truncated": truncated,
+            "preserved_evidence": preserved_evidence,
             "prior_witness_hash": (
                 prior_witness.get("witness_hash")
+                if isinstance(prior_witness, dict) else None
+            ),
+            "prior_manifest_hash": (
+                prior_witness.get("manifest_hash")
                 if isinstance(prior_witness, dict) else None
             ),
             "head_revision": state.get("head_revision") if state else None,
@@ -4717,6 +4734,8 @@ def write_audit_drift_receipt(
         )
         if not path.exists() and not path.is_symlink():
             atomic_write_json(path, record)
+        if not path.is_file():
+            return None
         prune_audit_drift_receipts(paths)
         return path
     except (BimriError, OSError, UnicodeError, ValueError, TypeError, KeyError):
@@ -4740,10 +4759,15 @@ def list_audit_drift_receipts(paths):
 
 
 def prune_audit_drift_receipts(paths):
-    """Bound drift evidence to the newest receipts and preserved blobs."""
+    """Bound drift evidence to the newest receipts and preserved blobs.
+
+    A blob cited by a retained receipt's preserved_evidence outlives the
+    unreferenced-blob bound, so no retained receipt ever cites pruned bytes.
+    """
     for path in list_audit_drift_receipts(paths)[:-AUDIT_DRIFT_KEEP]:
         with contextlib.suppress(OSError):
             path.unlink()
+    referenced = retained_drift_receipt_references(paths)[1]
     try:
         blobs = sorted(
             (
@@ -4751,6 +4775,7 @@ def prune_audit_drift_receipts(paths):
                 if not path.is_symlink()
                 and path.is_file()
                 and path.name.startswith("corrupt-transition-")
+                and path.relative_to(paths.root).as_posix() not in referenced
             ),
             key=lambda item: item.stat().st_mtime,
         )
@@ -4761,19 +4786,88 @@ def prune_audit_drift_receipts(paths):
             path.unlink()
 
 
-def audit_drift_summary(paths, limit=3):
-    """Total receipt count plus the newest receipts, for reporting."""
-    children = list_audit_drift_receipts(paths)
-    records = []
-    for path in reversed(children[-max(0, int(limit)):]):
+def validate_audit_drift_receipt(path, record):
+    """Return a problem string for an untrustworthy receipt, else None."""
+    if not isinstance(record, dict):
+        return "receipt is not an object"
+    if record.get("drift_schema") != AUDIT_DRIFT_SCHEMA:
+        return "unsupported drift schema"
+    match = re.fullmatch(r"D(\d{6})-([0-9a-f]{12})\.json", path.name)
+    if not match:
+        return "receipt filename is not bound to a sequence"
+    if record.get("sequence") != int(match.group(1)):
+        return "receipt sequence does not match its filename"
+    if record.get("receipt_hash") != audit_record_seal(record, "receipt_hash"):
+        return "receipt seal is invalid"
+    if sha256_bytes(canonical_json_bytes(record))[:12] != match.group(2):
+        return "receipt content does not match its filename digest"
+    delta = record.get("delta")
+    if delta is not None:
+        if not isinstance(delta, dict):
+            return "receipt delta is invalid"
+        for section, fields in (
+            ("changed", ("path", "prior_sha256", "sha256")),
+            ("added", ("path", "sha256")),
+            ("deleted", ("path", "prior_sha256")),
+        ):
+            items = delta.get(section)
+            if not isinstance(items, list):
+                return "receipt delta is invalid"
+            for item in items:
+                if not isinstance(item, dict) or set(item) != set(fields):
+                    return "receipt delta is invalid"
+                for field in fields:
+                    value = item.get(field)
+                    if field == "path":
+                        if not isinstance(value, str) or not value:
+                            return "receipt delta is invalid"
+                    elif not (
+                        isinstance(value, str) and HASH_RE.fullmatch(value)
+                    ):
+                        return "receipt delta is invalid"
+    return None
+
+
+def retained_drift_receipt_references(paths):
+    """Evidence still referenced by retained, validated drift receipts."""
+    manifest_hashes = set()
+    preserved = set()
+    for path in list_audit_drift_receipts(paths):
         try:
             record = read_json_strict(path, path.name)
         except (BimriError, OSError, UnicodeError):
             continue
-        if record.get("drift_schema") == AUDIT_DRIFT_SCHEMA:
-            record["receipt_name"] = path.name
-            records.append(record)
-    return len(children), records
+        if validate_audit_drift_receipt(path, record):
+            continue
+        if record.get("truncated"):
+            value = record.get("prior_manifest_hash")
+            if isinstance(value, str) and HASH_RE.fullmatch(value):
+                manifest_hashes.add(value)
+        for item in record.get("preserved_evidence") or ():
+            if isinstance(item, str) and item:
+                preserved.add(item)
+    return manifest_hashes, preserved
+
+
+def audit_drift_summary(paths, limit=3):
+    """Validated receipt count, newest valid receipts, damaged names."""
+    children = list_audit_drift_receipts(paths)
+    valid = []
+    damaged = []
+    for path in children:
+        try:
+            record = read_json_strict(path, path.name)
+        except (BimriError, OSError, UnicodeError):
+            damaged.append(path.name)
+            continue
+        problem = validate_audit_drift_receipt(path, record)
+        if problem:
+            damaged.append(path.name)
+            continue
+        record["receipt_name"] = path.name
+        valid.append(record)
+    newest = list(reversed(valid[-max(0, int(limit)):]))
+    return len(children), newest, damaged
 
 
 def write_audit_witness(paths, state, conflicts=None, manifest=None, run_facts=None):
@@ -5494,10 +5588,21 @@ def reconcile_audit_transition(paths, state):
                 ".bimri/audit-transition.json, then run doctor."
             ) from exc
         reasons = [f"audit transition marker was invalid: {exc}"]
+        preserved_evidence = []
         if preserved:
             reasons.append(f"marker bytes preserved at {preserved}")
+            preserved_evidence.append(preserved)
+        if write_audit_drift_receipt(
+            paths,
+            reasons,
+            state=state,
+            preserved_evidence=preserved_evidence,
+        ) is None:
+            raise BimriError(
+                "the invalid transition marker's drift evidence could not "
+                "be durably recorded. Repair .bimri/audit-drift, then retry."
+            ) from exc
         discard_audit_witness(paths)
-        write_audit_drift_receipt(paths, reasons, state=state)
         return state
     if marker is None:
         return state
@@ -5533,13 +5638,19 @@ def reconcile_audit_transition(paths, state):
             return state
         reasons = [
             f"incomplete {marker['operation']} lifecycle transition for "
-            f"{marker['run_id']} does not match its intended state/log bytes"
+            f"{marker['run_id']} does not match its intended state/log bytes",
+            "lifecycle state/log divergence; no inventory delta applies",
         ]
         # Cache-miss semantics: preserve the evidence, retire the reconciled
         # marker, and let the full semantic audit decide the store's fate.
-        write_audit_drift_receipt(
+        if write_audit_drift_receipt(
             paths, reasons, marker=marker, prior_witness=prior, state=state
-        )
+        ) is None:
+            raise BimriError(
+                "interrupted-transition drift evidence could not be durably "
+                "recorded; the transition marker and prior checkpoint "
+                "remain in place. Repair .bimri/audit-drift, then retry."
+            )
         discard_audit_witness(paths)
         clear_audit_transition(paths)
         prune_audit_manifest_generations(paths)
@@ -5611,9 +5722,31 @@ def reconcile_audit_transition(paths, state):
             # a general block: only an explicit retry of this exact conflict is
             # permitted by require_governance_for_resolution_retry.
             return state
-    write_audit_drift_receipt(
-        paths, reasons, marker=marker, prior_witness=prior, state=state
-    )
+    drift_delta = None
+    if manifest is not None:
+        try:
+            prior_m = load_audit_manifest_evidence(paths, prior)
+            allowed_recovery = authority_transition_allowed_manifest_paths(
+                paths, state, marker
+            ) | archive_paths_explained_by_transition(paths, marker)
+            drift_delta = audit_checkpoint_drift_delta(
+                prior_m, manifest, allowed_recovery
+            )
+        except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+            drift_delta = None
+    if write_audit_drift_receipt(
+        paths,
+        reasons,
+        marker=marker,
+        prior_witness=prior,
+        state=state,
+        delta=drift_delta,
+    ) is None:
+        raise BimriError(
+            "interrupted-transition drift evidence could not be durably "
+            "recorded; the transition marker and prior checkpoint remain in "
+            "place. Repair .bimri/audit-drift, then retry."
+        )
     discard_audit_witness(paths)
     clear_audit_transition(paths)
     prune_audit_manifest_generations(paths)
@@ -6052,49 +6185,64 @@ def governance_snapshot(
         not allow_recoverable_applying
         or not authority_has_recoverable_applying(paths)
     ):
-        published = write_audit_witness(
-            paths,
-            state,
-            conflicts,
-            manifest=manifest,
-            run_facts=run_facts,
-        )
-        if not published:
-            # Unsettled records legitimately refuse a fresh checkpoint. The
-            # audit itself passed, so the caller proceeds; operations simply
-            # stay on the full-audit path until the store settles, and any
-            # recovery baseline stays uncleared.
-            pass
+        # The ruled contract makes a durable receipt a transactional
+        # precondition of rebaselining over unexplained divergence: the
+        # receipt is recorded before the replacement checkpoint can
+        # publish, and a receipt that cannot be recorded keeps the prior
+        # checkpoint as the baseline and surfaces as an issue rather than
+        # a silent pass.
+        receipt_blocked = False
+        if not strict_prior_comparison and mismatch_issues:
+            drift_delta = None
+            delta_reasons = list(mismatch_issues)
+            if prior_witness is not None and manifest is not None:
+                try:
+                    prior_m = load_audit_manifest_evidence(
+                        paths,
+                        prior_witness,
+                        manifest_override=prior_manifest_override,
+                    )
+                    drift_delta = audit_checkpoint_drift_delta(
+                        prior_m, manifest, allowed_manifest_paths
+                    )
+                except (
+                    BimriError, OSError, UnicodeError, ValueError,
+                    TypeError,
+                ) as exc:
+                    drift_delta = None
+                    delta_reasons.append(
+                        "prior manifest evidence could not be loaded; "
+                        f"per-path delta unavailable: {exc}"
+                    )
+            receipt = write_audit_drift_receipt(
+                paths,
+                delta_reasons,
+                prior_witness=prior_witness,
+                state=state,
+                delta=drift_delta,
+            )
+            receipt_blocked = receipt is None
+        if receipt_blocked:
+            issues.append(
+                "unexplained divergence cannot be rebaselined because its "
+                "drift receipt could not be durably recorded; the prior "
+                "checkpoint remains the baseline."
+            )
         else:
-            if not strict_prior_comparison and mismatch_issues:
-                drift_delta = None
-                if prior_witness is not None and manifest is not None:
-                    try:
-                        prior_m = load_audit_manifest_evidence(
-                            paths,
-                            prior_witness,
-                            manifest_override=prior_manifest_override,
-                        )
-                        drift_delta = audit_checkpoint_drift_delta(
-                            prior_m, manifest, allowed_manifest_paths
-                        )
-                    except (
-                        BimriError, OSError, UnicodeError, ValueError,
-                        TypeError,
-                    ):
-                        drift_delta = None
-                write_audit_drift_receipt(
-                    paths,
-                    mismatch_issues,
-                    prior_witness=prior_witness,
-                    state=state,
-                    delta=drift_delta,
-                )
-            if clear_block_after_publish:
+            published = write_audit_witness(
+                paths,
+                state,
+                conflicts,
+                manifest=manifest,
+                run_facts=run_facts,
+            )
+            if published and clear_block_after_publish:
                 clear_audit_blocked(paths)
                 try:
                     transition = load_audit_transition(paths)
-                except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+                except (
+                    BimriError, OSError, UnicodeError, ValueError, TypeError,
+                ):
                     transition = None
                 if transition is not None and transition["kind"] == "authority":
                     clear_audit_transition(paths)
@@ -6173,13 +6321,18 @@ def begin_authority_write(
                 BimriError, OSError, UnicodeError, ValueError, TypeError,
             ):
                 drift_delta = None
-        write_audit_drift_receipt(
+        if write_audit_drift_receipt(
             paths,
             mismatch,
             prior_witness=prior_witness,
             state=state,
             delta=drift_delta,
-        )
+        ) is None:
+            raise BimriError(
+                "authority recovery is required; the divergence evidence "
+                "receipt could not be durably recorded before rebuilding "
+                "trust. Repair .bimri/audit-drift, then retry."
+            )
 
     # Missing, corrupt or diverged derived evidence has no prior verdict to
     # reuse. Rebuild trust once with the complete semantic authority audit.
@@ -6262,6 +6415,8 @@ def require_governance_for_resolution_retry(
         and transition.get("scope", {}).get("conflict_id") == conflict_id
     ):
         prior = transition["prior_witness"]
+        manifest = None
+        run_facts = None
         try:
             manifest = audit_witness_manifest(paths)
             run_facts = audit_witness_run_facts(paths, state)
@@ -6297,15 +6452,36 @@ def require_governance_for_resolution_retry(
                 )
             return conflicts
         # The retry window was disturbed beyond its own frozen closure.
-        # Preserve the divergence, then let the full semantic audit below
-        # decide whether this exact retry may still proceed.
-        write_audit_drift_receipt(
+        # Preserve the divergence with its complete per-path delta, then
+        # let the full semantic audit below decide whether this exact
+        # retry may still proceed.
+        retry_delta = None
+        if manifest is not None:
+            try:
+                prior_m = load_audit_manifest_evidence(paths, prior)
+                allowed_retry = authority_transition_allowed_manifest_paths(
+                    paths, state, transition
+                ) | archive_paths_explained_by_transition(paths, transition)
+                retry_delta = audit_checkpoint_drift_delta(
+                    prior_m, manifest, allowed_retry
+                )
+            except (
+                BimriError, OSError, UnicodeError, ValueError, TypeError,
+            ):
+                retry_delta = None
+        if write_audit_drift_receipt(
             paths,
             remaining,
             marker=transition,
             prior_witness=prior,
             state=state,
-        )
+            delta=retry_delta,
+        ) is None:
+            raise BimriError(
+                "authority recovery is required; the retry-window drift "
+                "receipt could not be durably recorded. Repair "
+                ".bimri/audit-drift, then retry."
+            )
     prior_witness = load_sealed_audit_witness(paths)
     if prior_witness is not None:
         manifest, run_facts, mismatch = verify_intact_audit_evidence(
@@ -6324,13 +6500,18 @@ def require_governance_for_resolution_retry(
                 BimriError, OSError, UnicodeError, ValueError, TypeError,
             ):
                 drift_delta = None
-        write_audit_drift_receipt(
+        if write_audit_drift_receipt(
             paths,
             mismatch,
             prior_witness=prior_witness,
             state=state,
             delta=drift_delta,
-        )
+        ) is None:
+            raise BimriError(
+                "authority recovery is required; the divergence evidence "
+                "receipt could not be durably recorded before rebuilding "
+                "trust. Repair .bimri/audit-drift, then retry."
+            )
     conflicts, issues = governance_snapshot(
         paths,
         state,
@@ -12514,13 +12695,28 @@ def doctor_errors(
         "recovery evidence is damaged: " + issue
         for issue in restore_receipt_issues(paths)
     )
-    drift_total, drift_records = audit_drift_summary(paths, limit=1)
-    if drift_total:
-        newest = drift_records[0] if drift_records else {}
+    drift_total, drift_records, drift_damaged = audit_drift_summary(
+        paths, limit=1
+    )
+    if drift_records:
+        newest = drift_records[0]
         newest_line = "; ".join(newest.get("reasons", [])[:2])
         warnings.append(
             f"{drift_total} unexplained-drift receipt(s) on record; newest "
-            f"({newest.get('created_at', 'unknown time')}): {newest_line}"
+            f"valid ({newest.get('created_at', 'unknown time')}): "
+            f"{newest_line}"
+        )
+        if newest.get("truncated"):
+            warnings.append(
+                "the newest drift receipt is truncated; its referenced "
+                "prior manifest generation is retained for the complete "
+                "inventory"
+            )
+    if drift_damaged:
+        warnings.append(
+            f"{len(drift_damaged)} drift receipt(s) failed validation and "
+            "are untrusted damaged evidence: "
+            + ", ".join(sorted(drift_damaged)[:3])
         )
     if paths.last_audit_drift:
         warnings.append(

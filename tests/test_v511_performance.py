@@ -1190,6 +1190,11 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         )
         self.assertEqual(self.witness_path().read_bytes(), witness_before)
         self.assert_no_audit_block()
+        # The receipt is a transactional precondition of publication, so it
+        # is already durable even though the crash stopped the new witness.
+        crash_receipts = self.assert_drift_receipt(
+            pattern=r"outside-crash-window|inventory"
+        )
 
         repaired = self.cli("doctor")
         self.assertIn("BIMRI doctor: PASSED", repaired.stdout)
@@ -1200,9 +1205,8 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
             checkpoint["witness_hash"],
             self.record_seal(checkpoint, "witness_hash"),
         )
-        self.assert_drift_receipt(
-            pattern=r"outside-crash-window|inventory"
-        )
+        # The retry deduplicates against the identical pre-crash receipt.
+        self.assertEqual(len(self.drift_receipts()), len(crash_receipts))
         self.assert_no_audit_block()
         recalled = self.cli("get", "--key", "witness.seed")
         self.assertIn("witness.seed", recalled.stdout)
@@ -2904,6 +2908,24 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         self.assertIn(foreign, archive_files[0].read_text("utf-8"))
         self.assert_no_audit_block()
         self.assert_drift_receipt(pattern=r"archive|inventory")
+        # The recovery receipt is self-contained: the drifted month is
+        # sealed with its hashes — changed with prior and current when the
+        # month pre-existed, added with its current hash when the crash
+        # window created it.
+        record = json.loads(self.drift_receipts()[-1].read_text("utf-8"))
+        self.assertIsNotNone(record["delta"])
+        month_relative = archive_files[0].relative_to(self.root).as_posix()
+        sealed = {
+            item["path"]: item
+            for section in ("changed", "added")
+            for item in record["delta"][section]
+        }
+        self.assertIn(month_relative, sealed)
+        self.assertRegex(sealed[month_relative]["sha256"], r"^[0-9a-f]{64}$")
+        if "prior_sha256" in sealed[month_relative]:
+            self.assertRegex(
+                sealed[month_relative]["prior_sha256"], r"^[0-9a-f]{64}$"
+            )
 
     def test_read_paths_refuse_unclaimed_legacy_roots(self):
         self.seed_authority_graph()
@@ -2960,6 +2982,77 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         self.assertIn(edited_relative, changed)
         self.assertEqual(changed[edited_relative]["prior_sha256"], prior_hash)
         self.assertEqual(changed[edited_relative]["sha256"], current_hash)
+
+    def test_obstructed_receipt_sink_blocks_rebaseline(self):
+        self.seed_authority_graph()
+        witness_before = self.witness_path().read_bytes()
+        self.root.joinpath(".bimri", "archive", "sink-probe.bin").write_bytes(
+            b"drift needing a receipt\n"
+        )
+        sink = self.root / ".bimri" / "audit-drift"
+        self.assertFalse(sink.exists())
+        sink.write_text("obstruction\n", encoding="utf-8")
+
+        blocked = self.cli("doctor", check=False)
+        self.assertEqual(
+            blocked.returncode, 1, blocked.stdout + blocked.stderr
+        )
+        self.assertIn(
+            "receipt", (blocked.stdout + blocked.stderr).lower()
+        )
+        self.assertEqual(self.witness_path().read_bytes(), witness_before)
+
+        sink.unlink()
+        repaired = self.cli("doctor")
+        self.assertIn("BIMRI doctor: PASSED", repaired.stdout)
+        self.assert_drift_receipt(pattern=r"sink-probe|inventory")
+        self.assertNotEqual(self.witness_path().read_bytes(), witness_before)
+
+    def test_tampered_receipt_is_reported_damaged_not_trusted(self):
+        self.seed_authority_graph()
+        self.root.joinpath(".bimri", "archive", "seal-probe.bin").write_bytes(
+            b"drift for a receipt\n"
+        )
+        self.cli("doctor")
+        receipt_path = self.drift_receipts()[-1]
+        record = json.loads(receipt_path.read_text("utf-8"))
+        record["reasons"] = ["forged reason the doctor must never trust"]
+        record["receipt_hash"] = "0" * 64
+        receipt_path.write_text(
+            json.dumps(record, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        audited = self.cli("doctor", "--read-only")
+        self.assertIn("PASSED", audited.stdout)
+        self.assertIn("failed validation", audited.stdout)
+        self.assertNotIn(
+            "forged reason the doctor must never trust", audited.stdout
+        )
+
+    def test_truncated_receipt_retains_complete_prior_manifest(self):
+        self.seed_authority_graph()
+        prior_manifest_hash = self.witness()["manifest_hash"]
+        generation = self.manifest_generation_path(prior_manifest_hash)
+        self.assertTrue(generation.is_file())
+        archive = self.root / ".bimri" / "archive"
+        for index in range(2001):
+            archive.joinpath(f"mass-{index:04d}.bin").write_bytes(b"x\n")
+
+        repaired = self.cli("doctor")
+        self.assertIn("BIMRI doctor: PASSED", repaired.stdout)
+        self.assertIn("truncated", repaired.stdout)
+        record = json.loads(self.drift_receipts()[-1].read_text("utf-8"))
+        self.assertEqual(record["truncated"], {"added": 1})
+        self.assertEqual(len(record["delta"]["added"]), 2000)
+        self.assertEqual(record["prior_manifest_hash"], prior_manifest_hash)
+        # The truncated receipt's referenced complete prior manifest
+        # survives later publications and pruning.
+        probe_run = self.start("prune-probe")
+        self.apply_set(
+            probe_run, "prune.probe", "prune trigger", new_subject=True
+        )
+        self.assertTrue(generation.is_file())
 
     def test_unknown_preflight_receipt_release_is_refused(self):
         self.seed_authority_graph()

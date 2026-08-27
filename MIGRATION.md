@@ -32,9 +32,13 @@ Make the project quiescent across every runtime boundary:
 1. finish or stop every agent using the project;
 2. wait for every BIMRI command to finish;
 3. pause any synchronization or copy operation affecting the folder;
-4. if v1-v3 was installed in Claude Cowork Global Instructions, disable or
+4. take a complete copy of the whole project folder (`bimri.md` plus the
+   entire `.bimri/` tree) somewhere outside it — this snapshot is the only
+   rollback that exists, because the first v5.1.1 proposal is an
+   intentional one-way boundary that no older engine can read past;
+5. if v1-v3 was installed in Claude Cowork Global Instructions, disable or
    remove that BIMRI block; and
-5. keep the folder quiescent until migration and `doctor` complete.
+6. keep the folder quiescent until migration and `doctor` complete.
 
 The old v1-v3 Global Instructions directly edit the hot-memory file. v4
 uses an older engine contract. None of those writers can participate in the v5

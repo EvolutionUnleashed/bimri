@@ -303,9 +303,14 @@ checks compare the live protected inventory with the prior manifest. Protected
 roots are flat; an unexpected subdirectory or redirected path prevents a valid
 audit. Divergence from the prior manifest is a cache miss, never a verdict:
 the full semantic audit decides, and when it passes over changes the engine
-cannot attribute to its own recorded operation, a sealed drift receipt — every
-diverging path with its prior and current hash, bounded to the newest 200 —
-is preserved under `.bimri/audit-drift/` and surfaced by `doctor`. A failed
+cannot attribute to its own recorded operation, a sealed drift receipt — the
+diverging paths with prior and current hashes, complete up to a documented
+per-section bound with any remainder counted, retaining its referenced
+complete prior manifest when truncated — is durably recorded under
+`.bimri/audit-drift/` before the new baseline can publish, and `doctor`
+seal-validates receipts before trusting them. A receipt that cannot be
+written keeps the prior checkpoint as the baseline and surfaces as an
+error. A failed
 semantic audit refuses into damaged-authority recovery. This detects and
 records standalone or accidental edits; it is not a defense against a
 coordinated writer editing history and derived evidence together, which no
@@ -464,7 +469,7 @@ Runtime files:
 | `.bimri/audit-manifest.json` | Detailed, rebuildable path-and-hash evidence behind that checkpoint. |
 | `.bimri/audit-manifests/` | Retained manifest generations referenced by live audit evidence. |
 | `.bimri/audit-transition.json` | Write-ahead marker while a checkpoint change is in flight. |
-| `.bimri/audit-drift/` | Bounded rolling receipts (newest 200) sealing every diverging path with its prior and current hash. |
+| `.bimri/audit-drift/` | Bounded rolling receipts (newest 200) sealing diverging paths with prior and current hashes; truncated receipts retain their referenced complete prior manifest. |
 | `.bimri/audit-blocked.json` | Owner-repair baseline held while a quarantine is open; cleared by restoration. |
 | `.bimri/archive/` | Cooled-current, replaced, and closed generations with provenance. |
 | `.bimri/backups/` | Migration and pre-change safety copies. |

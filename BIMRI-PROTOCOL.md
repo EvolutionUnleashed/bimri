@@ -128,10 +128,12 @@ explicit audit, review, search, and historical retrieval perform the full
 check. The checkpoint is a derived cache: divergence from it is a cache miss
 that forces the full semantic audit, never a stored verdict of its own. When
 that audit passes over divergence the engine cannot attribute to its own
-recorded operation, it preserves a sealed drift receipt (bounded to the
-newest 200, each carrying every diverging path with its prior and current
-hash) under `.bimri/audit-drift/` and continues; when the audit fails, the
-store refuses
+recorded operation, it first durably records a sealed drift receipt
+(bounded to the newest 200, each sealing the diverging paths with prior and
+current hashes up to a documented per-section bound, and retaining its
+referenced complete prior manifest when truncated) under
+`.bimri/audit-drift/`, then continues; when the audit fails, the store
+refuses
 into damaged-authority recovery exactly as it would without a checkpoint.
 `audit-blocked.json` appears only while an owner-approved quarantine holds its
 pre-repair baseline; restoration, or a clean doctor pass after it, clears it.
@@ -924,8 +926,14 @@ authority-changing write and for explicit doctor, review, task-language search,
 and historical retrieval. When intact prior path-and-hash evidence disagrees
 with that audit, the engine MUST NOT silently bless the new bytes: it MUST
 re-prove the complete semantic authority graph, and only a passing proof may
-adopt the new inventory as its baseline, while recording a durable drift
-receipt that preserves every diverging path with its prior and current hash.
+adopt the new inventory as its baseline. Recording a durable drift receipt is
+a precondition of that adoption: the receipt preserves the diverging paths
+with their prior and current hashes, complete up to the engine's documented
+per-section bound with any remainder counted explicitly, and a truncated
+receipt's referenced complete prior manifest MUST be retained while the
+receipt is retained. A receipt that cannot be durably recorded MUST prevent
+the rebaseline and surface as an error, and receipts MUST be seal-validated
+before their content is trusted or reported.
 A failing proof MUST refuse into damaged-authority recovery with the prior
 evidence retained. A normal current-only exact read is not required
 to traverse unrelated historical authority; every non-engine filesystem writer

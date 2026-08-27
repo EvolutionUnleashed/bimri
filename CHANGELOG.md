@@ -19,10 +19,16 @@ files are preserved under [`legacy/`](legacy/) and are not current installers.
 - The checkpoint is a derived cache, never an authority record. Divergence
   from it forces the full semantic audit; when that audit passes over changes
   the engine cannot attribute to its own recorded operation, the engine
-  preserves a sealed drift receipt under `.bimri/audit-drift/` — every
-  diverging path with its prior and current hash, monotonic sequence,
-  bounded to the newest 200 — rebaselines, and continues, and `doctor`
-  reports the receipt count and the newest reasons. A failed semantic audit
+  first durably records a sealed drift receipt under `.bimri/audit-drift/`
+  — the diverging paths with prior and current hashes (complete up to
+  2,000 entries per section with any remainder counted, a truncated
+  receipt's referenced complete prior manifest retained beside it),
+  monotonic sequence, bounded to the newest 200 — and only then publishes
+  the new baseline. A receipt that cannot be recorded keeps the prior
+  checkpoint and surfaces as an error, `doctor` seal-validates every
+  receipt and reports damaged evidence instead of trusting it, and
+  preserved corrupt-marker bytes outlive the blob bound while any retained
+  receipt cites them. A failed semantic audit
   refuses into the existing damaged-authority recovery lane. Interrupted
   operations self-heal exactly as in v5.1.0; no drift or crash state ever
   requires hand deletion of derived files. `audit-blocked.json` now appears

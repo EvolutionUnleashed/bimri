@@ -52,11 +52,48 @@ def timed(root, *arguments, check=True):
     return (time.perf_counter() - began) * 1000.0
 
 
-def summarize(label, samples):
+RESULTS = {}
+
+
+def summarize(label, samples, metric=None):
     ordered = sorted(samples)
     p50 = statistics.median(ordered)
     p95 = ordered[max(0, int(round(0.95 * len(ordered))) - 1)]
     print(f"{label:<28} p50 {p50:8.1f} ms   p95 {p95:8.1f} ms   n={len(ordered)}")
+    if metric:
+        RESULTS[f"{metric}_p50_ms"] = p50
+        RESULTS[f"{metric}_p95_ms"] = p95
+
+
+def apply_gates(specification):
+    """Fail (exit 1) when any metric breaches its stated ceiling.
+
+    Specification: comma-separated metric=max_ms pairs, for example
+    --gate "warm_get_p50_ms=1000,start_p50_ms=2000,propose_p50_ms=3000".
+    Known metrics: cold_first_read_ms plus <op>_p50_ms/<op>_p95_ms for
+    warm_get, start, journal, propose, sync, close.
+    """
+    breaches = []
+    for pair in filter(None, (part.strip() for part in specification.split(","))):
+        metric, _, ceiling = pair.partition("=")
+        metric = metric.strip()
+        if metric not in RESULTS:
+            breaches.append(f"unknown gate metric: {metric}")
+            continue
+        try:
+            maximum = float(ceiling)
+        except ValueError:
+            breaches.append(f"invalid gate ceiling: {pair}")
+            continue
+        if RESULTS[metric] > maximum:
+            breaches.append(
+                f"{metric} {RESULTS[metric]:.1f} ms exceeds {maximum:.1f} ms"
+            )
+    if breaches:
+        for breach in breaches:
+            print(f"GATE FAILED: {breach}")
+        raise SystemExit(1)
+    print("all gates passed")
 
 
 def pick_hot_key(root):
@@ -111,6 +148,10 @@ def main():
         "--grow", type=int, default=0,
         help="extra engine-driven runs to add to the copy before measuring",
     )
+    parser.add_argument(
+        "--gate", default="",
+        help="comma-separated metric=max_ms ceilings; breach exits 1",
+    )
     arguments = parser.parse_args()
 
     source = Path(arguments.store).resolve()
@@ -135,12 +176,13 @@ def main():
 
     cold = timed(root, "get", "--key", key, check=False)
     print(f"{'cold first read (seeds)':<28} once {cold:8.1f} ms")
+    RESULTS["cold_first_read_ms"] = cold
 
     reads = [
         timed(root, "get", "--key", key)
         for _ in range(arguments.samples)
     ]
-    summarize("warm get --key", reads)
+    summarize("warm get --key", reads, metric="warm_get")
 
     starts, journals, proposes, syncs, closes = [], [], [], [], []
     for index in range(arguments.samples):
@@ -162,12 +204,14 @@ def main():
             root, "close", "--run", run_id, "--outcome", "success",
             "--summary", "benchmark run",
         ))
-    summarize("warm start", starts)
-    summarize("journal", journals)
-    summarize("propose", proposes)
-    summarize("sync", syncs)
-    summarize("close (authority)", closes)
+    summarize("warm start", starts, metric="start")
+    summarize("journal", journals, metric="journal")
+    summarize("propose", proposes, metric="propose")
+    summarize("sync", syncs, metric="sync")
+    summarize("close (authority)", closes, metric="close")
     print(f"disposable copy retained at {workspace}")
+    if arguments.gate:
+        apply_gates(arguments.gate)
 
 
 if __name__ == "__main__":
