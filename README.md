@@ -304,17 +304,37 @@ roots are flat; an unexpected subdirectory or redirected path prevents a valid
 audit. Divergence from the prior manifest is a cache miss, never a verdict:
 the full semantic audit decides, and when it passes over changes the engine
 cannot attribute to its own recorded operation, a sealed drift receipt — the
-diverging paths with prior and current hashes, complete up to a documented
-per-section bound with any remainder counted, retaining its referenced
-complete prior manifest when truncated — is durably recorded under
-`.bimri/audit-drift/` before the new baseline can publish, and `doctor`
-seal-validates receipts before trusting them. A receipt that cannot be
-written keeps the prior checkpoint as the baseline and surfaces as an
-error. A failed
+diverging paths with prior and current hashes, inline up to a documented
+per-section bound with any remainder counted, the complete delta pinned in
+a validated attachment when truncated — is durably recorded and validated
+under `.bimri/audit-drift/` before the new baseline can publish, and
+`doctor` validates every receipt (seal, filename binding, and each
+referenced attachment's existence, size and hash) before trusting it. A
+receipt that cannot be written keeps the prior checkpoint as the baseline
+and surfaces as an error, and a checkpoint whose referenced manifest
+evidence is missing refuses rebaselining instead of adopting new bytes
+blind. A failed
 semantic audit refuses into damaged-authority recovery. This detects and
 records standalone or accidental edits; it is not a defense against a
 coordinated writer editing history and derived evidence together, which no
 local store can prove from its own bytes.
+
+### Support envelope
+
+v5.1.1 is a bounded, single-store performance release, validated on a store
+shaped like its own development project: roughly 500 runs, a few hundred
+revisions and current subjects, one machine, one lock domain. Inside that
+shape, warm exact reads run in the low hundreds of milliseconds end to end,
+start and journal likewise, authority-changing writes about 1.3 seconds,
+and the full audit that seeds the checkpoint runs once at about 30 seconds.
+Outside that shape the documented ceilings apply until the planned v5.2
+work: exact reads scale with total current-state size, a selected cold key
+scans its whole archive month, every operation serializes behind one
+exclusive lock, task-language `recall --query` is unranked ASCII substring
+matching on the fully audited path, and authority writes rescan retained
+history. Larger current-state sets, high reader concurrency, ranked or
+non-ASCII retrieval, multi-machine fleets, and indefinite-lifetime storage
+are explicitly not claims of this release.
 
 This is a cooperative local integrity model, not a claim that each read takes a
 filesystem snapshot. An out-of-engine edit to unrelated protected history can
@@ -469,7 +489,7 @@ Runtime files:
 | `.bimri/audit-manifest.json` | Detailed, rebuildable path-and-hash evidence behind that checkpoint. |
 | `.bimri/audit-manifests/` | Retained manifest generations referenced by live audit evidence. |
 | `.bimri/audit-transition.json` | Write-ahead marker while a checkpoint change is in flight. |
-| `.bimri/audit-drift/` | Bounded rolling receipts (newest 200) sealing diverging paths with prior and current hashes; truncated receipts retain their referenced complete prior manifest. |
+| `.bimri/audit-drift/` | Bounded rolling receipts (newest 200) sealing diverging paths with prior and current hashes; truncated receipts pin their complete delta in a validated attachment. |
 | `.bimri/audit-blocked.json` | Owner-repair baseline held while a quarantine is open; cleared by restoration. |
 | `.bimri/archive/` | Cooled-current, replaced, and closed generations with provenance. |
 | `.bimri/backups/` | Migration and pre-change safety copies. |

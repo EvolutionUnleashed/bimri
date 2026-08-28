@@ -347,9 +347,14 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         directory = Path(root or self.root) / DRIFT_RELATIVE
         if not directory.is_dir():
             return []
-        return sorted(
-            path for path in directory.glob("D*.json") if path.is_file()
-        )
+        entries = []
+        for path in directory.glob("D*.json"):
+            if not path.is_file():
+                continue
+            match = re.fullmatch(r"D(\d{6,})-[0-9a-f]{12}\.json", path.name)
+            if match:
+                entries.append((int(match.group(1)), path.name, path))
+        return [entry[2] for entry in sorted(entries)]
 
     def drift_reasons(self, root=None):
         reasons = []
@@ -3030,11 +3035,8 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
             "forged reason the doctor must never trust", audited.stdout
         )
 
-    def test_truncated_receipt_retains_complete_prior_manifest(self):
+    def test_truncated_receipt_pins_its_complete_delta_attachment(self):
         self.seed_authority_graph()
-        prior_manifest_hash = self.witness()["manifest_hash"]
-        generation = self.manifest_generation_path(prior_manifest_hash)
-        self.assertTrue(generation.is_file())
         archive = self.root / ".bimri" / "archive"
         for index in range(2001):
             archive.joinpath(f"mass-{index:04d}.bin").write_bytes(b"x\n")
@@ -3045,14 +3047,133 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         record = json.loads(self.drift_receipts()[-1].read_text("utf-8"))
         self.assertEqual(record["truncated"], {"added": 1})
         self.assertEqual(len(record["delta"]["added"]), 2000)
-        self.assertEqual(record["prior_manifest_hash"], prior_manifest_hash)
-        # The truncated receipt's referenced complete prior manifest
-        # survives later publications and pruning.
+        attachment = next(
+            item for item in record["attachments"]
+            if item["role"] == "complete-delta"
+        )
+        target = self.root.joinpath(*attachment["path"].split("/"))
+        raw = target.read_bytes()
+        self.assertEqual(len(raw), attachment["bytes"])
+        self.assertEqual(
+            hashlib.sha256(raw).hexdigest(), attachment["sha256"]
+        )
+        complete = json.loads(raw.decode("utf-8"))["complete_delta"]
+        self.assertEqual(len(complete["added"]), 2001)
+        # The attachment survives later publications and pruning while its
+        # receipt is retained.
         probe_run = self.start("prune-probe")
         self.apply_set(
             probe_run, "prune.probe", "prune trigger", new_subject=True
         )
-        self.assertTrue(generation.is_file())
+        self.assertTrue(target.is_file())
+        # Deleting the pinned attachment turns the receipt into damaged
+        # evidence, loudly, instead of a silent completeness claim.
+        target.unlink()
+        audited = self.cli("doctor", "--read-only")
+        self.assertIn("PASSED", audited.stdout)
+        self.assertIn("failed validation", audited.stdout)
+
+    def test_invalid_precrash_receipt_is_not_reused_for_publication(self):
+        self.seed_authority_graph()
+        witness_before = self.witness_path().read_bytes()
+        self.root.joinpath(".bimri", "archive", "dedup-probe.bin").write_bytes(
+            b"drift before the crash\n"
+        )
+        crashed = self.worker(
+            "witness_crash_before_replace", "doctor", check=False
+        )
+        self.assertEqual(
+            crashed.returncode, 110, crashed.stdout + crashed.stderr
+        )
+        receipts = self.drift_receipts()
+        self.assertEqual(len(receipts), 1)
+        record = json.loads(receipts[0].read_text("utf-8"))
+        record["receipt_hash"] = "0" * 64
+        receipts[0].write_text(
+            json.dumps(record, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        repaired = self.cli("doctor")
+        self.assertIn("BIMRI doctor: PASSED", repaired.stdout)
+        self.assertIn("failed validation", repaired.stdout)
+        receipts = self.drift_receipts()
+        self.assertEqual(len(receipts), 2)
+        fresh = json.loads(receipts[-1].read_text("utf-8"))
+        self.assertEqual(fresh["sequence"], 2)
+        self.assertNotEqual(self.witness_path().read_bytes(), witness_before)
+
+    def test_missing_prior_manifest_evidence_refuses_rebaseline(self):
+        self.seed_authority_graph()
+        witness_before = self.witness_path().read_bytes()
+        self.manifest_path().unlink()
+        for generation in self.root.joinpath(
+            ".bimri", "audit-manifests"
+        ).glob("*.json"):
+            generation.unlink()
+        self.root.joinpath(
+            ".bimri", "archive", "null-delta-probe.bin"
+        ).write_bytes(b"drift with no prior evidence\n")
+
+        blocked = self.cli("doctor", check=False)
+        self.assertEqual(
+            blocked.returncode, 1, blocked.stdout + blocked.stderr
+        )
+        self.assertIn(
+            "manifest evidence", (blocked.stdout + blocked.stderr).lower()
+        )
+        self.assertEqual(self.witness_path().read_bytes(), witness_before)
+
+        # The documented exit: removing the derived witness rebuilds trust
+        # from the full audit.
+        self.witness_path().unlink()
+        repaired = self.cli("doctor")
+        self.assertIn("BIMRI doctor: PASSED", repaired.stdout)
+        recalled = self.cli("get", "--key", "witness.seed")
+        self.assertIn("witness.seed", recalled.stdout)
+
+    def test_sequence_grammar_survives_the_millionth_receipt(self):
+        self.seed_authority_graph()
+        drift_dir = self.root / ".bimri" / "audit-drift"
+        drift_dir.mkdir()
+        drift_dir.joinpath("D999999-seed.json").write_text(
+            "{}", encoding="utf-8"
+        )
+        self.root.joinpath(
+            ".bimri", "archive", "million-probe.bin"
+        ).write_bytes(b"drift at the sequence boundary\n")
+
+        repaired = self.cli("doctor")
+        self.assertIn("BIMRI doctor: PASSED", repaired.stdout)
+        receipts = self.drift_receipts()
+        self.assertEqual(len(receipts), 1)
+        self.assertTrue(receipts[-1].name.startswith("D1000000-"))
+        record = json.loads(receipts[-1].read_text("utf-8"))
+        self.assertEqual(record["sequence"], 1000000)
+        probe_run = self.start("million-prune-probe")
+        self.apply_set(
+            probe_run, "million.probe", "prune trigger", new_subject=True
+        )
+        self.assertTrue(receipts[-1].is_file())
+
+    def test_missing_preserved_blob_marks_receipt_damaged(self):
+        self.seed_authority_graph()
+        marker = self.root / ".bimri" / "audit-transition.json"
+        marker.write_text("{corrupt marker bytes", encoding="utf-8")
+        healed = self.cli("start", "--actor", "marker-heal")
+        self.assertEqual(healed.returncode, 0)
+        record = json.loads(self.drift_receipts()[-1].read_text("utf-8"))
+        blob_relative = next(
+            item["path"] for item in record["attachments"]
+            if item["role"] == "corrupt-transition-marker"
+        )
+        blob = self.root.joinpath(*blob_relative.split("/"))
+        self.assertTrue(blob.is_file())
+        blob.unlink()
+
+        audited = self.cli("doctor", "--read-only")
+        self.assertIn("PASSED", audited.stdout)
+        self.assertIn("failed validation", audited.stdout)
 
     def test_unknown_preflight_receipt_release_is_refused(self):
         self.seed_authority_graph()

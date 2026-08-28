@@ -65,6 +65,7 @@ AUDIT_TRANSITION_SCHEMA = 1
 AUDIT_DRIFT_KEEP = 200
 AUDIT_DRIFT_DELTA_CAP = 2000
 AUDIT_DRIFT_BLOB_KEEP = 20
+PRIOR_EVIDENCE_INVALID_PREFIX = "prior audit manifest evidence is invalid"
 AUTHORITY_POLICY_VERSION = "5.1.1-authority-1"
 HOOK_TIMEOUT_SECONDS = 90
 PREVIOUS_V5_VERSION = "5.0"
@@ -4584,9 +4585,6 @@ def referenced_audit_manifest_hashes(paths):
         transition = None
     if transition:
         hashes.add(transition["prior_manifest_hash"])
-    # A truncated drift receipt stays complete only while its referenced
-    # prior manifest generation survives beside it.
-    hashes |= retained_drift_receipt_references(paths)[0]
     return hashes
 
 
@@ -4644,73 +4642,132 @@ def audit_checkpoint_drift_delta(
 
 
 def next_audit_drift_sequence(paths):
+    """One past the highest sequence any D-named file has ever claimed."""
     last = 0
-    for path in list_audit_drift_receipts(paths):
-        match = re.match(r"D(\d{6})-", path.name)
+    try:
+        children = list(paths.audit_drift.iterdir())
+    except (FileNotFoundError, OSError):
+        return 1
+    for path in children:
+        match = re.match(r"D(\d+)-", path.name)
         if match:
             last = max(last, int(match.group(1)))
     return last + 1
 
 
+def write_audit_drift_attachment(paths, sequence, payload):
+    """Persist one hash-and-size-pinned evidence attachment.
+
+    Returns its descriptor {path, sha256, bytes} or None on failure.
+    """
+    try:
+        digest = sha256_bytes(payload)
+        ensure_directory_durable(paths.audit_drift)
+        target = paths.audit_drift / f"A{sequence:06d}-{digest[:12]}.bin"
+        if not target.exists() and not target.is_symlink():
+            exclusive_write_bytes(target, payload)
+        if target.is_symlink() or not target.is_file():
+            return None
+        raw = target.read_bytes()
+        if sha256_bytes(raw) != digest:
+            return None
+        return {
+            "path": target.relative_to(paths.root).as_posix(),
+            "sha256": digest,
+            "bytes": len(payload),
+        }
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        return None
+
+
 def write_audit_drift_receipt(
     paths, reasons, marker=None, prior_witness=None, state=None, delta=None,
-    preserved_evidence=(),
+    attachments=(),
 ):
     """Preserve unexplained-drift evidence as a rebaseline precondition.
 
     Drift that a passing full audit could not condemn is recorded as sealed
     derived evidence: the diverging paths with their prior and current
-    hashes, complete up to AUDIT_DRIFT_DELTA_CAP entries per section with
-    any remainder counted explicitly; a truncated receipt's referenced
-    prior manifest generation is retained while the receipt is retained,
-    so the complete inventory stays recoverable. Retention is a bounded
-    rolling window of the newest AUDIT_DRIFT_KEEP receipts in monotonic
-    sequence order. Returning None means no durable receipt exists —
-    callers MUST treat that as a refusal to proceed, never as success.
+    hashes, inline up to AUDIT_DRIFT_DELTA_CAP entries per section. When
+    the inline delta truncates, the complete delta is persisted first as a
+    hash-and-size-pinned attachment the receipt references, retained while
+    the receipt is retained and validated with it — as is every other
+    attachment (preserved corrupt-marker bytes included). Retention is a
+    bounded rolling window of the newest AUDIT_DRIFT_KEEP receipts in
+    numeric sequence order. The written receipt is re-read and fully
+    validated, attachments and post-prune existence included, before this
+    function reports success. Returning None means no durable, valid
+    receipt exists — callers MUST treat that as a refusal to proceed,
+    never as success.
     """
     reasons = [str(reason) for reason in reasons if reason][:40]
-    preserved_evidence = sorted(
-        str(item) for item in preserved_evidence if item
-    )
+    attachments = [
+        dict(item) for item in attachments if isinstance(item, dict)
+    ]
     if not reasons and not delta:
         return None
-    truncated = {}
-    if isinstance(delta, dict):
-        bounded = {}
-        for section in ("changed", "added", "deleted"):
-            items = list(delta.get(section) or ())
-            if len(items) > AUDIT_DRIFT_DELTA_CAP:
-                truncated[section] = len(items) - AUDIT_DRIFT_DELTA_CAP
-                items = items[:AUDIT_DRIFT_DELTA_CAP]
-            bounded[section] = items
-        delta = bounded
-        if not any(delta.values()) and not reasons:
-            return None
     try:
+        if path_is_redirected(paths.audit_drift):
+            return None
+        sequence = next_audit_drift_sequence(paths)
+        truncated = {}
+        if isinstance(delta, dict):
+            complete = {
+                section: list(delta.get(section) or ())
+                for section in ("changed", "added", "deleted")
+            }
+            bounded = {}
+            for section, items in complete.items():
+                if len(items) > AUDIT_DRIFT_DELTA_CAP:
+                    truncated[section] = len(items) - AUDIT_DRIFT_DELTA_CAP
+                    bounded[section] = items[:AUDIT_DRIFT_DELTA_CAP]
+                else:
+                    bounded[section] = items
+            delta = bounded
+            if not any(delta.values()) and not reasons:
+                return None
+            if truncated:
+                # The complete delta is durable evidence in its own right,
+                # pinned before the receipt that references it.
+                descriptor = write_audit_drift_attachment(
+                    paths,
+                    sequence,
+                    canonical_json_bytes({"complete_delta": complete}),
+                )
+                if descriptor is None:
+                    return None
+                descriptor["role"] = "complete-delta"
+                attachments.append(descriptor)
         newest = list_audit_drift_receipts(paths)[-1:]
         if newest:
-            existing = read_json_strict(newest[0], newest[0].name)
+            try:
+                existing = read_json_strict(newest[0], newest[0].name)
+            except (BimriError, OSError, UnicodeError):
+                existing = None
             if (
-                existing.get("reasons") == reasons
+                existing is not None
+                and validate_audit_drift_receipt(
+                    paths, newest[0], existing
+                ) is None
+                and existing.get("reasons") == reasons
                 and existing.get("delta") == delta
-                and existing.get("preserved_evidence", []) == (
-                    preserved_evidence
-                )
+                and [
+                    item.get("sha256")
+                    for item in existing.get("attachments") or ()
+                ] == [item.get("sha256") for item in attachments]
             ):
                 # A repeated attempt against the same divergence adds no
-                # evidence; the newest receipt already carries it.
+                # evidence; the newest receipt — validated, never merely
+                # present — already carries it.
                 return newest[0]
-    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
-        pass
-    try:
         record = {
             "drift_schema": AUDIT_DRIFT_SCHEMA,
-            "sequence": next_audit_drift_sequence(paths),
+            "sequence": sequence,
             "created_at": now_iso(),
             "reasons": reasons,
             "delta": delta,
             "truncated": truncated,
-            "preserved_evidence": preserved_evidence,
+            "attachments": attachments,
             "prior_witness_hash": (
                 prior_witness.get("witness_hash")
                 if isinstance(prior_witness, dict) else None
@@ -4725,8 +4782,6 @@ def write_audit_drift_receipt(
             "transition_marker": marker,
         }
         record["receipt_hash"] = audit_record_seal(record, "receipt_hash")
-        if path_is_redirected(paths.audit_drift):
-            return None
         ensure_directory_durable(paths.audit_drift)
         digest = sha256_bytes(canonical_json_bytes(record))[:12]
         path = paths.audit_drift / (
@@ -4734,65 +4789,89 @@ def write_audit_drift_receipt(
         )
         if not path.exists() and not path.is_symlink():
             atomic_write_json(path, record)
-        if not path.is_file():
+        try:
+            on_disk = read_json_strict(path, path.name)
+        except (BimriError, OSError, UnicodeError):
+            return None
+        if validate_audit_drift_receipt(paths, path, on_disk) is not None:
             return None
         prune_audit_drift_receipts(paths)
+        if not path.is_file():
+            return None
         return path
     except (BimriError, OSError, UnicodeError, ValueError, TypeError, KeyError):
         return None
 
 
+def parse_audit_drift_sequence(name):
+    """Sequence for a conforming receipt filename, else None."""
+    match = re.fullmatch(r"D(\d{6,})-[0-9a-f]{12}\.json", name)
+    return int(match.group(1)) if match else None
+
+
 def list_audit_drift_receipts(paths):
+    """Conforming receipts in numeric sequence order (never lexical)."""
+    entries = []
     try:
-        return sorted(
-            (
-                path for path in paths.audit_drift.iterdir()
-                if not path.is_symlink()
-                and path.is_file()
-                and path.name.startswith("D")
-                and path.suffix == ".json"
-            ),
-            key=lambda item: item.name,
-        )
+        children = list(paths.audit_drift.iterdir())
     except (FileNotFoundError, OSError):
         return []
+    for path in children:
+        if path.is_symlink() or not path.is_file():
+            continue
+        sequence = parse_audit_drift_sequence(path.name)
+        if sequence is not None:
+            entries.append((sequence, path.name, path))
+    return [entry[2] for entry in sorted(entries)]
+
+
 
 
 def prune_audit_drift_receipts(paths):
-    """Bound drift evidence to the newest receipts and preserved blobs.
+    """Bound drift evidence to the newest receipts plus cited attachments.
 
-    A blob cited by a retained receipt's preserved_evidence outlives the
-    unreferenced-blob bound, so no retained receipt ever cites pruned bytes.
+    An attachment cited by a retained receipt outlives the
+    unreferenced-attachment bound, so no retained receipt ever cites
+    pruned bytes.
     """
     for path in list_audit_drift_receipts(paths)[:-AUDIT_DRIFT_KEEP]:
         with contextlib.suppress(OSError):
             path.unlink()
-    referenced = retained_drift_receipt_references(paths)[1]
+    referenced = retained_drift_receipt_attachment_paths(paths)
     try:
-        blobs = sorted(
+        attachments = sorted(
             (
                 path for path in paths.audit_drift.iterdir()
                 if not path.is_symlink()
                 and path.is_file()
-                and path.name.startswith("corrupt-transition-")
+                and (
+                    path.name.startswith("corrupt-transition-")
+                    or re.match(r"A\d{6,}-", path.name)
+                )
                 and path.relative_to(paths.root).as_posix() not in referenced
             ),
             key=lambda item: item.stat().st_mtime,
         )
     except (FileNotFoundError, OSError):
         return
-    for path in blobs[:-AUDIT_DRIFT_BLOB_KEEP]:
+    for path in attachments[:-AUDIT_DRIFT_BLOB_KEEP]:
         with contextlib.suppress(OSError):
             path.unlink()
 
 
-def validate_audit_drift_receipt(path, record):
-    """Return a problem string for an untrustworthy receipt, else None."""
+def validate_audit_drift_receipt(paths, path, record):
+    """Return a problem string for an untrustworthy receipt, else None.
+
+    Full validation covers schema, filename-to-sequence binding,
+    filename-to-content digest, the recomputed seal, delta shape, and every
+    referenced attachment's existence, size, and hash. A receipt is only as
+    trustworthy as the evidence it cites.
+    """
     if not isinstance(record, dict):
         return "receipt is not an object"
     if record.get("drift_schema") != AUDIT_DRIFT_SCHEMA:
         return "unsupported drift schema"
-    match = re.fullmatch(r"D(\d{6})-([0-9a-f]{12})\.json", path.name)
+    match = re.fullmatch(r"D(\d{6,})-([0-9a-f]{12})\.json", path.name)
     if not match:
         return "receipt filename is not bound to a sequence"
     if record.get("sequence") != int(match.group(1)):
@@ -4825,28 +4904,64 @@ def validate_audit_drift_receipt(path, record):
                         isinstance(value, str) and HASH_RE.fullmatch(value)
                     ):
                         return "receipt delta is invalid"
+    if record.get("truncated") and not any(
+        item.get("role") == "complete-delta"
+        for item in record.get("attachments") or ()
+        if isinstance(item, dict)
+    ):
+        return "truncated receipt lacks its complete-delta attachment"
+    for item in record.get("attachments") or ():
+        if not isinstance(item, dict):
+            return "receipt attachment descriptor is invalid"
+        relative = item.get("path")
+        digest = item.get("sha256")
+        size = item.get("bytes")
+        if (
+            not isinstance(relative, str)
+            or not relative.startswith(".bimri/audit-drift/")
+            or "/../" in relative
+            or not isinstance(digest, str)
+            or not HASH_RE.fullmatch(digest)
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 0
+        ):
+            return "receipt attachment descriptor is invalid"
+        target = paths.root.joinpath(*PurePosixPath(relative).parts)
+        if target.is_symlink() or not target.is_file():
+            return f"receipt attachment is missing: {relative}"
+        try:
+            raw = target.read_bytes()
+        except OSError:
+            return f"receipt attachment is unreadable: {relative}"
+        if len(raw) != size or sha256_bytes(raw) != digest:
+            return f"receipt attachment does not match its pin: {relative}"
     return None
 
 
-def retained_drift_receipt_references(paths):
-    """Evidence still referenced by retained, validated drift receipts."""
-    manifest_hashes = set()
-    preserved = set()
+def retained_drift_receipt_attachment_paths(paths):
+    """Attachment paths cited by retained, seal-intact receipts.
+
+    Retention uses the seal alone so a receipt whose attachment vanished
+    still protects its remaining attachments from pruning while doctor
+    reports it damaged.
+    """
+    referenced = set()
     for path in list_audit_drift_receipts(paths):
         try:
             record = read_json_strict(path, path.name)
         except (BimriError, OSError, UnicodeError):
             continue
-        if validate_audit_drift_receipt(path, record):
+        if not isinstance(record, dict):
             continue
-        if record.get("truncated"):
-            value = record.get("prior_manifest_hash")
-            if isinstance(value, str) and HASH_RE.fullmatch(value):
-                manifest_hashes.add(value)
-        for item in record.get("preserved_evidence") or ():
-            if isinstance(item, str) and item:
-                preserved.add(item)
-    return manifest_hashes, preserved
+        if record.get("receipt_hash") != audit_record_seal(
+            record, "receipt_hash"
+        ):
+            continue
+        for item in record.get("attachments") or ():
+            if isinstance(item, dict) and isinstance(item.get("path"), str):
+                referenced.add(item["path"])
+    return referenced
 
 
 def audit_drift_summary(paths, limit=3):
@@ -4860,14 +4975,14 @@ def audit_drift_summary(paths, limit=3):
         except (BimriError, OSError, UnicodeError):
             damaged.append(path.name)
             continue
-        problem = validate_audit_drift_receipt(path, record)
+        problem = validate_audit_drift_receipt(paths, path, record)
         if problem:
             damaged.append(path.name)
             continue
         record["receipt_name"] = path.name
         valid.append(record)
     newest = list(reversed(valid[-max(0, int(limit)):]))
-    return len(children), newest, damaged
+    return len(children), newest, sorted(damaged)
 
 
 def write_audit_witness(paths, state, conflicts=None, manifest=None, run_facts=None):
@@ -5560,7 +5675,11 @@ def preserve_corrupt_audit_transition(paths):
             exclusive_write_bytes(target, raw)
         path.unlink()
         fsync_directory(path.parent)
-        return target.relative_to(paths.root).as_posix()
+        return {
+            "path": target.relative_to(paths.root).as_posix(),
+            "sha256": digest,
+            "bytes": len(raw),
+        }
     except (OSError, UnicodeError):
         return None
 
@@ -5588,15 +5707,18 @@ def reconcile_audit_transition(paths, state):
                 ".bimri/audit-transition.json, then run doctor."
             ) from exc
         reasons = [f"audit transition marker was invalid: {exc}"]
-        preserved_evidence = []
+        attachments = []
         if preserved:
-            reasons.append(f"marker bytes preserved at {preserved}")
-            preserved_evidence.append(preserved)
+            reasons.append(
+                f"marker bytes preserved at {preserved['path']}"
+            )
+            preserved["role"] = "corrupt-transition-marker"
+            attachments.append(preserved)
         if write_audit_drift_receipt(
             paths,
             reasons,
             state=state,
-            preserved_evidence=preserved_evidence,
+            attachments=attachments,
         ) is None:
             raise BimriError(
                 "the invalid transition marker's drift evidence could not "
@@ -5986,7 +6108,11 @@ def audit_checkpoint_mismatch_issues(
             paths, witness, manifest_override=prior_manifest_override
         )
     except (BimriError, OSError, UnicodeError) as exc:
-        return [f"prior audit manifest evidence is invalid: {exc}"]
+        return [
+            PRIOR_EVIDENCE_INVALID_PREFIX + f": {exc}; restore the "
+            ".bimri/audit-manifests evidence from backup, or remove "
+            ".bimri/audit-witness.json to rebuild trust from the full audit"
+        ]
     if prior_manifest != manifest:
         allowed_manifest_paths = set(allowed_manifest_paths or ())
         prior_by_path = {
@@ -6158,8 +6284,14 @@ def governance_snapshot(
     if not strict_prior_comparison:
         # Checkpoint divergence is a cache miss, never an issue: the full
         # semantic audit is the authority on this store. Unexplained
-        # divergence is preserved as a drift receipt at publication.
-        paths.last_audit_drift = list(mismatch_issues)
+        # divergence is preserved as a drift receipt at publication. The
+        # one exception is a sealed witness whose referenced manifest
+        # evidence is unavailable: that is damaged evidence, and it
+        # refuses instead of rebaselining blind.
+        paths.last_audit_drift = [
+            issue for issue in mismatch_issues
+            if not issue.startswith(PRIOR_EVIDENCE_INVALID_PREFIX)
+        ]
     issues = list(dict.fromkeys(
         authority_storage_issues(
             paths,
@@ -6168,7 +6300,12 @@ def governance_snapshot(
         )
         + conflict_issues
         + inventory_issues
-        + (mismatch_issues if strict_prior_comparison else [])
+        + (
+            mismatch_issues if strict_prior_comparison else [
+                issue for issue in mismatch_issues
+                if issue.startswith(PRIOR_EVIDENCE_INVALID_PREFIX)
+            ]
+        )
     ))
     clear_block_after_publish = False
     if blocked_issues:
@@ -12708,9 +12845,8 @@ def doctor_errors(
         )
         if newest.get("truncated"):
             warnings.append(
-                "the newest drift receipt is truncated; its referenced "
-                "prior manifest generation is retained for the complete "
-                "inventory"
+                "the newest drift receipt is truncated; its complete delta "
+                "is pinned in a validated attachment beside it"
             )
     if drift_damaged:
         warnings.append(

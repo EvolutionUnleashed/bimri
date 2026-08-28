@@ -20,15 +20,20 @@ files are preserved under [`legacy/`](legacy/) and are not current installers.
   from it forces the full semantic audit; when that audit passes over changes
   the engine cannot attribute to its own recorded operation, the engine
   first durably records a sealed drift receipt under `.bimri/audit-drift/`
-  — the diverging paths with prior and current hashes (complete up to
-  2,000 entries per section with any remainder counted, a truncated
-  receipt's referenced complete prior manifest retained beside it),
-  monotonic sequence, bounded to the newest 200 — and only then publishes
-  the new baseline. A receipt that cannot be recorded keeps the prior
-  checkpoint and surfaces as an error, `doctor` seal-validates every
-  receipt and reports damaged evidence instead of trusting it, and
-  preserved corrupt-marker bytes outlive the blob bound while any retained
-  receipt cites them. A failed semantic audit
+  — the diverging paths with prior and current hashes (inline up to 2,000
+  entries per section with any remainder counted, the complete delta
+  pinned in a hash-and-size-validated attachment when truncated),
+  unbounded monotonic sequence, bounded to the newest 200 — and only then
+  publishes the new baseline. The written receipt is re-read and fully
+  validated (seal, filename binding, attachments, post-prune existence)
+  before the write counts as success, and deduplication only ever reuses a
+  receipt that validates. A receipt that cannot be recorded keeps the
+  prior checkpoint and surfaces as an error; `doctor` validates every
+  receipt and its attachments and reports damaged evidence instead of
+  trusting it; attachments cited by retained receipts outlive the
+  unreferenced-attachment bound; and a checkpoint whose referenced
+  manifest evidence is missing refuses rebaselining instead of adopting
+  new bytes with no recorded delta. A failed semantic audit
   refuses into the existing damaged-authority recovery lane. Interrupted
   operations self-heal exactly as in v5.1.0; no drift or crash state ever
   requires hand deletion of derived files. `audit-blocked.json` now appears

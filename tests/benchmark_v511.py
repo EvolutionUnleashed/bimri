@@ -19,6 +19,7 @@ The cold first operation that seeds the checkpoint is reported separately.
 
 import argparse
 import json
+import math
 import shutil
 import statistics
 import subprocess
@@ -29,6 +30,19 @@ from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 ENGINE = REPOSITORY / "bimri-engine.py"
+
+# Canonical release ceilings (--gate default). Deliberately generous: they
+# catch an order-of-magnitude regression (the class this release fixed) on
+# ordinary shared hardware, not millisecond noise.
+CANONICAL_GATES = {
+    "cold_first_read_ms": 90000.0,
+    "warm_get_p50_ms": 2000.0,
+    "start_p50_ms": 2500.0,
+    "journal_p50_ms": 2500.0,
+    "propose_p50_ms": 6000.0,
+    "sync_p50_ms": 6000.0,
+    "close_p50_ms": 6000.0,
+}
 
 
 def cli(root, *arguments, check=True):
@@ -68,26 +82,42 @@ def summarize(label, samples, metric=None):
 def apply_gates(specification):
     """Fail (exit 1) when any metric breaches its stated ceiling.
 
-    Specification: comma-separated metric=max_ms pairs, for example
+    Specification: "default" for the committed CANONICAL_GATES, or
+    comma-separated metric=max_ms pairs, for example
     --gate "warm_get_p50_ms=1000,start_p50_ms=2000,propose_p50_ms=3000".
     Known metrics: cold_first_read_ms plus <op>_p50_ms/<op>_p95_ms for
-    warm_get, start, journal, propose, sync, close.
+    warm_get, start, journal, propose, sync, close. A non-finite measured
+    value or ceiling is a breach, never a bypass.
     """
+    if specification.strip() == "default":
+        gates = dict(CANONICAL_GATES)
+    else:
+        gates = {}
+        breaches = []
+        for pair in filter(
+            None, (part.strip() for part in specification.split(","))
+        ):
+            metric, _, ceiling = pair.partition("=")
+            try:
+                gates[metric.strip()] = float(ceiling)
+            except ValueError:
+                breaches.append(f"invalid gate ceiling: {pair}")
+        if breaches:
+            for breach in breaches:
+                print(f"GATE FAILED: {breach}")
+            raise SystemExit(1)
     breaches = []
-    for pair in filter(None, (part.strip() for part in specification.split(","))):
-        metric, _, ceiling = pair.partition("=")
-        metric = metric.strip()
+    for metric, maximum in gates.items():
         if metric not in RESULTS:
             breaches.append(f"unknown gate metric: {metric}")
             continue
-        try:
-            maximum = float(ceiling)
-        except ValueError:
-            breaches.append(f"invalid gate ceiling: {pair}")
+        value = RESULTS[metric]
+        if not math.isfinite(maximum) or not math.isfinite(value):
+            breaches.append(f"{metric} is not a finite measurement")
             continue
-        if RESULTS[metric] > maximum:
+        if not value <= maximum:
             breaches.append(
-                f"{metric} {RESULTS[metric]:.1f} ms exceeds {maximum:.1f} ms"
+                f"{metric} {value:.1f} ms exceeds {maximum:.1f} ms"
             )
     if breaches:
         for breach in breaches:
@@ -142,7 +172,14 @@ def grow(root, runs):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--store", required=True, help="store root to copy")
+    parser.add_argument(
+        "--store", default="",
+        help="store root to copy (omit with --init for a fresh store)",
+    )
+    parser.add_argument(
+        "--init", action="store_true",
+        help="build a small fresh store instead of copying --store",
+    )
     parser.add_argument("--samples", type=int, default=9)
     parser.add_argument(
         "--grow", type=int, default=0,
@@ -154,16 +191,21 @@ def main():
     )
     arguments = parser.parse_args()
 
-    source = Path(arguments.store).resolve()
-    if not (source / ".bimri").is_dir():
-        raise SystemExit(f"{source} does not contain a .bimri store")
-
     workspace = Path(tempfile.mkdtemp(prefix="bimri-bench-"))
     root = workspace / "store"
     root.mkdir()
-    if (source / "bimri.md").exists():
-        shutil.copy2(source / "bimri.md", root / "bimri.md")
-    shutil.copytree(source / ".bimri", root / ".bimri")
+    if arguments.init:
+        print("building a fresh benchmark store...")
+        grow(root, 3)
+    else:
+        if not arguments.store:
+            raise SystemExit("provide --store, or --init for a fresh store")
+        source = Path(arguments.store).resolve()
+        if not (source / ".bimri").is_dir():
+            raise SystemExit(f"{source} does not contain a .bimri store")
+        if (source / "bimri.md").exists():
+            shutil.copy2(source / "bimri.md", root / "bimri.md")
+        shutil.copytree(source / ".bimri", root / ".bimri")
     print(f"benchmark copy: {root}")
 
     if arguments.grow:
