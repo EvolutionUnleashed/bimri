@@ -7,6 +7,7 @@ fixed-cost read boundary, write-time validation, locking, and durability.
 """
 
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -2847,7 +2848,7 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
             doctored.returncode, 2, doctored.stdout + doctored.stderr
         )
         self.assertIn(
-            "obstructed", (doctored.stdout + doctored.stderr).lower()
+            "obstruction", (doctored.stdout + doctored.stderr).lower()
         )
         self.assertTrue(obstruction.is_dir())
         self.assertEqual(self.witness_path().read_bytes(), witness_before)
@@ -3175,6 +3176,83 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         self.assertIn("PASSED", audited.stdout)
         self.assertIn("failed validation", audited.stdout)
 
+    def test_interrupted_recovery_refuses_without_prior_evidence(self):
+        stable_run = self.start("evidence-stable")
+        self.apply_set(
+            stable_run, "evidence.stable", "Stable value.", new_subject=True
+        )
+        close_run = self.start("evidence-closer")
+        self.propose(close_run, "evidence.stable", "", operation="close")
+        crashed = self.worker(
+            "witness_crash_before_replace",
+            "sync",
+            "--run",
+            close_run,
+            check=False,
+        )
+        self.assertEqual(
+            crashed.returncode, 110, crashed.stdout + crashed.stderr
+        )
+        months = sorted(self.root.joinpath(".bimri", "archive").glob("*.md"))
+        with months[0].open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(
+                "[ARCHIVED:2026-08-22] [BY:R999999-Q999] [closed] "
+                "[T2][K:evidence.foreign][I:3][S:agent][Q:working] Foreign.\n"
+            )
+        witness_before = self.witness_path().read_bytes()
+        self.manifest_path().unlink()
+        for generation in self.root.joinpath(
+            ".bimri", "audit-manifests"
+        ).glob("*.json"):
+            generation.unlink()
+
+        blocked = self.cli(
+            "start", "--actor", "evidence-probe", check=False
+        )
+        self.assertEqual(
+            blocked.returncode, 2, blocked.stdout + blocked.stderr
+        )
+        self.assertIn(
+            "manifest evidence", (blocked.stdout + blocked.stderr).lower()
+        )
+        # Nothing was blindly retired: the marker and prior checkpoint
+        # both survive the refusal.
+        self.assertTrue(self.root.joinpath(TRANSITION_RELATIVE).exists())
+        self.assertEqual(self.witness_path().read_bytes(), witness_before)
+
+        # The documented exit resets the derived trust artifacts. The
+        # evidence-invalid refusal clears; whatever the forged row itself
+        # implies is the normal recovery story, not this condition.
+        self.witness_path().unlink()
+        self.root.joinpath(TRANSITION_RELATIVE).unlink()
+        reset = self.cli("doctor", check=False)
+        self.assertNotIn(
+            "manifest evidence", (reset.stdout + reset.stderr).lower()
+        )
+
+    def test_marker_survives_until_its_evidence_is_durable(self):
+        self.seed_authority_graph()
+        marker = self.root / ".bimri" / "audit-transition.json"
+        marker.write_text("{corrupt marker bytes", encoding="utf-8")
+        sink = self.root / ".bimri" / "audit-drift"
+        sink.write_text("obstruction\n", encoding="utf-8")
+
+        blocked = self.cli("start", "--actor", "retire-order", check=False)
+        self.assertEqual(
+            blocked.returncode, 2, blocked.stdout + blocked.stderr
+        )
+        self.assertTrue(marker.is_file())
+
+        sink.unlink()
+        healed = self.cli("start", "--actor", "retire-order-2")
+        self.assertEqual(healed.returncode, 0)
+        self.assertFalse(marker.exists())
+        record = json.loads(self.drift_receipts()[-1].read_text("utf-8"))
+        self.assertTrue(any(
+            item["role"] == "corrupt-transition-marker"
+            for item in record["attachments"]
+        ))
+
     def test_unknown_preflight_receipt_release_is_refused(self):
         self.seed_authority_graph()
         run_id = self.start("receipt-reject")
@@ -3206,6 +3284,76 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
             ).exists()
         )
         self.assert_no_audit_block()
+
+
+class V511ReceiptUnitTest(unittest.TestCase):
+    """Narrow unit-level checks on the receipt store itself.
+
+    These import the engine directly — the same seam crash_worker.py uses —
+    because fabricating hundreds of sealed receipts or distinct event
+    bindings through the CLI would take minutes per case.
+    """
+
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location(
+            "bimri_receipt_unit", ENGINE
+        )
+        self.engine = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.engine)
+        self._temp = tempfile.TemporaryDirectory(
+            prefix="bimri-receipt-unit-"
+        )
+        self.paths = self.engine.Paths(Path(self._temp.name))
+        self.paths.bdir.mkdir()
+
+    def tearDown(self):
+        self._temp.cleanup()
+
+    def test_prune_window_holds_across_the_millionth_sequence(self):
+        drift = self.paths.audit_drift
+        drift.mkdir()
+        drift.joinpath("D999895-seed.json").write_text(
+            "{}", encoding="utf-8"
+        )
+        for index in range(210):
+            written = self.engine.write_audit_drift_receipt(
+                self.paths, [f"unit drift {index}"]
+            )
+            self.assertIsNotNone(written, f"receipt {index} failed")
+        receipts = self.engine.list_audit_drift_receipts(self.paths)
+        self.assertEqual(len(receipts), self.engine.AUDIT_DRIFT_KEEP)
+        sequences = [
+            self.engine.parse_audit_drift_sequence(path.name)
+            for path in receipts
+        ]
+        self.assertEqual(sequences, sorted(sequences))
+        self.assertEqual(len(sequences), len(set(sequences)))
+        # The window crossed the six-digit boundary: the newest receipts
+        # carry seven-digit sequences and the pruned ones were the lowest
+        # sequences, never the widest names.
+        self.assertGreater(sequences[-1], 1000000)
+        self.assertEqual(sequences[0], 999896 + 10)
+
+    def test_dedup_is_bound_to_the_event_not_just_the_content(self):
+        state_a = {
+            "head_revision": 1, "head_hash": "a" * 64, "_audit_epoch": 0,
+        }
+        state_b = {
+            "head_revision": 2, "head_hash": "b" * 64, "_audit_epoch": 0,
+        }
+        first = self.engine.write_audit_drift_receipt(
+            self.paths, ["same drift"], state=state_a
+        )
+        self.assertIsNotNone(first)
+        repeat = self.engine.write_audit_drift_receipt(
+            self.paths, ["same drift"], state=state_a
+        )
+        self.assertEqual(repeat, first)
+        other_event = self.engine.write_audit_drift_receipt(
+            self.paths, ["same drift"], state=state_b
+        )
+        self.assertIsNotNone(other_event)
+        self.assertNotEqual(other_event, first)
 
 
 if __name__ == "__main__":

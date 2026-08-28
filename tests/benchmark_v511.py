@@ -216,7 +216,7 @@ def main():
     key = pick_hot_key(root)
     print(f"benchmark key: {key}")
 
-    cold = timed(root, "get", "--key", key, check=False)
+    cold = timed(root, "get", "--key", key)
     print(f"{'cold first read (seeds)':<28} once {cold:8.1f} ms")
     RESULTS["cold_first_read_ms"] = cold
 

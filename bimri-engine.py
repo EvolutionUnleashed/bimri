@@ -4738,6 +4738,20 @@ def write_audit_drift_receipt(
                     return None
                 descriptor["role"] = "complete-delta"
                 attachments.append(descriptor)
+        event_binding = {
+            "prior_witness_hash": (
+                prior_witness.get("witness_hash")
+                if isinstance(prior_witness, dict) else None
+            ),
+            "prior_manifest_hash": (
+                prior_witness.get("manifest_hash")
+                if isinstance(prior_witness, dict) else None
+            ),
+            "head_revision": state.get("head_revision") if state else None,
+            "head_hash": state.get("head_hash") if state else None,
+            "audit_epoch": state_audit_epoch(state) if state else None,
+            "transition_marker": marker,
+        }
         newest = list_audit_drift_receipts(paths)[-1:]
         if newest:
             try:
@@ -4755,10 +4769,14 @@ def write_audit_drift_receipt(
                     item.get("sha256")
                     for item in existing.get("attachments") or ()
                 ] == [item.get("sha256") for item in attachments]
+                and all(
+                    existing.get(field) == value
+                    for field, value in event_binding.items()
+                )
             ):
-                # A repeated attempt against the same divergence adds no
-                # evidence; the newest receipt — validated, never merely
-                # present — already carries it.
+                # A repeated attempt against the same divergence OF THE
+                # SAME EVENT adds no evidence; a receipt from a different
+                # prior baseline, head, epoch or transition never counts.
                 return newest[0]
         record = {
             "drift_schema": AUDIT_DRIFT_SCHEMA,
@@ -4768,19 +4786,8 @@ def write_audit_drift_receipt(
             "delta": delta,
             "truncated": truncated,
             "attachments": attachments,
-            "prior_witness_hash": (
-                prior_witness.get("witness_hash")
-                if isinstance(prior_witness, dict) else None
-            ),
-            "prior_manifest_hash": (
-                prior_witness.get("manifest_hash")
-                if isinstance(prior_witness, dict) else None
-            ),
-            "head_revision": state.get("head_revision") if state else None,
-            "head_hash": state.get("head_hash") if state else None,
-            "audit_epoch": state_audit_epoch(state) if state else None,
-            "transition_marker": marker,
         }
+        record.update(event_binding)
         record["receipt_hash"] = audit_record_seal(record, "receipt_hash")
         ensure_directory_durable(paths.audit_drift)
         digest = sha256_bytes(canonical_json_bytes(record))[:12]
@@ -5659,7 +5666,12 @@ def authority_transition_completion_issues(
 
 
 def preserve_corrupt_audit_transition(paths):
-    """Move an unreadable transition marker aside as exact-byte evidence."""
+    """Copy an unreadable transition marker aside as verified evidence.
+
+    The original marker is NOT removed here: the caller retires it only
+    after the receipt citing this attachment is durably recorded, so a
+    death in between leaves the marker in place for the next attempt.
+    """
     path = paths.audit_transition
     try:
         if path.is_symlink():
@@ -5673,8 +5685,11 @@ def preserve_corrupt_audit_transition(paths):
         target = paths.audit_drift / f"corrupt-transition-{digest[:16]}.bin"
         if not target.exists() and not target.is_symlink():
             exclusive_write_bytes(target, raw)
-        path.unlink()
-        fsync_directory(path.parent)
+        if target.is_symlink() or not target.is_file():
+            return None
+        written = target.read_bytes()
+        if len(written) != len(raw) or sha256_bytes(written) != digest:
+            return None
         return {
             "path": target.relative_to(paths.root).as_posix(),
             "sha256": digest,
@@ -5701,10 +5716,10 @@ def reconcile_audit_transition(paths, state):
             or paths.audit_transition.is_symlink()
         ):
             raise BimriError(
-                "audit transition marker path is obstructed by something "
-                "that is not a regular file and could not be preserved for "
-                f"recovery: {exc}. Remove or restore "
-                ".bimri/audit-transition.json, then run doctor."
+                "the audit transition marker is invalid and could not be "
+                f"preserved for recovery: {exc}. Clear any obstruction on "
+                ".bimri/audit-drift or .bimri/audit-transition.json, then "
+                "run doctor."
             ) from exc
         reasons = [f"audit transition marker was invalid: {exc}"]
         attachments = []
@@ -5722,8 +5737,15 @@ def reconcile_audit_transition(paths, state):
         ) is None:
             raise BimriError(
                 "the invalid transition marker's drift evidence could not "
-                "be durably recorded. Repair .bimri/audit-drift, then retry."
+                "be durably recorded; the marker remains in place. Repair "
+                ".bimri/audit-drift, then retry."
             ) from exc
+        # Only now, with the attachment verified and the receipt durable,
+        # is the original marker retired. A failure here just repeats the
+        # (deduplicated) preservation on the next load.
+        with contextlib.suppress(OSError):
+            paths.audit_transition.unlink()
+            fsync_directory(paths.audit_transition.parent)
         discard_audit_witness(paths)
         return state
     if marker is None:
@@ -5854,8 +5876,19 @@ def reconcile_audit_transition(paths, state):
             drift_delta = audit_checkpoint_drift_delta(
                 prior_m, manifest, allowed_recovery
             )
-        except (BimriError, OSError, UnicodeError, ValueError, TypeError):
-            drift_delta = None
+        except (
+            BimriError, OSError, UnicodeError, ValueError, TypeError,
+        ) as exc:
+            # Retiring the marker and prior checkpoint without the per-path
+            # delta would be a blind rebaseline. Missing referenced
+            # evidence refuses, exactly as it does on every other surface.
+            raise BimriError(
+                PRIOR_EVIDENCE_INVALID_PREFIX + f": {exc}; the transition "
+                "marker and prior checkpoint remain in place. Restore the "
+                ".bimri/audit-manifests evidence from backup, or remove "
+                ".bimri/audit-witness.json and the marker to rebuild trust "
+                "from the full audit."
+            ) from exc
     if write_audit_drift_receipt(
         paths,
         reasons,
