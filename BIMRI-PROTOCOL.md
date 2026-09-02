@@ -387,11 +387,15 @@ unchanged cold subject appear absent or stale. A true same-key generation
 change still requires `sync` before a new proposal is created.
 
 An admitted proposal binds `base_revision` to that current accepted head and
-`base_hash` to the exact keyed line hash, or literal `absent`. It also carries
-one optional backward-readable `preflight_receipt` containing engine release
-v5.1.0, accepted-head revision and hash, and observed key hash. The receipt
-MUST validate against the named immutable revision before the proposal may
-create a new concurrent conflict. Proposal records remain immutable.
+`base_hash` to the exact keyed line hash, or literal `absent`. It MAY also carry
+one backward-readable `preflight_receipt` containing the engine release that
+created it, accepted-head revision and hash, and observed key hash. The v5.1.1
+engine writes this receipt on every new proposal and stamps v5.1.1; it also
+accepts earlier v5.1.0 receipts. Older v5.1.0 engines reject v5.1.1-authored
+receipts. When present, the receipt MUST validate against the named immutable
+revision before the proposal may create a new concurrent conflict. A
+receipt-less legacy proposal cannot create a new concurrent conflict and must
+be synced and restaged instead. Proposal records remain immutable.
 
 Every v5.1 proposal carries an explicit Boolean `new_subject`. A proposal based
 on cold-current memory additionally records `base_storage: cold` and binds the

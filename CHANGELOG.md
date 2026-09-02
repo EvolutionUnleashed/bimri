@@ -8,6 +8,11 @@ files are preserved under [`legacy/`](legacy/) and are not current installers.
 - Kept the performance work as an engine-only patch. The authority and
   mutable-state formats remain v5.1.0, and the readable hot-memory grammar
   remains v5.0.2.
+- Proposal preflight receipts now stamp engine release v5.1.1. This engine
+  accepts receipts written by v5.1.0, but an older v5.1.0 engine rejects a
+  store after its first v5.1.1 proposal is staged. Upgrades therefore require
+  a quiescent, complete copy of `bimri.md` and `.bimri/` outside the project;
+  that copy is the rollback boundary.
 - Added a compact engine-managed audit checkpoint bound to the v5.1.0 current
   authority, with the detailed protected path-and-hash inventory stored as
   separate audit evidence. Warm exact-current reads and ordinary lifecycle

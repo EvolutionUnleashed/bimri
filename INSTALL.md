@@ -64,10 +64,17 @@ two paths to its ignore rules explicitly.
 ## Agent Installation Contract
 
 1. Obtain this repository in a temporary local folder.
-2. Inspect the target for BIMRI v1-v4 or v5 files. Before every update, stop
-   every process executing the old engine and keep the folder quiescent until
-   installation completes. The lock serializes commands; it cannot fence an
-   already-loaded old process waiting to write after the installer exits.
+2. Inspect the target for BIMRI v1-v4 or v5 files. Before every update or
+   migration, stop every process executing the old engine, keep the folder
+   quiescent until installation completes, and copy every existing BIMRI
+   artifact somewhere outside the project. For a v5 target, that snapshot MUST
+   include `bimri.md` plus the entire `.bimri/` tree. The lock serializes
+   commands; it cannot fence an already-loaded old process waiting to write
+   after the installer exits. For v5.1.0 to v5.1.1, that complete external
+   snapshot is the only rollback after the first v5.1.1 proposal is staged: an
+   older v5.1.0 engine rejects the newer proposal receipt. A store the new
+   engine has only started and closed, with no v5.1.1 proposal, remains readable
+   by v5.1.0.
 3. If Claude Cowork Global Instructions contain a v1-v3 BIMRI block, ask
    the owner to disable or remove it before installation. Those instructions
    directly rewrite the old hot-memory file and must not run alongside v5.

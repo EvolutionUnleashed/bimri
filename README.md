@@ -5,13 +5,13 @@
 ![Dependencies: none](https://img.shields.io/badge/dependencies-none-lightgrey)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
-**BIMRI gives your AI agent a memory that lasts across sessions.** Every
-session, the agent starts knowing what it learned last time: your decisions,
-your preferences, the state of the work, and where each of those facts came
-from. The memory lives in your project folder as plain files you can open and
-read. It works with Claude Code, OpenAI Codex and any local agent that can run
-a Python script. Free and open source under the MIT license, with no database,
-no account and no API key.
+**BIMRI gives local AI agents persistent project memory across sessions.**
+Installed project instructions tell each agent to read the current accepted
+memory at the start of a session, so your decisions, preferences and the state
+of the work survive the handoff. The memory lives in your project folder as
+plain files you can open and read. It works with Claude Code, OpenAI Codex and
+any local agent that can run a Python script. Free and open source under the
+MIT license, with no database, no BIMRI account and no API key.
 
 Setup is one sentence to your agent:
 
@@ -28,42 +28,40 @@ another service to run. The plain-language overview lives at
 [agentguru.ai/bimri](https://agentguru.ai/bimri); everything technical is
 below.
 
-## AI Memory Today Has a Landlord
+## AI Agent Memory Should Outlast the Runtime
 
-An agent that forgets starts every morning as a stranger. The tools that do
-remember hold the memory on their terms.
+Claude Code can keep editable, machine-local project memory. OpenAI Codex can
+generate local memory files you can inspect. Both give one runtime useful
+continuity under that runtime's schema, loading rules and lifecycle.
 
-**You can't read it.** The memory your AI app keeps for you is not a file you
-can open. You find out what it remembers by watching what it does, and you
-cannot correct a wrong belief directly.
+The gap appears when several supported agents need one accepted memory they can
+all use and take with the project. A shared notes file travels, but by itself it
+does not label sources, preserve accepted history, govern conflicting writes or
+recover a half-finished change. BIMRI does.
 
-**It doesn't travel.** Switch platforms and the months of business understanding
-your agent built up stay behind. Memory on those terms is a lease, and the
-switching cost is the rent.
+## Your Agent's Memory Lives on Your Machine
 
-**Two agents will trample it.** Point two agents at the same notes file and
-sooner or later one overwrites the other without anybody noticing.
+BIMRI keeps accepted memory in a folder on your machine and uses an engine to
+protect its history. Accepted facts, decisions, preferences, rules and current
+work record their source and trust level. Learned patterns record their
+evidence, confidence and what would prove them wrong. When two agents
+concurrently propose incompatible changes to the same stable key from the same
+accepted base, BIMRI records one conflict and leaves the choice to you.
 
-## Your Agent's Memory. On Your Machine. Yours.
-
-BIMRI is a memory system that lives in a folder on your machine, run by an
-engine that keeps it safe. Every memory carries where it came from and how much
-to trust it. When two memories genuinely conflict, the engine stops and asks
-you instead of guessing. Copy the folder and everything your agent knows
-arrives with you on a new machine or a different AI platform.
-
-The model is the replaceable part. The memory is what actually knows your
-business, and it gets more valuable every week your agent runs.
+When BIMRI is idle, copy the project folder and rerun the installer on the new
+machine. Its accepted memory, evidence and history move with it. The model and
+runtime can change; what BIMRI has preserved about your business stays with the
+project.
 
 | What you get | What it means day to day |
 | --- | --- |
-| **Portable** | The memory is a folder. Move the folder, move the memory, to another machine or another agent. |
-| **Readable by you** | Plain Markdown you can open in any editor. Read exactly what your agent believes, then fix it if it is wrong. |
-| **Safe with many agents** | Several agents can run at once, each in its own lane. Independent changes merge on their own and nothing gets trampled. |
-| **Governed by you** | A genuine conflict stops and comes to a human. You stay the referee, and the decision is recorded. |
-| **Provenance built in** | Every memory carries its source and its trust level. Six weeks later you can still trace why the agent believes what it believes. |
-| **Long-term memory that stays small in context** | The agent loads a bounded working set of roughly 12,000 tokens. Everything else stays on disk and is recalled when needed. |
-| **Yours forever** | Free, MIT licensed, nothing to cancel, and nobody able to take the memory away from you. |
+| **Portable** | When BIMRI is idle, move the project to another machine or supported agent and its accepted memory, evidence and history go with it. |
+| **Readable by you** | Plain Markdown you can open in any editor. Read exactly what BIMRI currently carries, then tell the agent to correct it through the engine if it is wrong. |
+| **Safe with many agents** | On one machine and one filesystem lock domain, several agents can work at once without silently overwriting one another. |
+| **Governed by you** | An incompatible concurrent change to the same keyed subject stops for your decision, and the choice is recorded. |
+| **Provenance built in** | Accepted facts and current work record source and trust. Learned patterns record evidence, confidence and what would prove them wrong. |
+| **Long-term memory that stays small in context** | The agent loads a bounded working set of roughly 12,000 tokens. Everything else stays on disk and can be recalled when needed. |
+| **No hosted dependency** | MIT licensed, with no BIMRI account or subscription. The memory stays in files you control. |
 
 ## What One Memory Looks Like
 
@@ -73,20 +71,21 @@ business, and it gets more valuable every week your agent runs.
 
 - `[K:offer.spring-promotion]` is a stable key, so a newer memory on the same
   subject replaces this one instead of piling up beside it.
-- `[SRC:user]` records where it came from: the owner said it, an agent inferred
-  it, or outside material suggested it.
+- `[SRC:user]` says the owner directly supplied the claim. Agent inference uses
+  `[SRC:agent]`; outside material uses `[SRC:external]`.
 - `[T:confirmed]` records how much to trust it, so agents weigh what they read
   instead of swallowing it whole.
 - `-> .bimri/log/R000012.md` points at the journal where the full detail and
   the reasoning live.
 
-The file this line sits in, `bimri.md`, is generated from an immutable
-revision and is never edited by hand. Under `.bimri/` sit the run journals,
-every accepted revision, every proposed change and its outcome, every conflict
-and every human decision. Markdown for the memory, small JSON and TSV files for
-the bookkeeping, all of it in the project folder.
+The file this line sits in, `bimri.md`, is generated from an immutable revision
+and is never edited by hand. Under `.bimri/` sit the run journals, every
+accepted revision, every immutable proposal, its decision record once decided,
+every recorded BIMRI conflict and every recorded owner resolution. Markdown
+holds the memory; small JSON and TSV files hold the bookkeeping, all of it in
+the project folder.
 
-## Works With
+## Works With Claude Code, OpenAI Codex and Local Agents
 
 | Agent runtime | Integration |
 | --- | --- |
@@ -95,27 +94,33 @@ the bookkeeping, all of it in the project folder.
 | Other local coding agents | Supported when they can follow the instruction block and execute the verified Python runtime |
 
 The runtime is one Python 3.8 or newer standard-library script plus ordinary
-local files. There are no packages to install and nothing leaves your machine.
-Several agents can share one memory folder as long as they share one operating
-system and filesystem lock domain; see the concurrency boundary in the
-reference section for the exact rule.
+local files. There are no packages to install. The BIMRI engine has no network
+client, server, account or API key; it reads and writes local project files
+only. Your agent runtime may still send prompts, relevant file excerpts or tool
+results to its model provider under that runtime's own data controls. Several
+agents can share one memory folder as long as they share one operating system
+and filesystem lock domain; see the concurrency boundary in the reference
+section for the exact rule.
 
 ## How It Works, in One Minute
 
-Each agent asks the engine for its own run handle and gets a short brief plus
-the current memory. It journals detail as it works. Anything that should shape
-future sessions is proposed under a stable, lowercase key such as
-`checkout.next-step`. A sync commits accepted proposals as a new immutable
-revision and regenerates `bimri.md`. Two agents proposing incompatible changes
-to the same key from the same base produce one recorded conflict for a human to
-settle; everything else merges without anyone being asked.
+Each agent asks the engine for its own run handle, receives a short brief, and
+then reads the accepted current memory from `bimri.md`. It journals detail as it
+works. Anything that should shape future sessions is proposed under a stable,
+lowercase key such as `checkout.next-step`. A sync commits accepted proposals
+as a new immutable revision and regenerates `bimri.md`. Only concurrent
+incompatible changes to the same key from the same accepted base become human
+conflicts. Independent-key changes can commit without a human decision, while
+exact compatible same-key effects become no-ops. Other refusals stay with the
+agent instead of becoming owner conflicts.
 
 The readable view stays small on purpose. Tier 1 holds durable facts,
 decisions, preferences and rules. Tier 2 holds current work, risks and next
 actions. Tier 3 holds patterns only when evidence and a falsifier exist. When
-the view nears its ceiling the engine cools the least-relevant Tier 2 subjects
-into keyed cold storage, where they stay current and retrievable. Nothing is
-hard-deleted; closed and replaced generations remain as history.
+an incoming change would make the view too large, the engine moves eligible
+Tier 2 subjects into keyed cold storage and retries the change. Those subjects
+stay current and recallable. Earlier generations remain in immutable history
+rather than being deleted.
 
 ```text
 <verified-python> bimri-engine.py start --actor codex
@@ -134,8 +139,8 @@ below walks through every command.
 
 ## Fast Enough to Run on Every Session
 
-Measured on the development store that runs this project's own business
-(about 500 runs and 216 revisions), Windows 11, 2026-09-02:
+Measured on the development store used by agents running Stu Jordan's business
+(about 500 runs and 216 revisions), on Windows 11 on 2026-09-02:
 
 | Operation | Time |
 | --- | ---: |
@@ -143,57 +148,71 @@ Measured on the development store that runs this project's own business
 | Session start, warm | 0.41 s |
 | Journal one line | 0.39 s |
 | Propose or sync an authority change | 1.3 to 1.6 s |
-| Full integrity audit that seeds the checkpoint | about 33 s, once |
+| Cold full audit to seed or rebuild the checkpoint | about 33 s per audit |
 
-The engine verifies the accepted head, memory grammar and its integrity
-checkpoint on every read, and re-proves the complete evidence tree before
-every authority-changing write. 255 tests cover concurrency, crash recovery,
-migration, integrity and safety, and run in public CI on Linux and Windows
-under Python 3.8 and 3.12 on every change.
+Warm exact-current reads, starts and journals use the checkpoint while it
+remains valid. `doctor`, review, search and historical recall deliberately run
+the full audit, and a missing or invalid checkpoint is rebuilt. Before an
+authority-changing write, the engine rechecks the complete protected record
+and runs a semantic audit if anything changed. 255 tests cover concurrency,
+crash recovery, migration, integrity and safety, and run in public CI on Linux
+and Windows under Python 3.8 and 3.12 on every change.
 
-## The Bigger Picture
+## BIMRI and Compounding Intelligence
 
-BIMRI is the memory layer of the compounding intelligence engine that runs
-Stu Jordan's own business. Alongside it sit continuity, feedback learning and a
-results ledger, and BIMRI is the piece opened to the world. The idea is simple:
-an agent gets more valuable the longer you use it when it keeps what you teach
-it and checks its own results, and that only works if the memory is durable,
-readable and yours.
+BIMRI is the memory layer inside the compounding intelligence engine Stu Jordan
+uses to run agents in his own business. Continuity, feedback learning and a
+results ledger handle the other parts. BIMRI makes improvement durable by
+preserving the accepted decisions, corrections and business context those
+systems need, and it is the part released as open source.
 
-If you want an agent with this memory already inside, doing one named job on a
-schedule, that is [Agent in a Box](https://agentguru.ai). If you want to start
-free, the Starter Engine on the same site is one agent doing one job on a
-schedule, working today.
+What the business teaches the agent can survive the session, the model and the
+runtime.
+
+If you want the finished agent, [Agent in a Box](https://agentguru.ai/agent-in-a-box)
+is one agent for one named job, built on this architecture. [The Starter
+Engine](https://agentguru.ai/start) is a complete scheduled agent you can run
+free.
 
 ## Frequently Asked Questions
 
 ### What is BIMRI?
 
-BIMRI is a free, open-source AI agent memory system. It gives Claude Code,
-OpenAI Codex and other local coding agents a persistent, human-readable memory
-that lasts across sessions, stored as plain files in the project folder, with
-the source and trust level of every memory recorded.
+BIMRI is a free, open-source persistent memory system for Claude Code, OpenAI
+Codex and other local agents. It stores accepted project knowledge in
+human-readable files, preserves its provenance and verified history, and lets
+supported agents share one governed memory across sessions.
 
 ### What is AI agent memory?
 
-AI agent memory is whatever an agent carries from one session to the next:
-facts about the project, decisions already made, preferences, the state of the
-work. Most agents start every session from zero and rebuild that picture from
-whatever files they are handed. A memory system keeps it durable, keeps it
-small enough to load every time, and lets the agent retrieve the rest when it
-matters. BIMRI does that in plain files in the project folder, with every
-memory carrying its source and trust level.
+AI agent memory is the project knowledge an agent carries from one session to
+the next: decisions, preferences and the current state of the work. Each
+runtime has its own way of carrying or rebuilding that picture. BIMRI keeps one
+accepted record in the project, bounds what loads into each session and lets
+the agent recall the rest when needed.
 
 ### Does Claude Code remember between sessions?
 
-Partly, on its own. Claude Code reads your `CLAUDE.md` instructions every
-session and keeps an automatic memory file per project, so some context does
-carry forward without any setup. That note belongs to one tool and one project,
-loads with a size cap, and records nothing about where a fact came from or how
-much to trust it. BIMRI is the layer underneath: a memory with provenance on
-every line, shared by every agent working in the folder, portable to another
-platform, and bounded in what it loads. Claude Code's session hooks open and
-close a BIMRI run automatically, so the two work together.
+Yes. Claude Code reads your `CLAUDE.md` instructions and can keep editable,
+machine-local [project memory](https://code.claude.com/docs/en/memory) between
+sessions. That gives one runtime useful continuity. By default, its automatic
+notes are Claude Code-specific and stored per repository on one machine, and
+they do not require provenance on each fact. BIMRI adds a governed project
+memory that supported agents in the folder can share, with stable keys,
+provenance, immutable history and bounded loading. When the rendered hooks are
+enabled, Claude Code opens and closes a BIMRI run automatically.
+
+### Does OpenAI Codex remember between sessions?
+
+Yes, when local memories are enabled. Codex can generate local memory files
+from eligible prior chats, store them under the Codex home directory
+(`$CODEX_HOME/memories/`, normally `~/.codex/memories/`), and use them in later
+sessions. OpenAI documents these as
+[inspectable generated state](https://learn.chatgpt.com/docs/customization/memories);
+the feature is off by default and updates in the background rather than after
+every chat. BIMRI can run alongside it for project-owned memory that supported
+agents can share, with stable keys, provenance, immutable history and bounded
+loading. Keep rules that must always apply in `AGENTS.md`.
 
 ### What does BIMRI stand for?
 
@@ -203,9 +222,8 @@ on demand rather than stuffed into every session.
 
 ### Is BIMRI free?
 
-Yes. BIMRI is MIT licensed and free for personal and commercial use. This
-GitHub repository is public; a search result that describes it as private is
-stale.
+Yes. BIMRI is MIT licensed and free for personal and commercial use. The source
+and full documentation are in this public GitHub repository.
 
 ### Does BIMRI need a database, embeddings or an API key?
 
@@ -213,10 +231,12 @@ No. It uses ordinary local files, exact stable-key retrieval and lexical
 task-language search. There is no database, no package to install, no embedding
 model, no cloud service and no API key.
 
-### Does anything leave my machine?
+### Does BIMRI send my memory anywhere?
 
-No. The memory is ordinary files in your project folder. There is no server and
-no account behind it.
+The BIMRI engine has no network client, server, account or API key; it reads
+and writes local project files only. Your agent runtime may send prompts,
+relevant file excerpts or tool results to its model provider under that
+runtime's own data controls. BIMRI does not change that boundary.
 
 ### Which agents does it work with?
 
@@ -226,26 +246,29 @@ automatically through session hooks.
 
 ### How is this different from the memory built into my AI app?
 
-Built-in memory is genuinely useful: it remembers your preferences across
-chats on that platform with no setup at all. Its limits start where the memory
-stops being yours. You cannot open it as a file, correct a wrong belief
-directly, move it to another platform or share it between two agents, and it
-carries no record of where each fact came from. BIMRI is the same idea kept as
-readable files under your control, with provenance on every line.
+Built-in memory is useful, and runtimes differ. Local Codex can generate
+inspectable files, while Claude Code can keep editable project memory. BIMRI
+adds a project-owned layer that supported local agents can share: stable keys,
+source and trust labels on Tier 1 and Tier 2 claims, immutable revisions,
+recorded conflict decisions and a defined one-lock-domain concurrency
+boundary.
 
 ### Can several agents share one memory?
 
-Yes, on one machine at a time. Each agent works in its own lane with its own
-log, independent changes merge on their own, and a genuine conflict stops and
-comes to you instead of being guessed at. Simultaneous writes from different
-machines or synchronized copies are outside the guarantee.
+Yes, when every agent shares one machine and operating-system/filesystem lock
+domain. Each agent has its own log. Independent changes can commit without a
+human decision; concurrent incompatible changes to the same key from the same
+accepted base stop for yours. Simultaneous writes from different machines or
+synchronized copies are outside the guarantee.
 
 ### What happens if an agent crashes mid-write?
 
-Every change is written behind a durable marker, so the commands that follow
-finish or roll back the interrupted operation from that marker. Accepted
-memory is never half-written, and no crash state ever requires deleting files
-by hand. `doctor` names anything still waiting on its run.
+BIMRI records the intended memory change before replacing accepted state. After
+an interruption, recovery either proves the change committed, keeps the prior
+accepted memory authoritative, or reports the exact next action. That may be
+the original run finishing its write or the owner re-approving the same conflict
+choice. Accepted memory is never left half-written, and recovery does not
+require deleting files by hand.
 
 ### Does it run on Windows?
 
@@ -358,6 +381,13 @@ For a fresh target or v1-v4 migration, the installer command is:
 ```text
 <verified-python> bimri-engine.py install --target /absolute/path/to/the/project
 ```
+
+Before any upgrade, make the target quiescent and copy `bimri.md` plus the
+entire `.bimri/` tree somewhere outside the project. For v5.1.0 to v5.1.1,
+that complete snapshot is the only rollback after the first v5.1.1 proposal is
+staged: an older v5.1.0 engine rejects the newer proposal receipt. A store the
+new engine has only started and closed, with no v5.1.1 proposal, remains
+readable by v5.1.0.
 
 For any existing v5 store, stop every old engine process first and attest that
 external handoff explicitly:
