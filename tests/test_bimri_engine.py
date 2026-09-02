@@ -3308,11 +3308,13 @@ class BimriCliTest(unittest.TestCase):
         orphan_status = self.cli("status", root=orphan_root, check=False)
         self.assertEqual(orphan_status.returncode, 1)
         self.assertIn(f"resolution {orphan_id}", orphan_status.stdout)
-        # Start is a warm entry point: at-rest damage behind a valid
-        # checkpoint surfaces at the explicit full-audit boundaries (status
-        # above, doctor, authority writes), not on the warm path.
+        # Owner-ruled 2026-09-02: once a full-audit boundary (status above)
+        # has condemned the store, the checkpoint no longer shields the warm
+        # path. Start re-proves the store and prints the recovery banner,
+        # exactly as v5.1.0 did and as BIMRI-PROTOCOL 9.5 requires.
         warm_start = self.cli("start", "--actor", "recovery", root=orphan_root)
-        self.assertNotIn("AUTHORITY RECOVERY NEEDED", warm_start.stdout)
+        self.assertIn("AUTHORITY RECOVERY NEEDED", warm_start.stdout)
+        self.assertIn(f"resolution {orphan_id}", warm_start.stdout)
         boundary = self.cli(
             "doctor", "--read-only", root=orphan_root, check=False
         )

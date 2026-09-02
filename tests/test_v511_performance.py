@@ -3331,6 +3331,52 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         served = self.cli("get", "--key", "lock.subject")
         self.assertIn("lock.subject", served.stdout)
 
+    def test_failed_semantic_audit_invalidates_the_checkpoint_and_degrades_warm_commands(self):
+        # Owner-ruled 2026-09-02. Before this, a full audit that condemned
+        # authority left the earlier checkpoint readable, so the next warm
+        # start printed a clean brief and exact reads kept serving a store
+        # whose writes were paused; BIMRI-PROTOCOL 9.5 says start MUST print
+        # the recovery banner. A condemning audit now advances the audit
+        # epoch past the checkpoint (bytes retained as the prior baseline)
+        # and the next command re-proves the store, as v5.1.0 did.
+        records = self.seed_authority_graph()
+        root = self.clone_store("condemned-authority")
+        target = root / records["proposals"].relative_to(self.root)
+        original = target.read_bytes()
+        target.write_bytes(b"{broken authority json")
+        witness_before = self.witness_path(root).read_bytes()
+
+        doctor = self.cli("doctor", root=root, check=False)
+        self.assertEqual(doctor.returncode, 1, doctor.stdout + doctor.stderr)
+        self.assertIn("BIMRI doctor: FAILED", doctor.stdout)
+        # The checkpoint bytes stay as the prior baseline; its epoch binding
+        # is what the condemning audit advanced past.
+        self.assert_prior_witness_retained_but_invalid(root, witness_before)
+
+        started = self.cli("start", "--actor", "degraded", root=root, check=False)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self.assertIn("AUTHORITY RECOVERY NEEDED", started.stdout)
+        read = self.cli("get", "--key", "witness.seed", root=root, check=False)
+        self.assertNotEqual(read.returncode, 0, read.stdout)
+        self.assertRegex(
+            (read.stdout + read.stderr).lower(), r"authority|recovery"
+        )
+        self.assert_prior_witness_retained_but_invalid(root, witness_before)
+
+        # Exact restoration of the damaged bytes is the repair: the next
+        # audit passes over the retained baseline, receipts the epoch
+        # advance, publishes afresh, and the banner is gone.
+        target.write_bytes(original)
+        healed = self.cli("doctor", root=root)
+        self.assertIn("BIMRI doctor: PASSED", healed.stdout)
+        self.assertNotEqual(self.witness_path(root).read_bytes(), witness_before)
+        self.witness(root)
+        self.assert_drift_receipt(root, pattern=r"epoch")
+        restarted = self.cli("start", "--actor", "healed", root=root)
+        self.assertNotIn("AUTHORITY RECOVERY NEEDED", restarted.stdout)
+        served = self.cli("get", "--key", "witness.seed", root=root)
+        self.assertIn("witness.seed", served.stdout)
+
 
 class V511ReceiptUnitTest(unittest.TestCase):
     """Narrow unit-level checks on the receipt store itself.

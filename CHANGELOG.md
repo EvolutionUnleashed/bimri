@@ -34,7 +34,15 @@ files are preserved under [`legacy/`](legacy/) and are not current installers.
   unreferenced-attachment bound; and a checkpoint whose referenced
   manifest evidence is missing refuses rebaselining instead of adopting
   new bytes with no recorded delta. A failed semantic audit
-  refuses into the existing damaged-authority recovery lane. Interrupted
+  refuses into the existing damaged-authority recovery lane and
+  invalidates the checkpoint by advancing the state's audit epoch
+  (owner-ruled 2026-09-02), so the next `start` prints
+  `AUTHORITY RECOVERY NEEDED` and exact reads refuse until the store is
+  repaired, as in v5.1.0. The checkpoint bytes stay on disk as the prior
+  baseline for receipts, quarantine and restore, the same
+  retained-but-invalid shape a failed resolution leaves; a blocked receipt
+  sink, an open quarantine and a strict restore comparison keep their
+  prior checkpoint readable. Interrupted
   operations self-heal exactly as in v5.1.0; no drift or crash state ever
   requires hand deletion of derived files. `audit-blocked.json` now appears
   only while an owner-approved quarantine holds its pre-repair baseline, and

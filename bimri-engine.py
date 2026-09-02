@@ -6250,6 +6250,35 @@ def refresh_audit_witness_after_trusted_write(paths, state):
         paths.full_audit_run_facts = None
 
 
+def condemn_audit_checkpoint(paths, state):
+    """Stop a still-valid checkpoint from shielding the warm path.
+
+    Owner-ruled 2026-09-02. A full audit that condemns authority must not
+    leave the earlier checkpoint readable: otherwise the next warm start
+    prints a clean brief and exact reads keep serving a store whose writes
+    are paused, against BIMRI-PROTOCOL 9.5. The witness bytes stay on disk
+    as the prior baseline for drift receipts, quarantine and restore; only
+    the state's audit epoch advances, the same retained-but-invalid shape a
+    failed resolution leaves. The next command re-proves the store and
+    refuses or degrades exactly as v5.1.0 did, until an audit passes and
+    publishes a fresh checkpoint.
+    """
+    paths.validated_audit_witness = None
+    witness = load_sealed_audit_witness(paths)
+    if witness is None:
+        return False
+    if witness.get("audit_epoch") != state_audit_epoch(state):
+        return False
+    try:
+        state["_audit_epoch"] = state_audit_epoch(state) + 1
+        save_state(paths, state)
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        # The epoch could not be persisted. Removing the derived file keeps
+        # the warm path from trusting it; the baseline is lost only here.
+        discard_audit_witness(paths)
+    return True
+
+
 def governance_snapshot(
     paths,
     state,
@@ -6351,8 +6380,15 @@ def governance_snapshot(
     paths.full_audit_manifest = manifest
     paths.full_audit_run_facts = run_facts
     if issues:
+        condemned = [
+            issue for issue in issues
+            if issue not in blocked_issues
+            and not issue.startswith(PRIOR_EVIDENCE_INVALID_PREFIX)
+        ]
         if write_witness and prior_witness is None:
             discard_audit_witness(paths)
+        elif write_witness and condemned and not strict_prior_comparison:
+            condemn_audit_checkpoint(paths, state)
     elif write_witness and (
         not allow_recoverable_applying
         or not authority_has_recoverable_applying(paths)

@@ -133,8 +133,11 @@ recorded operation, it first durably records a sealed drift receipt
 current hashes up to a documented per-section bound, with the complete
 delta pinned in a validated attachment when truncated) under
 `.bimri/audit-drift/`, then continues; when the audit fails, the store
-refuses
-into damaged-authority recovery exactly as it would without a checkpoint.
+refuses into damaged-authority recovery exactly as it would without a
+checkpoint and invalidates the checkpoint (its bytes remain as the prior
+baseline; its epoch binding advances), so later warm reads and starts
+re-prove the store and report the recovery condition rather than serving
+past it.
 `audit-blocked.json` appears only while an owner-approved quarantine holds its
 pre-repair baseline; restoration, or a clean doctor pass after it, clears it.
 The witness-protected roots are flat; an unexpected subdirectory prevents a

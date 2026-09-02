@@ -314,7 +314,13 @@ receipt that cannot be written keeps the prior checkpoint as the baseline
 and surfaces as an error, and a checkpoint whose referenced manifest
 evidence is missing refuses rebaselining instead of adopting new bytes
 blind. A failed
-semantic audit refuses into damaged-authority recovery. This detects and
+semantic audit refuses into damaged-authority recovery and invalidates the
+checkpoint by advancing the audit epoch, so the next `start` prints
+`AUTHORITY RECOVERY NEEDED` and exact reads refuse until the store is repaired,
+exactly as v5.1.0 behaved. The checkpoint bytes stay on disk as the prior
+baseline for receipts, quarantine and restore; only a blocked receipt sink, an
+open quarantine, or a strict restore comparison keeps the prior checkpoint
+readable. This detects and
 records standalone or accidental edits; it is not a defense against a
 coordinated writer editing history and derived evidence together, which no
 local store can prove from its own bytes.
