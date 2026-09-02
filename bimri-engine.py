@@ -852,8 +852,10 @@ def existing_store_lock(paths, timeout=10.0):
         raise BimriError("existing .bimri directory is missing or unsafe.")
     if path_is_redirected(paths.lock) or not paths.lock.is_file():
         raise BimriError(
-            "existing .bimri/engine.lock is missing or unsafe; the code-only "
-            "updater will not create it."
+            "existing .bimri/engine.lock is missing or unsafe. A lifecycle "
+            "command such as start, status or doctor recreates a missing "
+            "lock file; read-only commands and the code-only updater never "
+            "create it."
         )
     with _held_lock(paths.lock.open("r+b"), timeout):
         yield
@@ -15623,7 +15625,28 @@ def build_parser():
     return parser
 
 
+def reconfigure_console_streams():
+    """Emit UTF-8 on every host.
+
+    Memory text is UTF-8 on disk. On Windows a piped or redirected stdout
+    defaults to the ANSI code page, so printing an entry that carried a
+    character outside it raised UnicodeEncodeError from print() and the
+    command died with exit 2 (reproduced 2026-09-02). Hook and tool
+    consumers read UTF-8; a stream that cannot be reconfigured is left
+    alone.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (ValueError, OSError, AttributeError, TypeError):
+            pass
+
+
 def main(argv=None):
+    reconfigure_console_streams()
     argv = list(sys.argv[1:] if argv is None else argv)
     if (
         len(argv) == 2

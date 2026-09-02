@@ -3285,6 +3285,52 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         )
         self.assert_no_audit_block()
 
+    def test_console_output_is_utf8_under_an_ansi_code_page(self):
+        # Memory text is UTF-8 on disk. A piped stdout on Windows defaulted to
+        # the ANSI code page, so reading an entry that carried a character
+        # outside it died in print() with exit 2. Forcing the legacy encoding
+        # through the environment reproduces that host on every platform.
+        run_id = self.start("utf8")
+        text = "Tiếng Việt ✓ 日本語 → em dash — check"
+        self.apply_set(run_id, "utf8.subject", text, new_subject=True)
+        environment = dict(os.environ, PYTHONIOENCODING="cp1252", PYTHONUTF8="0")
+        for arguments in (
+            ("recall", "--key", "utf8.subject"),
+            ("get", "--key", "utf8.subject"),
+            ("recall", "--key", "utf8.subject", "--history"),
+            ("recall", "--query", "em dash"),
+        ):
+            result = subprocess.run(
+                [sys.executable, str(ENGINE), "--root", str(self.root), *arguments],
+                capture_output=True,
+                env=environment,
+                timeout=120,
+            )
+            stdout = result.stdout.decode("utf-8", "replace")
+            stderr = result.stderr.decode("utf-8", "replace")
+            self.assertEqual(result.returncode, 0, stdout + stderr)
+            self.assertIn(text, stdout, arguments)
+
+    def test_missing_lock_read_refusal_names_the_repair(self):
+        run_id = self.start("lock")
+        self.apply_set(
+            run_id,
+            "lock.subject",
+            "Value read after the lock file vanishes.",
+            new_subject=True,
+        )
+        lock = self.root / ".bimri" / "engine.lock"
+        lock.unlink()
+        refused = self.cli("get", "--key", "lock.subject", check=False)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn(
+            "recreates a missing lock file", refused.stderr + refused.stdout
+        )
+        self.cli("status")
+        self.assertTrue(lock.is_file())
+        served = self.cli("get", "--key", "lock.subject")
+        self.assertIn("lock.subject", served.stdout)
+
 
 class V511ReceiptUnitTest(unittest.TestCase):
     """Narrow unit-level checks on the receipt store itself.

@@ -341,9 +341,17 @@ filesystem snapshot. An out-of-engine edit to unrelated protected history can
 remain unseen by current-only recall until the next full-audit boundary;
 changes to state, the accepted head, or the selected cold binding invalidate
 that lookup immediately. Every writer must therefore use the engine and shared
-lock. A missing or unreadable checkpoint can still require a full audit before
-the fast path is re-established, and BIMRI does not promise one universal
-latency across filesystems, security scanners, or unbounded current state.
+lock. Run logs under `.bimri/log/` sit outside the witnessed inventory
+altogether: the audit validates active-run logs and the run facts that bear on
+authority, and it does not hash closed journals. A missing or unreadable
+checkpoint can still require a full audit before the fast path is
+re-established. While an interrupted authority write leaves a decision or
+resolution `applying` that the next command's recovery pass cannot settle on
+its own, the engine withholds the checkpoint and every start and exact read
+takes the full-audit path until that run's own sync or close settles it;
+`doctor` passes meanwhile and lists each unfinished applying decision. BIMRI
+does not promise one universal latency across filesystems, security scanners,
+or unbounded current state.
 
 ## Memory Tiers, Provenance, and Trust
 

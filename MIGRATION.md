@@ -4,9 +4,15 @@ Engine v5.1.1 uses authority format v5.1.0 while retaining the readable v5.0.2
 hot-memory grammar. The upgrade from v5.1.0 is one-way: v5.1.1 stamps its
 own engine release into proposal preflight receipts, and every proposal —
 pending or decided — remains an immutable authority record that a v5.1.0
-engine keeps validating, so it rejects the store permanently once any
-v5.1.1 proposal has been staged. Safe rollback exists only by restoring the
-complete pre-update backup taken before the first v5.1.1 proposal. The
+engine keeps validating. Once any v5.1.1 proposal has been staged, the
+v5.1.0 engine's `status`, `doctor`, `recall` and `sync` refuse the store
+permanently, and its `start` opens only a degraded run behind the
+`AUTHORITY RECOVERY NEEDED` banner (writing its run log and state entry, as
+the protocol's degraded-run lane allows). Safe rollback exists only by
+restoring the complete pre-update backup taken before the first v5.1.1
+proposal. A store the v5.1.1 engine has only started and closed, with no
+proposal, remains fully readable by v5.1.0, which ignores the derived
+`audit-*` files. The
 engine automatically migrates explicitly versioned v1-v3
 tiered Markdown and the engine-based v4 format. This canonical repository publicly
 distributed the original v1 and streamlined v3 instructions; the parser also

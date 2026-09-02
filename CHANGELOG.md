@@ -91,6 +91,31 @@ files are preserved under [`legacy/`](legacy/) and are not current installers.
   `start` 0.36 s (was 51.8 s); one-line `journal` ~0.30 s (was ~23.4 s);
   `close` 0.35 s (was 43.8 s). On a 10x synthetic store, warm reads held
   p50 11 ms and p99 18 ms.
+- Console output is UTF-8 on every host. Memory text is UTF-8 on disk, and
+  on Windows a piped or redirected stdout defaulted to the ANSI code page,
+  so `get`, `recall` and `search` died with a codec error on any entry
+  carrying a character outside it (reproduced 2026-09-02; present since
+  v5.1.0). The engine now reconfigures stdout and stderr to UTF-8 at
+  startup.
+- Stated behaviour after an interrupted authority write: while a proposal
+  decision or an owner resolution that the next command's recovery pass
+  cannot settle on its own remains `applying` or `failed` (a `sync` killed
+  mid-batch is the reproduced case), a passing audit still refuses to
+  publish a fresh checkpoint, so `start` and exact reads take the
+  full-audit path until that run's own `sync` or `close` settles the
+  records, or the owner authorizes `recover-run`. `doctor` passes meanwhile
+  and lists each unfinished applying decision with the remedy. The first
+  command after a killed `propose` may refuse with
+  `an earlier audit transition is incomplete; run doctor before retrying`;
+  the following command, or `doctor`, completes the recovery. No hand
+  deletion is ever required.
+- Stated boundary: run logs under `.bimri/log/` are not part of the
+  witnessed inventory. The seven witnessed roots are proposals, decisions,
+  conflicts, resolutions, revisions, archive and recovery, as in the
+  original checkpoint design; an out-of-engine append to a closed run log
+  is not detected by any audit boundary in v5.1.0 or v5.1.1.
+- The missing-lock refusal on read-only paths now names the lifecycle
+  commands that recreate the lock file.
 
 ## 5.1.0
 
