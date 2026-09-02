@@ -1086,9 +1086,14 @@ class BimriCliTest(unittest.TestCase):
             "working",
         )
         second_id = PROPOSAL_RE.search(second.stdout).group(0)
+        # Directory order is filesystem-dependent (unsorted on ext4, sorted on
+        # NTFS); compare the set of proposal files in a fixed order.
         self.assertEqual(
-            [path.stem for path in (self.root / ".bimri" / "proposals").glob("*.json")],
-            [first, second_id],
+            sorted(
+                path.stem
+                for path in (self.root / ".bimri" / "proposals").glob("*.json")
+            ),
+            sorted([first, second_id]),
         )
         self.assertNotEqual(before, {
             path.relative_to(self.root).as_posix(): path.read_bytes()
