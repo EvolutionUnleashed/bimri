@@ -1,6 +1,6 @@
 # AGENTS.md
 
-## BIMRI Engine v5.1.0 | Authority Format v5.1.0 | Hot Grammar v5.0.2
+## BIMRI Engine v5.1.1 | Authority Format v5.1.0 | Hot Grammar v5.0.2
 
 This project uses BIMRI portable memory. `bimri.md` is the small, readable
 current state. Full evidence and history live under `.bimri/`.

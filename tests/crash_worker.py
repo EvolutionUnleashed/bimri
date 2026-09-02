@@ -35,6 +35,7 @@ def main():
     root = Path(sys.argv[3]).resolve()
     command = sys.argv[4:]
     engine = load_engine(engine_path)
+    graph_replay_observed = None
 
     no_memory_temp_modes = {
         "code_update_forbid_bdir_temp",
@@ -263,6 +264,15 @@ def main():
             return result
 
         engine.apply_proposal = crash_after_resolution_effect
+    elif mode == "resolution_fail_during_force_apply":
+        original = engine.apply_proposal
+
+        def fail_during_resolution_effect(*args, **kwargs):
+            if kwargs.get("force") and kwargs.get("human_confirmed"):
+                raise engine.BimriError("forced resolution effect failure")
+            return original(*args, **kwargs)
+
+        engine.apply_proposal = fail_during_resolution_effect
     elif mode == "resolution_crash_after_applying_record":
         original = engine.atomic_write_json
         resolution_dir = root / ".bimri" / "resolutions"
@@ -353,6 +363,100 @@ def main():
             return original(path, content)
 
         engine.atomic_write_text = fail_hot_write
+    elif mode == "witness_crash_before_replace":
+        original = engine.os.replace
+        witness = (root / ".bimri" / "audit-witness.json").resolve()
+
+        def crash_before_witness_replace(source, destination, *args, **kwargs):
+            if Path(destination).resolve() == witness:
+                os._exit(110)
+            return original(source, destination, *args, **kwargs)
+
+        engine.os.replace = crash_before_witness_replace
+    elif mode == "blocked_restore_crash_between_manifest_and_witness":
+        original_replace = engine.os.replace
+        manifest = (root / ".bimri" / "audit-manifest.json").resolve()
+        witness = (root / ".bimri" / "audit-witness.json").resolve()
+        publication_marker = root / ".test-restore-manifest-published"
+
+        def crash_after_manifest_before_witness(
+            source, destination, *args, **kwargs
+        ):
+            resolved = Path(destination).resolve()
+            if resolved == witness and publication_marker.exists():
+                os._exit(113)
+            result = original_replace(source, destination, *args, **kwargs)
+            if resolved == manifest:
+                publication_marker.write_text(
+                    "manifest published\n", encoding="utf-8"
+                )
+            return result
+
+        engine.os.replace = crash_after_manifest_before_witness
+    elif mode == "exact_recall_forbid_global_collection":
+
+        def reject_global_collection(*_args, **_kwargs):
+            raise AssertionError(
+                "exact-current recall attempted global history collection"
+            )
+
+        engine.recall_records = reject_global_collection
+    elif mode == "valid_witness_forbid_full_audit":
+
+        def reject_full_authority_audit(*_args, **_kwargs):
+            raise AssertionError(
+                "valid audit witness fell back to a full governance audit"
+            )
+
+        engine.authority_storage_issues = reject_full_authority_audit
+        engine.audit_witness_manifest = reject_full_authority_audit
+        engine.audit_witness_run_facts = reject_full_authority_audit
+        engine.load_audit_manifest_evidence = reject_full_authority_audit
+        engine.scan_open_conflicts = reject_full_authority_audit
+        engine.held_recall_records = reject_full_authority_audit
+    elif mode == "valid_checkpoint_forbid_graph_replay":
+
+        def reject_graph_replay(*_args, **_kwargs):
+            raise AssertionError(
+                "valid authority checkpoint triggered global graph replay"
+            )
+
+        engine.authority_storage_issues = reject_graph_replay
+    elif mode == "missing_checkpoint_require_graph_replay":
+        original = engine.authority_storage_issues
+        graph_replay_observed = {"called": False}
+
+        def observe_graph_replay(*args, **kwargs):
+            graph_replay_observed["called"] = True
+            return original(*args, **kwargs)
+
+        engine.authority_storage_issues = observe_graph_replay
+    elif mode == "journal_hold_lock":
+        original = engine.append_line
+        signal = root / ".test-writer-lock-held"
+        release = root / ".test-release-writer-lock"
+        held = False
+
+        def hold_journal_write(path, line):
+            nonlocal held
+            candidate = Path(path)
+            if (
+                not held
+                and candidate.parent == root / ".bimri" / "log"
+                and str(line).startswith("[ID:")
+            ):
+                held = True
+                signal.write_text("writer lock held\n", encoding="utf-8")
+                deadline = time.monotonic() + 20
+                while not release.exists():
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(
+                            "timed out waiting to release journal writer lock"
+                        )
+                    time.sleep(0.005)
+            return original(path, line)
+
+        engine.append_line = hold_journal_write
     elif mode == "index_failure":
 
         def fail_index(_paths, _state):
@@ -735,7 +839,14 @@ def main():
     else:
         raise SystemExit("unknown fault mode: " + mode)
 
-    return engine.main(["--root", str(root)] + command)
+    result = engine.main(["--root", str(root)] + command)
+    if graph_replay_observed is not None and not graph_replay_observed["called"]:
+        print(
+            "missing or invalid checkpoint bypassed global graph replay",
+            file=sys.stderr,
+        )
+        return 119
+    return result
 
 
 if __name__ == "__main__":

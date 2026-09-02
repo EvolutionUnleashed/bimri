@@ -1,7 +1,19 @@
 # BIMRI Migration and the v5.1.0 Lifecycle Upgrade
 
-Engine v5.1.0 uses authority format v5.1.0 while retaining the readable v5.0.2
-hot-memory grammar. It automatically migrates explicitly versioned v1-v3
+Engine v5.1.1 uses authority format v5.1.0 while retaining the readable v5.0.2
+hot-memory grammar. The upgrade from v5.1.0 is one-way: v5.1.1 stamps its
+own engine release into proposal preflight receipts, and every proposal —
+pending or decided — remains an immutable authority record that a v5.1.0
+engine keeps validating. Once any v5.1.1 proposal has been staged, the
+v5.1.0 engine's `status`, `doctor`, `recall` and `sync` refuse the store
+permanently, and its `start` opens only a degraded run behind the
+`AUTHORITY RECOVERY NEEDED` banner (writing its run log and state entry, as
+the protocol's degraded-run lane allows). Safe rollback exists only by
+restoring the complete pre-update backup taken before the first v5.1.1
+proposal. A store the v5.1.1 engine has only started and closed, with no
+proposal, remains fully readable by v5.1.0, which ignores the derived
+`audit-*` files. The
+engine automatically migrates explicitly versioned v1-v3
 tiered Markdown and the engine-based v4 format. This canonical repository publicly
 distributed the original v1 and streamlined v3 instructions; the parser also
 accepts a valid v2 header. Migration preserves old material before creating v5
@@ -26,9 +38,13 @@ Make the project quiescent across every runtime boundary:
 1. finish or stop every agent using the project;
 2. wait for every BIMRI command to finish;
 3. pause any synchronization or copy operation affecting the folder;
-4. if v1-v3 was installed in Claude Cowork Global Instructions, disable or
+4. take a complete copy of the whole project folder (`bimri.md` plus the
+   entire `.bimri/` tree) somewhere outside it — this snapshot is the only
+   rollback that exists, because the first v5.1.1 proposal is an
+   intentional one-way boundary that no older engine can read past;
+5. if v1-v3 was installed in Claude Cowork Global Instructions, disable or
    remove that BIMRI block; and
-5. keep the folder quiescent until migration and `doctor` complete.
+6. keep the folder quiescent until migration and `doctor` complete.
 
 The old v1-v3 Global Instructions directly edit the hot-memory file. v4
 uses an older engine contract. None of those writers can participate in the v5

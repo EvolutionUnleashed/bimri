@@ -3,6 +3,133 @@
 This file records the public BIMRI architecture history. Historical instruction
 files are preserved under [`legacy/`](legacy/) and are not current installers.
 
+## 5.1.1
+
+- Kept the performance work as an engine-only patch. The authority and
+  mutable-state formats remain v5.1.0, and the readable hot-memory grammar
+  remains v5.0.2.
+- Proposal preflight receipts now stamp engine release v5.1.1. This engine
+  accepts receipts written by v5.1.0, but an older v5.1.0 engine rejects a
+  store after its first v5.1.1 proposal is staged. Upgrades therefore require
+  a quiescent, complete copy of `bimri.md` and `.bimri/` outside the project;
+  that copy is the rollback boundary.
+- Added a compact engine-managed audit checkpoint bound to the v5.1.0 current
+  authority, with the detailed protected path-and-hash inventory stored as
+  separate audit evidence. Warm exact-current reads and ordinary lifecycle
+  bookkeeping no longer enumerate or hash the historical authority tree.
+  Behavior change: warm reads defer whole-tree verification to
+  authority-changing writes and explicit audit, review, search, and
+  historical-recall boundaries, so an out-of-engine edit to unrelated history
+  is seen at the next such boundary rather than on every read.
+- The checkpoint is a derived cache, never an authority record. Divergence
+  from it forces the full semantic audit; when that audit passes over changes
+  the engine cannot attribute to its own recorded operation, the engine
+  first durably records a sealed drift receipt under `.bimri/audit-drift/`
+  — the diverging paths with prior and current hashes (inline up to 2,000
+  entries per section with any remainder counted, the complete delta
+  pinned in a hash-and-size-validated attachment when truncated),
+  unbounded monotonic sequence, bounded to the newest 200 — and only then
+  publishes the new baseline. The written receipt is re-read and fully
+  validated (seal, filename binding, attachments, post-prune existence)
+  before the write counts as success, and deduplication only ever reuses a
+  receipt that validates. A receipt that cannot be recorded keeps the
+  prior checkpoint and surfaces as an error; `doctor` validates every
+  receipt and its attachments and reports damaged evidence instead of
+  trusting it; attachments cited by retained receipts outlive the
+  unreferenced-attachment bound; and a checkpoint whose referenced
+  manifest evidence is missing refuses rebaselining instead of adopting
+  new bytes with no recorded delta. A failed semantic audit
+  refuses into the existing damaged-authority recovery lane and
+  invalidates the checkpoint by advancing the state's audit epoch
+  (owner-ruled 2026-09-02), so the next `start` prints
+  `AUTHORITY RECOVERY NEEDED` and exact reads refuse until the store is
+  repaired, as in v5.1.0. The checkpoint bytes stay on disk as the prior
+  baseline for receipts, quarantine and restore, the same
+  retained-but-invalid shape a failed resolution leaves; a blocked receipt
+  sink, an open quarantine and a strict restore comparison keep their
+  prior checkpoint readable. Interrupted
+  operations self-heal exactly as in v5.1.0; no drift or crash state ever
+  requires hand deletion of derived files. `audit-blocked.json` now appears
+  only while an owner-approved quarantine holds its pre-repair baseline, and
+  restoration clears it. Owner-ruled 2026-08-27: this receipts contract
+  replaces the earlier normative fail-closed rule in the protocol, and the
+  current-only exact recall plus deferred warm-read verification below are
+  confirmed semantics.
+- An obstruction on the audit-transition marker path that is not a regular
+  file or symlink is a hard error on every surface; doctor never reports
+  health past it, and the checkpoint is left untouched until the owner
+  removes the obstruction.
+- During interrupted-transition recovery an archive month counts as the
+  operation's own effect only when its change is byte-provably the prior
+  witnessed content plus appended rows stamped by the operation's scope.
+  Any other archive change is preserved as drift evidence.
+- Read-only doctor and warm exact reads enforce the same legacy-lineage
+  refusals as writable load: marker and state must claim each other, and
+  unclaimed legacy root files refuse the read.
+- Authority-changing writes still re-verify the complete evidence inventory:
+  propose 1.31 s, sync 1.26 s and authority close 1.24 s measured on the
+  ~500-run live-size store. This exceeds the design brief's one-second
+  entry-point target and is recorded as a known, owner-accepted deviation
+  (2026-08-27); incremental authenticated manifests are the planned v5.2
+  fix. Reads and lifecycle bookkeeping are unaffected.
+- Unknown files inside witnessed roots — crash-orphaned engine temp files
+  included — are never deleted or blocked on. They enter the audited
+  inventory, cost at most one full re-audit when they first appear, and stay
+  visible through drift receipts and doctor litter reporting. The engine
+  cannot prove a temp-named file is its own, so it preserves it.
+- Added a direct current-key path for `get --key` and `recall --key` without
+  `--history`. Behavior change: it returns only the accepted current
+  generation (hot or cold-current); held candidates and history remain
+  reachable through `--history`, `--query`, and `review`. It validates at
+  most the bounded hot head plus one selected cold archive month.
+- Removed automatic derived-index rebuilds from start, commit, and resolution
+  hot paths. `index`, `maintain`, `doctor`, installation, and migration remain
+  the explicit rebuild points; the index remains non-authoritative.
+- Increased the example Claude hook timeout to 90 seconds so a cold first audit
+  on an established store has enough time to complete and seed its witness.
+  Dimension this against your store: the cold first audit measured 32.4 s on a
+  ~200-revision store and 77.5 s on a 10x synthetic store (2026-08-23, Windows
+  11 desktop), so a very large store may need a larger hook timeout for its
+  first run after installing this release.
+- Made a `failed` owner-resolution record fail closed as an explicit recovery
+  condition. Ordinary retrieval and shared-memory writes pause until the owner
+  explicitly retries the recorded conflict choice; a failed attempt can no
+  longer be mistaken for a healthy audited store.
+- Reworked the public README around BIMRI's open-source, local-first persistent
+  memory protocol, cross-session retrieval, human-governed provenance, agent
+  runtime support, and explicit same-lock-domain concurrency boundary.
+- Measured before and after on the live development store (~198 revisions,
+  433 run logs, Windows 11 desktop, 2026-08-23): `recall --key` warm
+  engine-side p50 11 ms (was ~21.3 s), warm CLI end-to-end p50 282 ms;
+  `start` 0.36 s (was 51.8 s); one-line `journal` ~0.30 s (was ~23.4 s);
+  `close` 0.35 s (was 43.8 s). On a 10x synthetic store, warm reads held
+  p50 11 ms and p99 18 ms.
+- Console output is UTF-8 on every host. Memory text is UTF-8 on disk, and
+  on Windows a piped or redirected stdout defaulted to the ANSI code page,
+  so `get`, `recall` and `search` died with a codec error on any entry
+  carrying a character outside it (reproduced 2026-09-02; present since
+  v5.1.0). The engine now reconfigures stdout and stderr to UTF-8 at
+  startup.
+- Stated behaviour after an interrupted authority write: while a proposal
+  decision or an owner resolution that the next command's recovery pass
+  cannot settle on its own remains `applying` or `failed` (a `sync` killed
+  mid-batch is the reproduced case), a passing audit still refuses to
+  publish a fresh checkpoint, so `start` and exact reads take the
+  full-audit path until that run's own `sync` or `close` settles the
+  records, or the owner authorizes `recover-run`. `doctor` passes meanwhile
+  and lists each unfinished applying decision with the remedy. The first
+  command after a killed `propose` may refuse with
+  `an earlier audit transition is incomplete; run doctor before retrying`;
+  the following command, or `doctor`, completes the recovery. No hand
+  deletion is ever required.
+- Stated boundary: run logs under `.bimri/log/` are not part of the
+  witnessed inventory. The seven witnessed roots are proposals, decisions,
+  conflicts, resolutions, revisions, archive and recovery, as in the
+  original checkpoint design; an out-of-engine append to a closed run log
+  is not detected by any audit boundary in v5.1.0 or v5.1.1.
+- The missing-lock refusal on read-only paths now names the lifecycle
+  commands that recreate the lock file.
+
 ## 5.1.0
 
 - Restored normal Tier 1 authoring and confirmed-memory updates. Direct

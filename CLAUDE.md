@@ -2,8 +2,8 @@
 
 ## Claude Code
 
-Use BIMRI engine and authority format v5.1.0. The readable hot-memory grammar
-remains v5.0.2.
+Use BIMRI engine v5.1.1 and authority format v5.1.0. The readable hot-memory
+grammar remains v5.0.2.
 `BIMRI-PROTOCOL.md` is the normative memory protocol.
 
 `<verified-python>` in BIMRI instructions means the exact absolute Python 3.8+
