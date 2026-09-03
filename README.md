@@ -9,9 +9,10 @@
 Installed project instructions tell each agent to read the current accepted
 memory at the start of a session, so your decisions, preferences and the state
 of the work survive the handoff. The memory lives in your project folder as
-plain files you can open and read. It works with Claude Code, OpenAI Codex and
-any local agent that can run a Python script. Free and open source under the
-MIT license, with no database, no BIMRI account and no API key.
+plain files you can open and read. It works with Claude Code, OpenAI Codex,
+local Claude Cowork sessions and any local agent that can run a Python script.
+Free and open source under the MIT license, with no database, no BIMRI account
+and no API key.
 
 Setup is one sentence to your agent:
 
@@ -85,11 +86,12 @@ every recorded BIMRI conflict and every recorded owner resolution. Markdown
 holds the memory; small JSON and TSV files hold the bookkeeping, all of it in
 the project folder.
 
-## Works With Claude Code, OpenAI Codex and Local Agents
+## Works With Claude Code, Claude Cowork, OpenAI Codex and Local Agents
 
 | Agent runtime | Integration |
 | --- | --- |
 | Claude Code | `CLAUDE.md`, `AGENTS.md`, and optional session hooks that open and close a run automatically |
+| Claude Cowork | Explicit engine commands in local desktop sessions only; cloud sessions are not supported |
 | OpenAI Codex | `AGENTS.md` and explicit engine commands |
 | Other local coding agents | Supported when they can follow the instruction block and execute the verified Python runtime |
 
@@ -101,6 +103,32 @@ results to its model provider under that runtime's own data controls. Several
 agents can share one memory folder as long as they share one operating system
 and filesystem lock domain; see the concurrency boundary in the reference
 section for the exact rule.
+
+## Claude Cowork: Local Desktop Sessions Only
+
+BIMRI works with Claude Cowork when the desktop app offers local execution and
+the project folder is connected. It does not support Cowork cloud sessions.
+BIMRI v5.0.2 passed the local Cowork compatibility matrix for locking, atomic
+replacement, journaling, proposals, conflicts, maintenance, status and doctor.
+v5.1.1 keeps the same local file/runtime model, but a Cowork-specific v5.1.1
+regression pass has not yet been run. Anthropic says Cowork sessions now run in
+the cloud by default, while local execution remains available for existing
+desktop deployments. Cloud mode runs the agent loop and code on Anthropic's
+servers and reaches connected local files through a brokered Desktop
+connection. BIMRI has not verified that split boundary for the shared locks and
+atomic file replacement its write guarantees depend on. In Cowork's local
+mode, file access stays on the device and shell commands run inside its isolated
+Linux VM. See
+[Anthropic's Cowork architecture overview](https://support.claude.com/en/articles/14479288-claude-cowork-architecture-overview).
+
+For each local Cowork session, connect the folder with read, write and delete
+permission, then tell Cowork to read the project's `AGENTS.md` and use the BIMRI
+protocol. Use the explicit start and close commands rather than relying on the
+optional Claude Code session hooks. Keep one runtime boundary active at a time:
+stop Cowork and let every BIMRI command finish before Claude Code, Codex,
+another Cowork session or another machine uses the same memory store. Because
+the Python binding is specific to one runtime, re-run installation whenever
+the project moves between Cowork's VM and a native host agent.
 
 ## How It Works, in One Minute
 
@@ -374,6 +402,35 @@ Give a coding agent this repository URL and say:
 Install BIMRI in this project from https://github.com/EvolutionUnleashed/bimri.
 Follow INSTALL.md, preserve my existing instructions and memory, and run the
 self-check.
+```
+
+#### Already Have BIMRI? Upgrade It
+
+The current installer detects and upgrades supported BIMRI v1 through v5.1.1
+installations. You do not need to know which version is installed. Give a local
+coding agent access to the project folder and paste this:
+
+```text
+Upgrade the BIMRI installation in this project to the latest release from
+https://github.com/EvolutionUnleashed/bimri. Work from a clean temporary copy
+of the current repository outside the target project, and read its INSTALL.md
+and MIGRATION.md before changing anything. Detect the installed BIMRI version
+and follow the documented upgrade path for that version; do not use this
+project's old engine as the installer. Before modifying the project, stop every
+agent and BIMRI process using the folder, pause any sync or copy operation, and
+make a verified complete backup of the project outside it. If v1-v3 BIMRI is
+active in Claude Cowork Global Instructions, stop and ask me to disable it.
+Verify an absolute Python 3.8+ executable as INSTALL.md requires. Pass
+--quiescent only for an existing v5 store and only after the folder is
+genuinely quiescent. Preserve all project instructions, BIMRI memory, evidence,
+history and unrelated files; never edit bimri.md or .bimri/ by hand. If the
+version is unsupported, the source is ambiguous, the store is damaged, the
+backup cannot be verified or any safety check fails, stop without changing the
+project and tell me exactly what blocked the upgrade. Finish with doctor
+--read-only and then status from the installed engine, verify the migration or
+update receipt, confirm .bimri/runtime.local.json was rebound, smoke-test any
+enabled hooks, and report the old and new versions, backup path, preservation
+result and validation result.
 ```
 
 For a fresh target or v1-v4 migration, the installer command is:
