@@ -14,7 +14,9 @@ concurrency:
 
 jobs:
   test:
-    timeout-minutes: 30
+    # Windows 3.8 can take about 29 minutes for the full crash/recovery suite,
+    # leaving no reliable room for the benchmark step under the old ceiling.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
