@@ -47,17 +47,55 @@ The [installation guide](https://github.com/EvolutionUnleashed/bimri/blob/main/I
 
 ## How BIMRI Manages Agent Memory
 
-**Versioned memory keeps the current answer clear.** Each subject has one current entry. Updating a decision replaces that entry while retaining its history, so old and new answers do not accumulate as equally current instructions.
+An agent starts with the project's current memory, records useful findings as it works, and proposes updates for future sessions. BIMRI checks those updates, maintains the current decisions and preserves their history. Working memory stays within its limits, while additional knowledge remains available for retrieval.
 
-**Memory provenance preserves who said what.** Facts and current work record their source and trust level. The engine keeps an agent's proposed change separate when it would replace something you confirmed.
+Agents decide what to propose for memory. The engine manages how those entries are stored, updated and kept within the working-memory limit.
 
-**Multi-agent conflict handling protects shared decisions.** The engine checks a proposed update against the version it was based on before accepting it. The [reference guide](https://github.com/EvolutionUnleashed/bimri/blob/main/REFERENCE.md) explains how independent changes merge and concurrent conflicts are resolved.
+### Three Memory Tiers
 
-**Tiered memory manages the context window.** Agents start with a bounded working memory covering durable rules, current work and recorded patterns. Other saved knowledge remains on disk for retrieval when needed. Long-term memory can grow without loading the entire history into every session.
+BIMRI organises working memory by the role each piece of knowledge plays. Continuing the fictional booking-app example:
 
-**Deterministic storage preserves the text you save.** The engine uses fixed Python rules to accept, store and retrieve entries. It does not ask a model to rewrite saved text or make an LLM call for memory operations. The agent decides what to propose for memory.
+| Tier | What it remembers | Example |
+| --- | --- | --- |
+| **1. Core knowledge** | Lasting facts, confirmed decisions, preferences and standing rules | Customers can book without creating an account. |
+| **2. Active context** | Current work, recent findings, risks and next steps | Test the calendar integration before launch. |
+| **3. Patterns** | Recurring observations, with evidence, confidence and a way to check whether they hold | Calendar failures appear more often around daylight-saving changes. |
 
-**Crash recovery protects continuity.** Accepted changes have a version history. Interrupted writes can be checked and recovered using the engine's recovery process.
+Core knowledge gives your agents a consistent foundation. Active context keeps them up to date with the work. Patterns help agents carry useful observations into future decisions, while keeping track of what supports them and what would prove them wrong.
+
+The tiers describe different kinds of knowledge. They are not stages every memory passes through, and Tier 3 is not an archive. An agent's proposed addition to core knowledge needs your confirmation.
+
+### Keeping Decisions Current
+
+**Versioned memory keeps one current answer per subject.** If you change the cancellation period from 48 hours to 24 hours, the new decision replaces the current entry. The earlier version stays in history, with its source record available when you need to understand the change.
+
+**Memory provenance preserves who said what.** Facts and active context record where they came from and whether they are confirmed or provisional. Your confirmed instruction takes priority over an agent's inference. A proposed replacement stays separate until you adopt it.
+
+**Multi-agent conflict handling keeps simultaneous updates organised.** The engine checks each update against the version it was based on. Independent changes merge automatically; incompatible concurrent changes to the same subject are preserved for resolution. Agents can contribute without silently overwriting one another's decisions.
+
+The engine stores entries using fixed Python rules, without asking another model to summarise or rewrite them. Saving and retrieving memory adds no LLM call inside BIMRI.
+
+### Growing Long-Term Memory Without Context Bloat
+
+Working memory is the brief an agent loads at the start of a session. Updating existing subjects keeps that brief from filling with repeated versions of the same decision.
+
+When a new entry would exceed the working-memory limit, BIMRI automatically moves lower-priority active-context entries into longer-term storage. Those entries keep their current status, source and trust level, and remain available for retrieval. Core knowledge stays in the starting brief.
+
+The engine handles this maintenance as it accepts updates, so you do not have to keep trimming the memory file. The limit applies to the starting context; your accumulated project knowledge continues to grow on disk.
+
+### Retrieving Earlier Knowledge
+
+An agent can retrieve the current answer for a specific subject or search saved memory using words from its task. It can also look up previous versions when the history matters. Moving an entry out of the starting brief keeps it available without loading it into every session.
+
+For example, an agent investigating a calendar bug can search for earlier findings about time zones and daylight-saving changes. A decision from months ago can still inform today's work.
+
+### Continuity Across Tools and Interrupted Work
+
+Your project folder holds the working memory, additional saved knowledge and version history together. Move it while BIMRI is idle and rerun installation in the new environment to continue with that knowledge intact.
+
+Crash recovery protects the same continuity during interrupted writes. BIMRI records a change before replacing the accepted memory. After an interruption, recovery establishes whether the change completed, retains the previous accepted state, or identifies the repair needed.
+
+The [reference guide](https://github.com/EvolutionUnleashed/bimri/blob/main/REFERENCE.md) covers memory tiers, retrieval commands, conflict handling and recovery in detail.
 
 ## Requirements and Limits
 
