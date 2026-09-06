@@ -1,22 +1,30 @@
-# BIMRI: Local, Persistent Memory You Can Share Across AI Agents
+# BIMRI: Persistent Memory for AI Agents
 
-BIMRI keeps your agents' project knowledge on your own machine, ready to use across sessions and supported agents. You can change the agent you work with, or use several on the same project, while keeping the decisions, corrections and context you've already built up.
+**Multi-agent memory with local ownership and portability.**
 
-That knowledge becomes more useful as your project develops. Each saved decision gives future work more context, and each recorded correction helps you avoid explaining the same thing again. You keep it when you move between supported tools.
+BIMRI is an open-source persistent AI memory system. Keep long-term project knowledge on your machine, carry it between supported agents, and let several agents build on the same decisions and context. Your investment in teaching an agent stays with you when you change tools.
 
-Works with Claude Code, OpenAI Codex and other supported local agents. Free and open source under the MIT license.
+Use Claude Code for one part of a project and OpenAI Codex for another. Run a local agent on a schedule. Start a new session next week. BIMRI makes the knowledge you've recorded available for the work that comes next.
 
-## Why Use BIMRI?
+The memory engine is agent-agnostic: any local agent that can follow its instructions and execute its Python commands can integrate with it. Memory is stored in plain files in your project folder, with no hosted memory service, database, account or API key. Free under the MIT license.
 
-- **You own the memory.** It is stored in your project folder as ordinary files you can inspect, back up and move.
-- **It runs locally.** The memory engine needs no hosted service, database, account or API key. It runs on Python without extra packages.
-- **You can choose your agents.** BIMRI is independent of any one agent provider. A new supported agent can use the project knowledge you've already saved.
-- **Several agents can share what they know.** Agents working on the same project can contribute to one memory. Independent updates can be combined; conflicting changes to the same subject are kept for you to resolve.
-- **Your decisions survive the session.** Once recorded as confirmed, your instruction cannot be silently replaced in memory by an agent's inference.
+## Local Ownership and Portable Long-Term Memory
+
+Every project develops knowledge worth keeping: why a decision was made, what a customer needs, which approach failed, what should happen next. Persistent AI memory lets that knowledge accumulate across sessions and remain available as your tools change.
+
+With BIMRI, you control the files that hold it. You can inspect your memory in a text editor, back it up with the project, and move it to another machine. A different supported agent can inherit the context you've spent months building.
+
+That is the foundation for compounding intelligence: future work can draw on more of what you've learned. BIMRI preserves the decisions, corrections and findings that make this possible; your agents use them in their work.
+
+## Multi-Agent Memory for Shared Project Knowledge
+
+Several agents working on one project can contribute to a common memory. A finding recorded by one becomes available to the others when they next load or retrieve it. This supports parallel work, handoffs between coding agents, and continuity across scheduled runs.
+
+Shared memory also needs a way to handle disagreement. BIMRI combines independent updates automatically. When two agents make incompatible concurrent changes to the same subject, it preserves the conflict for you to resolve. A confirmed decision cannot be silently replaced in memory by an agent's inference.
 
 Concurrent sharing requires agents to use the BIMRI engine in the same supported filesystem environment on one machine. See [requirements and limits](#requirements-and-limits) before connecting different runtimes.
 
-## A Simple Example
+## Example: Two Coding Agents, One Project Memory
 
 Suppose you're building a booking app with two agents. One works on the booking flow while another investigates the calendar integration. Later, you switch to a different supported agent to continue the project. These are fictional examples of the knowledge they can share through BIMRI:
 
@@ -27,9 +35,7 @@ Suppose you're building a booking app with two agents. One works on the booking 
 | You change the cancellation period from 48 hours to 24 hours. | The current decision, with the previous version retained in history. |
 | Two agents concurrently propose different changes to the same cancellation rule. | A conflict you can resolve, so one change does not silently replace the other. |
 
-Agents still need to read and use the memory. BIMRI preserves what is recorded; it does not guarantee that an agent will follow every instruction correctly.
-
-## Get Started
+## Install Persistent Memory for Claude Code or Codex
 
 Give your local coding agent access to the project folder and paste:
 
@@ -41,23 +47,25 @@ self-check.
 
 The [installation guide](https://github.com/EvolutionUnleashed/bimri/blob/main/INSTALL.md) covers setup and runtime requirements. For an existing installation, follow the [upgrade and migration guide](https://github.com/EvolutionUnleashed/bimri/blob/main/MIGRATION.md).
 
-## How BIMRI Keeps Memory Useful
+## How BIMRI Manages Agent Memory
 
-**It keeps track of what is current.** Each subject has one current entry. Updating a decision replaces that entry while retaining its history, so old and new answers do not accumulate as equally current instructions.
+**Versioned memory keeps the current answer clear.** Each subject has one current entry. Updating a decision replaces that entry while retaining its history, so old and new answers do not accumulate as equally current instructions.
 
-**It distinguishes your decisions from an agent's conclusions.** Facts and current work record their source and trust level. The engine keeps an agent's proposed change separate when it would replace something you confirmed.
+**Memory provenance preserves who said what.** Facts and current work record their source and trust level. The engine keeps an agent's proposed change separate when it would replace something you confirmed.
 
-**It handles updates from multiple agents.** Independent changes can merge automatically. Incompatible concurrent changes to the same subject are recorded for resolution. The [reference guide](https://github.com/EvolutionUnleashed/bimri/blob/main/REFERENCE.md) explains the exact conflict rules.
+**Multi-agent conflict handling protects shared decisions.** The engine checks a proposed update against the version it was based on before accepting it. The [reference guide](https://github.com/EvolutionUnleashed/bimri/blob/main/REFERENCE.md) explains how independent changes merge and concurrent conflicts are resolved.
 
-**It limits what loads at the start.** Agents read a bounded working memory. Other saved knowledge remains on disk and can be retrieved when needed, instead of loading the entire history into every session.
+**Tiered memory manages the context window.** Agents start with a bounded working memory covering durable rules, current work and recorded patterns. Other saved knowledge remains on disk for retrieval when needed. Long-term memory can grow without loading the entire history into every session.
 
-**It stores memory without another model call.** The engine uses fixed Python rules to accept, store and retrieve entries. It does not ask a model to rewrite saved text. The agent decides what to propose for memory.
+**Deterministic storage preserves the text you save.** The engine uses fixed Python rules to accept, store and retrieve entries. It does not ask a model to rewrite saved text or make an LLM call for memory operations. The agent decides what to propose for memory.
 
-**It preserves recovery information.** Accepted changes have a version history. Interrupted writes can be checked and recovered using the engine's recovery process.
+**Crash recovery protects continuity.** Accepted changes have a version history. Interrupted writes can be checked and recovered using the engine's recovery process.
 
 ## Requirements and Limits
 
 Python 3.8 or newer and a local agent that can read project files, follow BIMRI's instructions and run its engine commands. The installer verifies the Python executable.
+
+Agents still need to read and use the memory. BIMRI preserves what is recorded; it does not guarantee that an agent will follow every instruction correctly.
 
 Claude Code and OpenAI Codex use project instructions to work with BIMRI. Other local agents need the same file and command access. Cowork support is limited to the documented local execution setup; cloud sessions are unsupported. See [runtime setup](https://github.com/EvolutionUnleashed/bimri/blob/main/INSTALL.md).
 
