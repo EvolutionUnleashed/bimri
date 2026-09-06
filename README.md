@@ -2,7 +2,7 @@
 
 **Multi-agent memory with local ownership and portability.**
 
-BIMRI is an open-source persistent AI memory system. Keep long-term project knowledge on your machine, carry it between supported agents, and let several agents build on the same decisions and context. Your investment in teaching an agent stays with you when you change tools.
+BIMRI is an open-source persistent AI memory system. Keep long-term project knowledge on your machine, carry it between your local agents, and let them build on the same decisions and context. Your investment in teaching an agent stays with you when you change tools.
 
 Use Claude Code for one part of a project and OpenAI Codex for another. Run a local agent on a schedule. Start a new session next week. BIMRI makes the knowledge you've recorded available for the work that comes next.
 
@@ -12,21 +12,19 @@ The memory engine is agent-agnostic: any local agent that can follow its instruc
 
 Every project develops knowledge worth keeping: why a decision was made, what a customer needs, which approach failed, what should happen next. Persistent AI memory lets that knowledge accumulate across sessions and remain available as your tools change.
 
-With BIMRI, you control the files that hold it. You can inspect your memory in a text editor, back it up with the project, and move it to another machine. A different supported agent can inherit the context you've spent months building.
+With BIMRI, you control the files that hold it. You can inspect your memory in a text editor, back it up with the project, and move it to another machine. Your next agent inherits the context you've spent months building.
 
 That is the foundation for compounding intelligence: future work can draw on more of what you've learned. BIMRI preserves the decisions, corrections and findings that make this possible; your agents use them in their work.
 
 ## Multi-Agent Memory for Shared Project Knowledge
 
-Several agents working on one project can contribute to a common memory. A finding recorded by one becomes available to the others when they next load or retrieve it. This supports parallel work, handoffs between coding agents, and continuity across scheduled runs.
+Several agents working on one project on your machine share a common memory. A finding recorded by one becomes available to the others when they next load or retrieve it. This supports parallel work, handoffs between coding agents, and continuity across scheduled runs.
 
 Shared memory also needs a way to handle disagreement. BIMRI combines independent updates automatically. When two agents make incompatible concurrent changes to the same subject, it preserves the conflict for you to resolve. A confirmed decision cannot be silently replaced in memory by an agent's inference.
 
-Concurrent sharing requires agents to use the BIMRI engine in the same supported filesystem environment on one machine. See [requirements and limits](#requirements-and-limits) before connecting different runtimes.
-
 ## Example: Two Coding Agents, One Project Memory
 
-Suppose you're building a booking app with two agents. One works on the booking flow while another investigates the calendar integration. Later, you switch to a different supported agent to continue the project. These are fictional examples of the knowledge they can share through BIMRI:
+Suppose you're building a booking app with two agents. One works on the booking flow while another investigates the calendar integration. Later, a third agent takes over the next stage with the project memory already in place. In this fictional project, BIMRI keeps track of:
 
 | What happens | What BIMRI keeps for later work |
 | --- | --- |
@@ -65,11 +63,9 @@ The [installation guide](https://github.com/EvolutionUnleashed/bimri/blob/main/I
 
 Python 3.8 or newer and a local agent that can read project files, follow BIMRI's instructions and run its engine commands. The installer verifies the Python executable.
 
-Agents still need to read and use the memory. BIMRI preserves what is recorded; it does not guarantee that an agent will follow every instruction correctly.
-
 Claude Code and OpenAI Codex use project instructions to work with BIMRI. Other local agents need the same file and command access. Cowork support is limited to the documented local execution setup; cloud sessions are unsupported. See [runtime setup](https://github.com/EvolutionUnleashed/bimri/blob/main/INSTALL.md).
 
-- Concurrent writers must share the same operating-system locking environment and use the engine. Multiple machines, synced folders and unverified VM or container boundaries are outside the sharing guarantee. Cowork's VM and native agents must not use the memory concurrently.
+- Concurrent agents use the engine within one operating-system locking environment. For multiple machines, synced folders, or separate VM and container environments, use the [handoff procedure](https://github.com/EvolutionUnleashed/bimri/blob/main/REFERENCE.md#concurrency-and-portability-boundary). Cowork's VM and native agents take turns using the memory.
 - To move memory, stop its agents and BIMRI processes, copy the project while it is idle, then rerun installation in the new environment.
 - Retrieval uses subject keys and text search. Semantic search with embeddings is not included.
 - BIMRI makes no network calls. Your agent provider's own data handling still applies to anything the agent reads.
