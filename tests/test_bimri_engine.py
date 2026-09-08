@@ -351,7 +351,7 @@ class BimriCliTest(unittest.TestCase):
             "engine_path": engine_path,
             "host_bound": True,
             "python_executable": python_executable,
-            "version": "5.1.1",
+            "version": "5.1.2",
         })
 
         template = json.loads(
@@ -897,7 +897,7 @@ class BimriCliTest(unittest.TestCase):
         receipt = proposal["preflight_receipt"]
         self.assertEqual(proposal["bimri_version"], "5.1.0")
         self.assertEqual(proposal["base_revision"], state["head_revision"])
-        self.assertEqual(receipt["engine_release"], "5.1.1")
+        self.assertEqual(receipt["engine_release"], "5.1.2")
         self.assertEqual(receipt["observed_head_revision"], state["head_revision"])
         self.assertEqual(receipt["observed_head_hash"], state["head_hash"])
         self.assertEqual(receipt["observed_key_hash"], "absent")
@@ -5082,7 +5082,14 @@ class BimriCliTest(unittest.TestCase):
         corrupt_path.write_bytes(corrupt_bytes)
 
         installed = subprocess.run(
-            [sys.executable, str(ENGINE), "install", "--target", str(target)],
+            [
+                sys.executable,
+                str(ENGINE),
+                "install",
+                "--target",
+                str(target),
+                "--quiescent",
+            ],
             text=True,
             capture_output=True,
             timeout=60,
@@ -7982,7 +7989,7 @@ class BimriCliTest(unittest.TestCase):
         self.assertIn("<!-- BIMRI v5.0.2 |", self.hot())
         status = self.cli("status")
         self.assertIn(
-            "BIMRI engine v5.1.1 | memory format v5.1.0 | revision V000000",
+            "BIMRI engine v5.1.2 | memory format v5.1.0 | revision V000000",
             status.stdout,
         )
 
@@ -8176,6 +8183,52 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(protected_tree_snapshot(self.root), before)
         self.assertFalse((self.root / ".bimri-update-backups").exists())
 
+    def test_legacy_v5_store_install_requires_quiescent_attestation(self):
+        # v5.1.2: the v5.0/v5.0.1 upgrade route used to skip the attestation
+        # the v5.0.2/v5.1.0 code-only route demands, and silently ignored
+        # the flag. One guard now runs before version routing, before the
+        # target is created or locked, so a refused install writes nothing.
+        for version in ("5.0", "5.0.1"):
+            with self.subTest(version=version):
+                root = self.root / f"legacy-{version.replace('.', '-')}"
+                self.cli("migrate", root=root)
+                state_path = root / ".bimri" / "state.json"
+                state = self.state(root=root)
+                state["bimri_version"] = version
+                state.pop("cold_current", None)
+                state_path.write_text(
+                    json.dumps(state, indent=2, sort_keys=True) + "\n", "utf-8"
+                )
+                program = root / "bimri-engine.py"
+                program.write_text("old installed engine sentinel\n", "utf-8")
+                before = protected_tree_snapshot(root)
+
+                refused = self.cli(
+                    "install", "--target", root, check=False, root=REPOSITORY
+                )
+
+                self.assertEqual(refused.returncode, 2)
+                self.assertIn(
+                    "requires an externally verified quiescent handoff",
+                    refused.stderr,
+                )
+                self.assertIn(f"v{version} store", refused.stderr)
+                self.assertEqual(
+                    program.read_text("utf-8"), "old installed engine sentinel\n"
+                )
+                self.assertEqual(protected_tree_snapshot(root), before)
+                self.assertEqual(self.state(root=root)["bimri_version"], version)
+                self.assertFalse((root / ".bimri" / "install-backups").exists())
+
+                accepted = self.cli(
+                    "install", "--target", root, "--quiescent", root=REPOSITORY
+                )
+
+                self.assertIn(
+                    f"Memory: upgraded v{version} to v5.1.0", accepted.stdout
+                )
+                self.assertEqual(self.state(root=root)["bimri_version"], "5.1.0")
+
     def test_exact_v5_0_2_waiter_proves_external_quiescence_is_required(self):
         self.cli("migrate")
         historical = subprocess.run(
@@ -8315,7 +8368,7 @@ class BimriCliTest(unittest.TestCase):
             timeout=60,
         )
 
-        self.assertIn("BIMRI 5.1.1 installed.", result.stdout)
+        self.assertIn("BIMRI 5.1.2 installed.", result.stdout)
         self.assertIn("Existing authority store v5.1.0 verified", result.stdout)
         self.assertIn("Memory preservation: PASSED", result.stdout)
         self.assertEqual(protected_tree_snapshot(self.root), before)
@@ -8323,7 +8376,7 @@ class BimriCliTest(unittest.TestCase):
         runtime = json.loads(
             (bdir / "runtime.local.json").read_text("utf-8")
         )
-        self.assertEqual(runtime["version"], "5.1.1")
+        self.assertEqual(runtime["version"], "5.1.2")
         manifests = list(
             (self.root / ".bimri-update-backups").glob(
                 "*/install-manifest.json"
@@ -8331,9 +8384,14 @@ class BimriCliTest(unittest.TestCase):
         )
         self.assertEqual(len(manifests), 1)
         manifest = json.loads(manifests[0].read_text("utf-8"))
-        self.assertEqual(manifest["engine_release"], "5.1.1")
+        self.assertEqual(manifest["engine_release"], "5.1.2")
         self.assertEqual(manifest["memory_format"], "5.1.0")
-        self.assertEqual(manifest["mode"], "lossless-authority-activation")
+        # v5.1.2: a same-format update keeps the stricter code-only-update
+        # label, which binds the before and after tree and state digests.
+        self.assertEqual(manifest["mode"], "code-only-update")
+        self.assertEqual(manifest["source_memory_format"], "5.1.0")
+        self.assertFalse(manifest["state_activated"])
+        self.assertEqual(manifest["before_state_sha256"], manifest["after_state_sha256"])
         self.assertEqual(manifest["before_tree_digest"], manifest["after_tree_digest"])
         self.assertEqual(manifest["preservation"], "passed")
         self.assertEqual(manifest["protected_write_attempts"], 0)

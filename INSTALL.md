@@ -70,11 +70,12 @@ two paths to its ignore rules explicitly.
    artifact somewhere outside the project. For a v5 target, that snapshot MUST
    include `bimri.md` plus the entire `.bimri/` tree. The lock serializes
    commands; it cannot fence an already-loaded old process waiting to write
-   after the installer exits. For v5.1.0 to v5.1.1, that complete external
-   snapshot is the only rollback after the first v5.1.1 proposal is staged: an
-   older v5.1.0 engine rejects the newer proposal receipt. A store the new
-   engine has only started and closed, with no v5.1.1 proposal, remains readable
-   by v5.1.0.
+   after the installer exits. For a v5.1.0 or v5.1.1 store taking v5.1.2, that
+   complete external snapshot is the only rollback after the first v5.1.2
+   proposal is staged: v5.1.2 accepts receipts stamped v5.1.0, v5.1.1 and
+   v5.1.2, but an older engine rejects the newer proposal receipt. A store the
+   new engine has only started and closed, with no v5.1.2 proposal, remains
+   readable by the older engine.
 3. If Claude Cowork Global Instructions contain a v1-v3 BIMRI block, ask
    the owner to disable or remove it before installation. Those instructions
    directly rewrite the old hot-memory file and must not run alongside v5.
@@ -92,10 +93,19 @@ two paths to its ignore rules explicitly.
    <verified-python> bimri-engine.py install --target /absolute/path/to/the/project --quiescent
    ```
 
+   The installer checks that attestation before it routes on the stored
+   version, so it applies to v5.0 and v5.0.1 stores as well as v5.0.2 and
+   v5.1.x. Without the flag the install exits 2 and creates nothing in the
+   target.
+
 5. Do not replace existing `AGENTS.md` or `CLAUDE.md`. The installer merges a
-   marked BIMRI block and backs up files it upgrades. It packages `legacy/` as
-   inert rollback material and copies BIMRI's MIT notice to `BIMRI-LICENSE`;
-   neither action replaces the target project's root `LICENSE`.
+   marked BIMRI block and backs up files it upgrades. The merge replaces only
+   the text between a `<!-- BIMRI:START -->` marker and the first
+   `<!-- BIMRI:END -->` that follows it with no other start marker between;
+   an orphan start marker in owner prose, and the prose after it, stay in
+   place. It packages `legacy/` as inert rollback material and copies BIMRI's
+   MIT notice to `BIMRI-LICENSE`; neither action replaces the target project's
+   root `LICENSE`.
 6. Existing BIMRI v1-v4 memory migrates automatically and idempotently.
    Migration preserves exact source and backup bytes, records their hashes,
    and stops without overwriting ambiguous or malformed input. Inherited claim
@@ -103,17 +113,27 @@ two paths to its ignore rules explicitly.
    v5 metadata, fits the 4,096-character safety ceiling. Conversion fails
    closed rather than truncating anything that cannot fit losslessly. New and
    edited claims retain the 500-character text limit.
-   Existing v5.0 and v5.0.1 state also upgrades automatically with
-   a byte-preserving backup. A v5.0 upgrade adopts the 12,000-token capacity
-   profile when its limits are still stock; a v5.0.1 upgrade preserves its
-   configured limits.
+   Existing v5.0 and v5.0.1 state upgrades during the same `--quiescent`
+   install with a byte-preserving backup. A v5.0 upgrade adopts the
+   12,000-token capacity profile when its limits are still stock; a v5.0.1
+   upgrade preserves its configured limits. After the state upgrade this route
+   runs the lifecycle repair path: it synchronizes the generated view (a
+   divergent `bimri.md` passes through the manual-edit recovery path and is
+   healed), rebuilds the index and runs repair-capable validation.
    An existing v5.0.2 store takes the lossless v5.1 authority-activation path
    documented below. Root `bimri.md` and every immutable evidence/history
    artifact remain byte-identical. The mutable state is backed up exactly and
    transactionally advanced to v5.1.0 so an old engine fails closed.
 7. Run `<verified-python> bimri-engine.py doctor --read-only` from the updated
    target when you need to repeat the non-mutating audit. Use normal
-   `doctor` only when repair-capable validation is intended.
+   `doctor` only when repair-capable validation is intended, with one
+   exception: after an engine update of a v5.1.x store, run normal `doctor`
+   once from the updated target before any agent session. The new engine
+   binds its audit checkpoint to authority policy version `5.1.2-authority-1`,
+   so the checkpoint the previous engine wrote is a cache miss; that first
+   `doctor` re-proves the store with one full audit, about 35 seconds on a
+   700-run store, and seeds the new checkpoint so the first `hook-start` does
+   not pay for it inside its 90-second timeout.
 8. Confirm the installer wrote both local binding records above; never commit
    them.
 9. Report only:
@@ -211,17 +231,28 @@ and then runs the new read-only audit. Success is reported only with an
 explicit receipt equivalent to:
 
 ```text
-BIMRI 5.1.1 installed.
+BIMRI 5.1.2 installed.
 Existing v5.0.2 hot memory preserved; authority state activated at v5.1.0.
 Accepted head unchanged: V...... <sha256>.
 Memory preservation: PASSED (bimri.md and immutable evidence unchanged).
 ```
 
-If state or accepted-head authority is invalid, package replacement does not
-begin. Sound state/head with damaged governance may receive the recovery tools
-in explicit `installed-recovery-required` mode. The updater never repairs,
-rebuilds, reindexes, truncates, or rewrites memory content as part of
-installation or rollback.
+A same-format update, a v5.1.0 store taking a newer engine, follows the same
+transaction; its second line reads `Existing authority store v5.1.0 verified.`
+and the receipt under `.bimri-update-backups/<timestamp>/` records its `mode`
+as `code-only-update`, while a v5.0.2 activation records
+`lossless-authority-activation`.
+
+If state or accepted-head authority is invalid (unreadable or wrong-version
+state, a missing or mismatched accepted head), package replacement does not
+begin. Sound state/head with damaged governance records, damaged recovery
+evidence, or a divergent `bimri.md` receives the recovery tools in explicit
+`installed-recovery-required` mode: the update completes, the divergent bytes
+stay untouched, the receipt lists the read-only audit errors, and the next
+`start` heals the view as a manual-edit conflict. On this path the updater
+never repairs, rebuilds, reindexes, truncates, or rewrites memory content as
+part of installation or rollback; only the v5.0 and v5.0.1 route in step 6
+runs the lifecycle repair path.
 
 ## Claude Code Hooks
 
@@ -242,9 +273,17 @@ close; then run `doctor`. A zero-output hook is a failed hook even if its
 process reports success. Confirm that the synthetic run is closed before
 reporting the installation complete.
 
-An automatic `hook-close` for an unknown or already-unmapped session is a
-successful no-op. The explicit `close` command remains strict so operator
-mistakes are still visible.
+`hook-start` opens a run only when Claude's payload carries a `session_id` or
+`transcript_path`. A payload with neither, including empty, invalid or
+non-object stdin, is refused with exit 2 and a message ending in
+`[hook-identity-missing]`, and nothing is created; a run opened under an
+invented identity could never be closed by its `SessionEnd` hook. Claude Code
+does not block a session on a `SessionStart` hook exit code, so such a session
+opens without a brief and the explicit `start --actor` command in `AGENTS.md`
+still applies. An automatic `hook-close` for an unknown or already-unmapped
+session is a successful no-op, and the `SessionEnd` reason it records is
+flattened to one line and bounded so it cannot fail the close. The explicit
+`close` command remains strict so operator mistakes are still visible.
 
 The root `hooks-example.json` remains a portable placeholder template. Never
 paste its unresolved placeholder into Claude settings; use only the local

@@ -3,6 +3,144 @@
 This file records the public BIMRI architecture history. Historical instruction
 files are preserved under [`legacy/`](legacy/) and are not current installers.
 
+## 5.1.2
+
+- Kept this release engine-only and defects-only. The authority and
+  mutable-state formats remain v5.1.0, and the readable hot-memory grammar
+  remains v5.0.2. No memory file changes shape, no new owner prompt is added,
+  and the tab-separated output format of `get`, `recall` and `search` is
+  unchanged.
+- Proposal preflight receipts now stamp engine release v5.1.2. This engine
+  accepts receipts written by v5.1.0, v5.1.1 and v5.1.2, but an older v5.1.1
+  engine rejects a store after its first v5.1.2 proposal is staged. Upgrades
+  therefore require a quiescent, complete copy of `bimri.md` and `.bimri/`
+  outside the project; that copy is the rollback boundary.
+- Advanced the authority policy version bound into the audit checkpoint to
+  `5.1.2-authority-1`. A checkpoint written by v5.1.1 is a cache miss under
+  the new policy, so the first command after the update re-proves the store
+  with one full audit, about 35 seconds on a 700-run store, and then publishes
+  a fresh checkpoint. `INSTALL.md` step 7 now asks for one normal `doctor` run
+  from the updated target before any session starts, so that audit is paid
+  there rather than inside the first hook-start's timeout.
+- Memory text, rationale, falsifier, conflict question and journal text may
+  no longer contain U+0085, U+2028 or U+2029. The text validator accepted
+  these Unicode line separators while the hot-memory and run-log parsers split
+  lines on them, so one agent proposal could carry a second, forged entry
+  line, including a forged `[T:confirmed] [SRC:user]` entry, into the accepted
+  head; the next full audit then found a decision naming a revision that did
+  not contain its recorded effect, and the store entered
+  `AUTHORITY RECOVERY NEEDED` with reads and writes blocked (reproduced
+  2026-09-07). The same characters in journal text could make `close` skip
+  writing its `[OUTCOME:...]` and `[CLOSED:...]` markers. The validator now
+  refuses any value that would parse as more than one line. Behavior change
+  for an existing store: a stored value that carries one of these characters
+  is invalid at its next full audit and needs owner repair through the
+  quarantine and restore lane. No known store contains one.
+- A failed full audit at the `sync`, authority `close` and `resolve`
+  boundaries now invalidates the audit checkpoint by advancing the state's
+  audit epoch, with the checkpoint bytes retained as the prior baseline,
+  exactly as `doctor` and the other full-audit boundaries (`status`,
+  task-language and historical recall, `search`, `review`, `index`, `maintain`
+  and `migrate`) already did after the 2026-09-02 ruling. In v5.1.1 those
+  three boundaries wrote the drift receipt and refused without invalidating,
+  so the next `start` printed a clean brief and exact reads kept serving a
+  store whose writes were paused, and a later proposal-free lifecycle `close`
+  republished the checkpoint over the proven damage. A degraded `propose`
+  still invalidates by deleting the checkpoint file; that is the second
+  mechanism and is unchanged. Read-only `doctor`, the quarantine shadow audit,
+  blocked-quarantine and prior-evidence-invalid issues and a strict restore
+  comparison keep their exemptions. Behavior change: a refused `sync`, `close`
+  or `resolve` performs one extra state save, the next `start` prints
+  `AUTHORITY RECOVERY NEEDED`, exact reads refuse until the store is repaired,
+  and a `hook-close` at session end exits 2 on a store the engine has already
+  proved damaged, as in v5.1.0.
+- The `--quiescent` attestation is now checked before version routing for
+  every existing v5 store. In v5.1.1 a v5.0 or v5.0.1 store upgraded to v5.1.0
+  without it and ignored the flag when it was passed, which contradicted the
+  protocol and meant the same store was refused without the flag one command
+  later, once it was at v5.1.0. Behavior change: an install into a v5.0 or
+  v5.0.1 store without `--quiescent` exits 2 with the same handoff message the
+  v5.0.2 and v5.1.0 routes already printed, and creates nothing in the target.
+- `--trust contested` can no longer be authored from the CLI or admitted at
+  proposal preflight. The engine never wrote contested trust itself (only a
+  human-approved resolution writes `confirmed`), so an agent could render a
+  `[T:contested]` line that `review` had nothing to resolve. Contested trust
+  is derived from a conflict record only. Stored records that carry it still
+  parse and validate, so no existing store needs repair.
+- Tier 3 proposals no longer write a false drift receipt. `propose` advanced
+  the pattern counter in `state.json` outside its declared write scope, so
+  every Tier 3 proposal left a state change the next audit could not attribute
+  to a recorded operation and receipted as unexplained drift. The counter now
+  advances when the pattern is accepted, inside the `sync` or `close` scope,
+  and pattern IDs remain monotonic. A receipt v5.1.1 already wrote stays on
+  disk as retained evidence and needs no action.
+- Orphan candidates in the start brief are classified by inactivity rather
+  than start time. A run is a candidate when its last recorded activity, the
+  `last_activity_at` that `journal`, `propose` and `sync` maintain, falling
+  back to `started_at`, is more than 24 hours old; v5.1.1 labeled a run an
+  orphan 24 hours after it started even when it had journaled a second
+  earlier. The brief prints every id while there are five or fewer
+  candidates; above that it prints the count plus the five newest ids and
+  points to `status` for the full list (134 ids cost 500 to 800 tokens on
+  every start of the development store). This is classification only: nothing
+  is closed, stamped or mutated, and `recover-run` still needs the owner's
+  word per run.
+- `hook-start` refuses a payload that carries no `session_id` or
+  `transcript_path` (empty, invalid, non-object or id-less stdin) with exit 2
+  and a message ending in `[hook-identity-missing]`, and creates nothing.
+  v5.1.1 opened a run under an invented identity that the matching
+  `hook-close` could never close, so every such session left an orphan.
+  Claude Code does not block a session on a `SessionStart` hook exit code:
+  the session opens without a brief, the same state as after a lock-busy
+  start, and the explicit `start --actor` in `AGENTS.md` covers it.
+  `hook-close` for an unknown or unmapped session remains a successful no-op.
+  `hook-close` also flattens the `SessionEnd` reason it records (control
+  characters become spaces, whitespace collapses) and bounds it to 200
+  characters, so a long or multi-line reason can no longer make the close
+  exit 2 and leave the run open.
+- `get`, `recall` and `search` accept `--json` and return the full typed
+  record. The tab-separated output prints seven columns (location, key, id,
+  reason, trust, source, text), so a pattern lost its confidence, observation
+  count, evidence ids and falsifier, a Tier 1 or Tier 2 row lost its tier,
+  kind or importance and status, first and last run, tags and pointer, and
+  two pattern generations printed byte-identical in `--history`. The JSON
+  payload is an object with `matches`, `total` and `omitted`; each match
+  carries the seven fields above (the entry text under `text`) plus `tier`,
+  then `kind` for Tier 1, `importance`, `status`, `first_run` and `last_run`
+  for Tier 2, `confidence`, `observations`, `evidence` and `falsifier` for
+  Tier 3, and `tags` and `pointer` for Tiers 1 and 2; a held candidate also
+  reports its `operation`. The tab-separated output is unchanged. Tags and
+  falsifiers are now part of the search text on both output paths, which adds
+  matches and removes none. Exit codes are unchanged: 0 matched, 1 no match,
+  2 error.
+- The installer no longer deletes owner text after an orphan
+  `<!-- BIMRI:START -->` marker. The block-merge pattern matched from the
+  first start marker to the real block's end marker, so a stray marker in
+  owner prose made the next install delete everything between them (the
+  install backup still held the text). The merge now pairs a start marker
+  only with the first end marker that follows it with no other start marker
+  between, so an orphan marker and the prose after it stay in place.
+- The update receipt's `mode` reads `code-only-update` for a same-format
+  update, a v5.1.0 store taking a newer engine. v5.1.1 wrote
+  `lossless-authority-activation` for every existing-store update even when
+  no state was activated, and because terminal receipt validation enforces
+  the unchanged tree and state digests only for `code-only-update` receipts,
+  the mislabel loosened later validation of those receipts. A v5.0.2 to
+  v5.1.0 activation keeps `lossless-authority-activation`.
+- A command whose stdout pipe closes early now exits with its own exit code.
+  On Windows, `start --actor x | head -1` raised at the final stream flush
+  after the command had completed and exited 120.
+- Stated documentation corrections with no engine change. A divergent
+  `bimri.md` does not stop the v5.1 update: the update completes as
+  `installed-recovery-required` with the file untouched, and the next `start`
+  heals the view as a manual-edit conflict, while damaged core state or a
+  head hash mismatch stops the update before any write (`MIGRATION.md` said
+  the opposite). The v5.0 and v5.0.1 upgrade route runs the lifecycle repair
+  path and may heal the view and rebuild the index, unlike the v5.0.2 and
+  v5.1.0 update path. `.bimri/index.tsv` is a derived export that `recall`,
+  `get` and `search` do not read. `REFERENCE.md` now names both checkpoint
+  invalidation mechanisms.
+
 ## 5.1.1
 
 - Kept the performance work as an engine-only patch. The authority and
@@ -21,40 +159,37 @@ files are preserved under [`legacy/`](legacy/) and are not current installers.
   authority-changing writes and explicit audit, review, search, and
   historical-recall boundaries, so an out-of-engine edit to unrelated history
   is seen at the next such boundary rather than on every read.
-- The checkpoint is a derived cache, never an authority record. Divergence
-  from it forces the full semantic audit; when that audit passes over changes
-  the engine cannot attribute to its own recorded operation, the engine
-  first durably records a sealed drift receipt under `.bimri/audit-drift/`
-  — the diverging paths with prior and current hashes (inline up to 2,000
-  entries per section with any remainder counted, the complete delta
-  pinned in a hash-and-size-validated attachment when truncated),
-  unbounded monotonic sequence, bounded to the newest 200 — and only then
-  publishes the new baseline. The written receipt is re-read and fully
-  validated (seal, filename binding, attachments, post-prune existence)
-  before the write counts as success, and deduplication only ever reuses a
-  receipt that validates. A receipt that cannot be recorded keeps the
-  prior checkpoint and surfaces as an error; `doctor` validates every
-  receipt and its attachments and reports damaged evidence instead of
-  trusting it; attachments cited by retained receipts outlive the
-  unreferenced-attachment bound; and a checkpoint whose referenced
-  manifest evidence is missing refuses rebaselining instead of adopting
-  new bytes with no recorded delta. A failed semantic audit
-  refuses into the existing damaged-authority recovery lane and
-  invalidates the checkpoint by advancing the state's audit epoch
-  (owner-ruled 2026-09-02), so the next `start` prints
-  `AUTHORITY RECOVERY NEEDED` and exact reads refuse until the store is
-  repaired, as in v5.1.0. The checkpoint bytes stay on disk as the prior
-  baseline for receipts, quarantine and restore, the same
+- The checkpoint is a derived cache, never an authority record. Divergence from
+  it forces the full semantic audit; when that audit passes over changes the
+  engine cannot attribute to its own recorded operation, the engine first
+  durably records a sealed drift receipt under `.bimri/audit-drift/`, carrying
+  the diverging paths with prior and current hashes (inline up to 2,000 entries
+  per section with any remainder counted, the complete delta pinned in a
+  hash-and-size-validated attachment when truncated), with an unbounded
+  monotonic sequence number and retention bounded to the newest 200, and only
+  then publishes the new baseline. The written receipt is re-read and fully
+  validated (seal, filename binding, attachments, post-prune existence) before
+  the write counts as success, and deduplication only ever reuses a receipt
+  that validates. A receipt that cannot be recorded keeps the prior checkpoint
+  and surfaces as an error; `doctor` validates every receipt and its
+  attachments and reports damaged evidence instead of trusting it; attachments
+  cited by retained receipts outlive the unreferenced-attachment bound; and a
+  checkpoint whose referenced manifest evidence is missing refuses rebaselining
+  instead of adopting new bytes with no recorded delta. A failed semantic audit
+  refuses into the existing damaged-authority recovery lane and invalidates the
+  checkpoint by advancing the state's audit epoch (owner-ruled 2026-09-02), so
+  the next `start` prints `AUTHORITY RECOVERY NEEDED` and exact reads refuse
+  until the store is repaired, as in v5.1.0. The checkpoint bytes stay on disk
+  as the prior baseline for receipts, quarantine and restore, the same
   retained-but-invalid shape a failed resolution leaves; a blocked receipt
-  sink, an open quarantine and a strict restore comparison keep their
-  prior checkpoint readable. Interrupted
-  operations self-heal exactly as in v5.1.0; no drift or crash state ever
-  requires hand deletion of derived files. `audit-blocked.json` now appears
-  only while an owner-approved quarantine holds its pre-repair baseline, and
-  restoration clears it. Owner-ruled 2026-08-27: this receipts contract
-  replaces the earlier normative fail-closed rule in the protocol, and the
-  current-only exact recall plus deferred warm-read verification below are
-  confirmed semantics.
+  sink, an open quarantine and a strict restore comparison keep their prior
+  checkpoint readable. Interrupted operations self-heal exactly as in v5.1.0;
+  no drift or crash state ever requires hand deletion of derived files.
+  `audit-blocked.json` now appears only while an owner-approved quarantine
+  holds its pre-repair baseline, and restoration clears it. Owner-ruled
+  2026-08-27: this receipts contract replaces the earlier normative fail-closed
+  rule in the protocol, and the current-only exact recall plus deferred
+  warm-read verification below are confirmed semantics.
 - An obstruction on the audit-transition marker path that is not a regular
   file or symlink is a hard error on every surface; doctor never reports
   health past it, and the checkpoint is left untouched until the owner
@@ -72,8 +207,8 @@ files are preserved under [`legacy/`](legacy/) and are not current installers.
   entry-point target and is recorded as a known, owner-accepted deviation
   (2026-08-27); incremental authenticated manifests are the planned v5.2
   fix. Reads and lifecycle bookkeeping are unaffected.
-- Unknown files inside witnessed roots — crash-orphaned engine temp files
-  included — are never deleted or blocked on. They enter the audited
+- Unknown files inside witnessed roots, crash-orphaned engine temp files
+  included, are never deleted or blocked on. They enter the audited
   inventory, cost at most one full re-audit when they first appear, and stay
   visible through drift receipts and doctor litter reporting. The engine
   cannot prove a temp-named file is its own, so it preserves it.
