@@ -28,6 +28,7 @@ import argparse
 import copy
 import contextlib
 import datetime as dt
+import errno
 import hashlib
 import json
 import os
@@ -4220,8 +4221,21 @@ def normalize_audit_manifest(manifest):
     return normalized
 
 
-def validate_sealed_audit_witness_record(witness):
-    """Validate a compact checkpoint record from live or blocked evidence."""
+def audit_witness_uses_current_policy(witness):
+    return (
+        witness.get("engine_version") == ENGINE_VERSION
+        and witness.get("memory_format_version") == MEMORY_FORMAT_VERSION
+        and witness.get("policy_version") == AUTHORITY_POLICY_VERSION
+    )
+
+
+def validate_sealed_audit_witness_record(witness, allow_prior_policy=False):
+    """Validate a checkpoint, optionally retaining known prior recovery evidence.
+
+    A 5.1.1 seal remains evidence of an interrupted operation or quarantine.
+    It never satisfies the current read policy; only a full audit can do that.
+    Unknown engine/policy pairs remain invalid even on the recovery path.
+    """
     try:
         expected_fields = {
             "witness_schema", "engine_version", "memory_format_version",
@@ -4238,9 +4252,15 @@ def validate_sealed_audit_witness_record(witness):
             return None
         if (
             witness.get("witness_schema") != AUDIT_WITNESS_SCHEMA
-            or witness.get("engine_version") != ENGINE_VERSION
             or witness.get("memory_format_version") != MEMORY_FORMAT_VERSION
-            or witness.get("policy_version") != AUTHORITY_POLICY_VERSION
+            or not (
+                audit_witness_uses_current_policy(witness)
+                or (
+                    allow_prior_policy
+                    and witness.get("engine_version") == V5_1_1_ENGINE_VERSION
+                    and witness.get("policy_version") == "5.1.1-authority-1"
+                )
+            )
         ):
             return None
         parse_timestamp(witness.get("created_at"), "audit witness timestamp")
@@ -4295,7 +4315,7 @@ def reconcile_engine_checkpoint_for_exact_read(paths):
     )
 
 
-def load_sealed_audit_witness(paths):
+def load_sealed_audit_witness(paths, allow_prior_policy=False):
     """Load the compact checkpoint without consulting authority/history files."""
     path = paths.audit_witness
     if path_is_redirected(path) or not path.is_file():
@@ -4304,7 +4324,9 @@ def load_sealed_audit_witness(paths):
         witness = read_json_strict(path, "audit witness")
     except (BimriError, OSError, UnicodeError, ValueError, TypeError):
         return None
-    return validate_sealed_audit_witness_record(witness)
+    return validate_sealed_audit_witness_record(
+        witness, allow_prior_policy=allow_prior_policy
+    )
 
 
 def load_valid_audit_witness(paths, state, state_hash=None):
@@ -4499,7 +4521,9 @@ def load_audit_transition(paths):
         raise BimriError("audit transition scope is invalid.")
     if marker.get("kind") == "authority":
         validate_frozen_authority_transition_scope(marker["scope"])
-    prior = validate_sealed_audit_witness_record(marker.get("prior_witness"))
+    prior = validate_sealed_audit_witness_record(
+        marker.get("prior_witness"), allow_prior_policy=True
+    )
     if (
         prior is None
         or marker.get("prior_witness_hash") != prior.get("witness_hash")
@@ -4584,7 +4608,7 @@ def write_audit_transition(paths, marker):
 
 def referenced_audit_manifest_hashes(paths):
     hashes = set()
-    witness = load_sealed_audit_witness(paths)
+    witness = load_sealed_audit_witness(paths, allow_prior_policy=True)
     if witness is not None:
         hashes.add(witness["manifest_hash"])
     try:
@@ -5062,6 +5086,13 @@ def write_audit_witness(paths, state, conflicts=None, manifest=None, run_facts=N
             "manifest_count": len(manifest),
             "proposal_runs": proposal_runs,
         }
+        if frozen_completion is not None:
+            # Complete the exact old transaction before publishing a new
+            # policy verdict. Reconciliation has audited its current content,
+            # but its frozen closure must not be rewritten during recovery.
+            frozen_witness = frozen_completion["witness"]
+            witness["engine_version"] = frozen_witness["engine_version"]
+            witness["policy_version"] = frozen_witness["policy_version"]
         witness["witness_hash"] = audit_record_seal(witness, "witness_hash")
         if (
             frozen_completion is not None
@@ -5089,7 +5120,9 @@ def write_audit_witness(paths, state, conflicts=None, manifest=None, run_facts=N
         if paths.audit_witness.exists() and paths.audit_witness.is_dir():
             raise BimriError("audit witness destination is a directory.")
         atomic_write_json(paths.audit_witness, witness)
-        paths.validated_audit_witness = witness
+        paths.validated_audit_witness = (
+            witness if audit_witness_uses_current_policy(witness) else None
+        )
         return True
     except (BimriError, OSError, UnicodeError, ValueError, TypeError):
         paths.validated_audit_witness = None
@@ -5214,7 +5247,9 @@ def validate_frozen_authority_transition_scope(scope):
         if (
             not isinstance(state_file_hash, str)
             or not HASH_RE.fullmatch(state_file_hash)
-            or validate_sealed_audit_witness_record(completion.get("witness"))
+            or validate_sealed_audit_witness_record(
+                completion.get("witness"), allow_prior_policy=True
+            )
             is None
         ):
             raise BimriError("audit transition completion is invalid.")
@@ -5389,7 +5424,9 @@ def publish_lifecycle_checkpoint(paths, state, marker):
     witness["witness_hash"] = audit_record_seal(witness, "witness_hash")
     ensure_audit_manifest_generation(paths, prior)
     atomic_write_json(paths.audit_witness, witness)
-    paths.validated_audit_witness = witness
+    paths.validated_audit_witness = (
+        witness if audit_witness_uses_current_policy(witness) else None
+    )
     clear_audit_transition(paths)
     paths.pending_checkpoint_witness = None
     prune_audit_manifest_generations(paths)
@@ -5781,7 +5818,9 @@ def reconcile_audit_transition(paths, state):
             # Marker durable, first state replace not reached.
             atomic_write_json(paths.audit_witness, prior)
             clear_audit_transition(paths)
-            paths.validated_audit_witness = prior
+            paths.validated_audit_witness = (
+                prior if audit_witness_uses_current_policy(prior) else None
+            )
             prune_audit_manifest_generations(paths)
             return state
         if (
@@ -6046,7 +6085,9 @@ def load_audit_blocked_record(paths):
         if prior_hash is not None or record.get("prior_manifest") is not None:
             raise BimriError("audit blocked prior witness hash is orphaned.")
     else:
-        validated = validate_sealed_audit_witness_record(prior_witness)
+        validated = validate_sealed_audit_witness_record(
+            prior_witness, allow_prior_policy=True
+        )
         if (
             validated is None
             or prior_hash != validated.get("witness_hash")
@@ -6324,7 +6365,8 @@ def governance_snapshot(
         witness = load_valid_audit_witness(paths, state)
         if witness is not None:
             return [], []
-    live_prior_witness = load_sealed_audit_witness(paths)
+    # Prior-policy seals are comparison evidence, never a cached audit pass.
+    live_prior_witness = load_sealed_audit_witness(paths, allow_prior_policy=True)
     blocked_prior_witness = load_audit_blocked_prior_witness(paths)
     blocked_prior_manifest = load_audit_blocked_prior_manifest(paths)
     if prior_witness_override is not None:
@@ -11791,7 +11833,9 @@ def cmd_quarantine_authority(
     with engine_lock(paths):
         state = load_or_initialize(paths)
         blocked_prior = load_audit_blocked_prior_witness(paths)
-        recovery_prior = blocked_prior or load_sealed_audit_witness(paths)
+        recovery_prior = blocked_prior or load_sealed_audit_witness(
+            paths, allow_prior_policy=True
+        )
         recovery_prior_manifest = (
             load_audit_blocked_prior_manifest(paths)
             if blocked_prior is not None
@@ -12145,7 +12189,7 @@ def cmd_restore_authority(
         state = load_or_initialize(paths)
         repair_prior_witness = (
             load_audit_blocked_prior_witness(paths)
-            or load_sealed_audit_witness(paths)
+            or load_sealed_audit_witness(paths, allow_prior_policy=True)
         )
         repair_prior_manifest = load_audit_blocked_prior_manifest(paths)
         path = authority_record_path(paths, kind, record_id)
@@ -16122,34 +16166,89 @@ def main(argv=None):
     return 0
 
 
-def flush_console_streams():
-    """Drain stdout and stderr without turning a closed pipe into exit 120.
-
-    A consumer such as ``start --actor x | head -1`` closes its end of the
-    pipe early. The interpreter's own flush at shutdown then fails with
-    OSError (EINVAL on Windows, EPIPE elsewhere) and Python reports exit
-    status 120 in place of the command's code (retrieval red team
-    2026-09-07, RT-8). After a failed flush the buffered bytes are drained
-    into the null device so the shutdown flush has nothing left to fail on.
-    """
-    for stream in (sys.stdout, sys.stderr):
+def is_closed_console_pipe(stream, error):
+    if isinstance(error, BrokenPipeError) or getattr(error, "errno", None) == errno.EPIPE:
+        return True
+    # Windows can report EINVAL for a disconnected pipe. EINVAL on a regular
+    # output file is a real failure, so require an actual pipe descriptor.
+    if os.name == "nt" and getattr(error, "errno", None) == errno.EINVAL:
         try:
-            stream.flush()
-            continue
-        except (OSError, ValueError):
-            pass
-        try:
-            null = os.open(os.devnull, os.O_WRONLY)
-            try:
-                os.dup2(null, stream.fileno())
-            finally:
-                os.close(null)
-            stream.flush()
+            return stat.S_ISFIFO(os.fstat(stream.fileno()).st_mode)
         except (OSError, ValueError, AttributeError):
             pass
+    return False
+
+
+def discard_console_buffer(stream):
+    """Drain failed output only after its pipe closed or failure was recorded."""
+    if isinstance(stream, PipeTolerantConsole):
+        stream.discard_output = True
+        stream = stream.stream
+    try:
+        null = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(null, stream.fileno())
+        finally:
+            os.close(null)
+        stream.flush()
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+class PipeTolerantConsole:
+    """Let commands finish when a pipe reader leaves, including mid-command."""
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.discard_output = False
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+    def write(self, text):
+        if not self.discard_output:
+            try:
+                return self.stream.write(text)
+            except OSError as exc:
+                if not is_closed_console_pipe(self.stream, exc):
+                    raise
+                discard_console_buffer(self)
+        return len(text)
+
+    def flush(self):
+        if not self.discard_output:
+            try:
+                self.stream.flush()
+            except OSError as exc:
+                if not is_closed_console_pipe(self.stream, exc):
+                    raise
+                discard_console_buffer(self)
+
+
+def flush_console_streams():
+    """Return false for real output failures; preserve closed-pipe exit codes."""
+    succeeded = True
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None:
+            continue
+        try:
+            stream.flush()
+        except (OSError, ValueError) as exc:
+            if not is_closed_console_pipe(stream, exc):
+                succeeded = False
+                with contextlib.suppress(OSError, ValueError):
+                    print(f"BIMRI ERROR: output failed: {exc}", file=sys.stderr)
+            # Avoid Python replacing the chosen failure code with exit 120.
+            discard_console_buffer(stream)
+    return succeeded
 
 
 if __name__ == "__main__":
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name)
+        if stream is not None:
+            setattr(sys, name, PipeTolerantConsole(stream))
     exit_code = main()
-    flush_console_streams()
+    if not flush_console_streams():
+        exit_code = exit_code or 2
     sys.exit(exit_code)

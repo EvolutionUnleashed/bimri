@@ -303,7 +303,9 @@ release), accepted head, and canonical current-memory state. A checkpoint
 written under an earlier engine or policy version is a cache miss: the first
 command after an engine update re-proves the store with one full audit, about
 35 seconds on a 700-run store, and publishes a fresh checkpoint, which is why
-`INSTALL.md` asks for one `doctor` run before the first session. Detailed
+`INSTALL.md` asks for one `doctor` run before the first session. Recovery
+records may still use sealed v5.1.1 checkpoints as comparison
+evidence; they cannot use them as a current-policy audit pass. Detailed
 path-and-SHA-256 evidence for the last full audit lives separately in
 `.bimri/audit-manifest.json`, so a warm exact lookup does not parse or hash the
 historical inventory. Neither file stores memory, conflicts, or held

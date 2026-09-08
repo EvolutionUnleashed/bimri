@@ -363,6 +363,15 @@ def main():
             return original(path, content)
 
         engine.atomic_write_text = fail_hot_write
+    elif mode == "lifecycle_crash_before_log":
+        original = engine.exclusive_write_text
+
+        def crash_before_run_log(path, content):
+            if Path(path).parent == root / ".bimri" / "log":
+                os._exit(110)
+            return original(path, content)
+
+        engine.exclusive_write_text = crash_before_run_log
     elif mode == "witness_crash_before_replace":
         original = engine.os.replace
         witness = (root / ".bimri" / "audit-witness.json").resolve()

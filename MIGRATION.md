@@ -340,6 +340,14 @@ under authority policy version `5.1.2-authority-1` with one full audit, about
 35 seconds on a 700-run store; run `doctor` once before any session so that
 audit seeds the checkpoint outside a hook timeout.
 
+Existing v5.1.1 quarantine and interrupted-operation records retain their
+sealed checkpoint evidence. The updated engine can finish a recorded lifecycle
+write, reconcile an authority completion, and validate an owner-approved
+restoration against the old baseline. It then audits under the new policy
+before enabling warm reads. The update itself does not resolve quarantines
+or approve replacements; unknown policy versions and damaged seals still
+refuse recovery through those records.
+
 Two validation changes in v5.1.2 can touch an existing store. A stored value
 that contains U+0085, U+2028 or U+2029 in a field the engine validates (memory
 text, rationale, falsifier, conflict question, or the journal of an active

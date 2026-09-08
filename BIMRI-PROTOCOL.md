@@ -123,7 +123,11 @@ Reference-engine note (non-normative): engine v5.1.2 maintains a compact
 `audit-witness.json` checkpoint and separate `audit-manifest.json` path-and-hash
 evidence for a successful full integrity audit. The checkpoint binds the engine
 release and an authority policy version, so an engine update makes the
-previous checkpoint a cache miss that the next command re-proves. Current-only
+previous checkpoint a cache miss that the next command re-proves. Sealed
+v5.1.1 checkpoints remain valid as comparison evidence in quarantine and
+interrupted-operation records. Recovering those records does not make an old
+policy checkpoint eligible for current reads; the new policy still requires
+a full semantic audit. Current-only
 reads may validate the checkpoint, accepted head, current state, and one
 selected cold binding without traversing historical authority.
 Authority-changing writes (`propose`, `sync`, authority `close`, `resolve`) and

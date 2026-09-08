@@ -22,6 +22,12 @@ files are preserved under [`legacy/`](legacy/) and are not current installers.
   a fresh checkpoint. `INSTALL.md` step 7 now asks for one normal `doctor` run
   from the updated target before any session starts, so that audit is paid
   there rather than inside the first hook-start's timeout.
+- Sealed v5.1.1 checkpoints embedded in quarantine and interrupted-operation
+  records remain readable as recovery evidence. A lifecycle recovery finishes
+  its exact state/log write, and an authority recovery preserves its frozen
+  completion before the new policy audit publishes a v5.1.2 checkpoint.
+  Old evidence cannot authorize a warm read or bypass the new text validator;
+  unrelated drift still blocks an owner-approved restoration.
 - Memory text, rationale, falsifier, conflict question and journal text may
   no longer contain U+0085, U+2028 or U+2029. The text validator accepted
   these Unicode line separators while the hot-memory and run-log parsers split
@@ -128,8 +134,10 @@ files are preserved under [`legacy/`](legacy/) and are not current installers.
   the mislabel loosened later validation of those receipts. A v5.0.2 to
   v5.1.0 activation keeps `lossless-authority-activation`.
 - A command whose stdout pipe closes early now exits with its own exit code.
-  On Windows, `start --actor x | head -1` raised at the final stream flush
-  after the command had completed and exited 120.
+  This covers writes during the command and the final flush, with buffered
+  and unbuffered output. A disconnected reader no longer interrupts a command
+  after its state changes. Real output failures, including a full disk, still
+  return a nonzero exit code and report an error when stderr is available.
 - Stated documentation corrections with no engine change. A divergent
   `bimri.md` does not stop the v5.1 update: the update completes as
   `installed-recovery-required` with the file untouched, and the next `start`

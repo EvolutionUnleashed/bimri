@@ -8,7 +8,9 @@ retrieval, installer) and each one failed on the 5.1.1 engine.
 
 import argparse
 import datetime as dt
+import errno
 import importlib.util
+import io
 import json
 import re
 import shutil
@@ -17,6 +19,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
@@ -54,11 +57,12 @@ class V512DefectsTest(unittest.TestCase):
         self._temp.cleanup()
 
     def cli(
-        self, *arguments, root=None, input_text=None, check=True, timeout=120
+        self, *arguments, root=None, input_text=None, check=True, timeout=120,
+        engine=None,
     ):
         command = [
             sys.executable,
-            str(ENGINE),
+            str(engine or ENGINE),
             "--root",
             str(root or self.root),
             *map(str, arguments),
@@ -752,29 +756,72 @@ class V512DefectsTest(unittest.TestCase):
     # ---- retrieval RT-8: a consumer that closes the pipe early ---------------
 
     def test_closed_stdout_pipe_keeps_the_command_exit_code(self):
-        payload = json.dumps({"session_id": "piped"})
-        opened = self.cli("hook-start", input_text=payload)
-        run_id = RUN_RE.search(opened.stdout).group(1)
-        # A resumed hook-start prints only the brief, and only into the
-        # block buffer, so every byte reaches the pipe at exit. Closing the
-        # read end before stdin is delivered makes that exit-time flush
-        # fail deterministically: Python 3 reported exit status 120 here.
-        proc = subprocess.Popen(
-            [sys.executable, str(ENGINE), "--root", str(self.root), "hook-start"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        proc.stdout.close()
-        proc.stdin.write(payload)
-        proc.stdin.close()
-        stderr = proc.stderr.read()
-        self.assertEqual(proc.wait(timeout=120), 0, stderr)
-        self.assertEqual(stderr, "")
-        self.assertEqual(set(self.state()["active_runs"]), {run_id})
-        closed = self.cli("hook-close", input_text=payload)
-        self.assertIn(f"run {run_id} closed", closed.stdout)
+        for resumed in (False, True):
+            for unbuffered in (False, True):
+                with self.subTest(resumed=resumed, unbuffered=unbuffered):
+                    payload = json.dumps({"session_id": f"pipe-{resumed}-{unbuffered}"})
+                    run_id = None
+                    if resumed:
+                        opened = self.cli("hook-start", input_text=payload)
+                        run_id = RUN_RE.search(opened.stdout).group(1)
+                    # Deliver stdin only after closing the read end. This
+                    # covers writes inside start as well as the shutdown flush.
+                    command = [sys.executable]
+                    if unbuffered:
+                        command.append("-u")
+                    command += [str(ENGINE), "--root", str(self.root), "hook-start"]
+                    with subprocess.Popen(
+                        command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, text=True,
+                    ) as proc:
+                        proc.stdout.close()
+                        proc.stdin.write(payload)
+                        proc.stdin.close()
+                        stderr = proc.stderr.read()
+                        self.assertEqual(proc.wait(timeout=120), 0, stderr)
+                    self.assertEqual(stderr, "")
+                    active = set(self.state()["active_runs"])
+                    self.assertEqual(len(active), 1)
+                    if run_id is not None:
+                        self.assertEqual(active, {run_id})
+                    run_id = active.pop()
+                    closed = self.cli("hook-close", input_text=payload)
+                    self.assertIn(f"run {run_id} closed", closed.stdout)
+
+    def test_real_output_failure_is_not_silenced(self):
+        engine = load_engine_module("bimri_v512_output_failure")
+
+        class FullOutput(io.StringIO):
+            def flush(self):
+                raise OSError(errno.ENOSPC, "No space left on output device")
+
+        output = engine.PipeTolerantConsole(FullOutput())
+        errors = io.StringIO()
+        with mock.patch.object(sys, "stdout", output), mock.patch.object(sys, "stderr", errors):
+            output.write("buffered result")
+            self.assertFalse(engine.flush_console_streams())
+        self.assertIn("output failed", errors.getvalue())
+        self.assertIn("No space left", errors.getvalue())
+
+        class FailingOutput(io.StringIO):
+            def write(self, text):
+                raise OSError(errno.EIO, "Output device failed")
+
+        output = engine.PipeTolerantConsole(FailingOutput())
+        with self.assertRaises(OSError):
+            output.write("result")
+        self.assertFalse(output.discard_output)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "requires /dev/full")
+    def test_full_output_device_exits_nonzero(self):
+        self.cli("migrate")
+        with open("/dev/full", "wb") as output:
+            result = subprocess.run(
+                [sys.executable, str(ENGINE), "--root", str(self.root), "status"],
+                stdout=output, stderr=subprocess.PIPE, text=True, timeout=120,
+            )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("output failed", result.stderr)
 
     # ---- release identity ----------------------------------------------------
 
@@ -843,6 +890,16 @@ class V512DefectsTest(unittest.TestCase):
         # witness for this engine: the warm path reads it as absent, which is
         # the cache miss that forces the one-time re-proof below.
         self.assertIsNone(engine.load_sealed_audit_witness(engine.Paths(self.root)))
+        self.assertIsNotNone(engine.load_sealed_audit_witness(
+            engine.Paths(self.root), allow_prior_policy=True,
+        ))
+        for version, policy in (("5.1.1", "unknown"), ("9.9.9", "5.1.1-authority-1")):
+            unsupported = dict(witness, engine_version=version, policy_version=policy)
+            unsupported.pop("witness_hash")
+            unsupported["witness_hash"] = _sha256_json(unsupported)
+            self.assertIsNone(engine.validate_sealed_audit_witness_record(
+                unsupported, allow_prior_policy=True,
+            ))
 
         served = self.cli("get", "--key", "policy.key")
         self.assertIn("Checkpoint probe.", served.stdout)
@@ -852,6 +909,138 @@ class V512DefectsTest(unittest.TestCase):
         started = self.cli("start", "--actor", "after-reprove")
         self.assertNotIn("AUTHORITY RECOVERY NEEDED", started.stdout)
         self.assertIn("PASSED", self.cli("doctor", "--read-only").stdout)
+
+    def prior_engine(self):
+        """Use the actual released 5.1.1 source, never fabricated recovery seals."""
+        path = self.workspace / "engine-5.1.1.py"
+        if not path.exists():
+            result = subprocess.run(
+                ["git", "-c", f"safe.directory={REPOSITORY.as_posix()}",
+                 "show", "7e0dec1675506add69d6b91eca48a64cdcac65a2:bimri-engine.py"],
+                cwd=REPOSITORY, capture_output=True, timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(b'ENGINE_VERSION = "5.1.1"', result.stdout)
+            path.write_bytes(result.stdout)
+        return path
+
+    def seed_prior_store(self):
+        old = self.prior_engine()
+        opened = self.cli("start", "--actor", "prior-engine", engine=old)
+        run = RUN_RE.search(opened.stdout).group(1)
+        proposed = self.cli(
+            "propose", "--run", run, "--tier", "2", "--new-subject",
+            "--key", "upgrade.seed", "--text", "Preserved prior value.", engine=old,
+        )
+        proposal = PROPOSAL_RE.search(proposed.stdout).group(0)
+        self.cli("sync", "--run", run, engine=old)
+        return run, proposal
+
+    def crash_prior_command(self, mode, *arguments):
+        result = subprocess.run(
+            [sys.executable, str(REPOSITORY / "tests" / "crash_worker.py"),
+             str(self.prior_engine()), mode, str(self.root), *arguments],
+            text=True, capture_output=True, timeout=120,
+        )
+        self.assertEqual(result.returncode, 110, result.stdout + result.stderr)
+        marker = json.loads(self.root.joinpath(".bimri", "audit-transition.json").read_text("utf-8"))
+        self.assertEqual(marker["prior_witness"]["engine_version"], "5.1.1")
+        return marker
+
+    def assert_upgrade_reproved(self):
+        self.assertFalse(self.root.joinpath(".bimri", "audit-transition.json").exists())
+        self.assertEqual(self.witness()["engine_version"], "5.1.2")
+        self.assertEqual(self.witness()["policy_version"], "5.1.2-authority-1")
+        self.assertIn("PASSED", self.cli("doctor", "--read-only").stdout)
+        self.assertEqual(list(self.root.joinpath(".bimri", "audit-drift").glob("*.json")), [])
+
+    def test_prior_policy_start_recovers_missing_run_log(self):
+        self.seed_prior_store()
+        marker = self.crash_prior_command(
+            "lifecycle_crash_before_log", "start", "--actor", "interrupted-start",
+        )
+        log = self.root / marker["log_path"]
+        self.assertFalse(log.exists())
+        self.assertIn(marker["run_id"], self.state()["active_runs"])
+        engine = load_engine_module("bimri_v512_prior_lifecycle")
+        paths = engine.Paths(self.root)
+        engine.reconcile_engine_checkpoint_for_exact_read(paths)
+        self.assertEqual(log.read_text("utf-8"), marker["log_append"])
+        self.assertIsNone(paths.validated_audit_witness)
+        self.assertIsNone(engine.load_sealed_audit_witness(paths))
+        self.assertIn("Preserved prior value.", self.cli("get", "--key", "upgrade.seed").stdout)
+        self.assert_upgrade_reproved()
+
+    def test_prior_policy_close_recovers_and_reproves(self):
+        self.seed_prior_store()
+        opened = self.cli("start", "--actor", "empty-prior-run", engine=self.prior_engine())
+        run = RUN_RE.search(opened.stdout).group(1)
+        self.crash_prior_command(
+            "witness_crash_before_replace", "close", "--run", run,
+            "--outcome", "success", "--summary", "Interrupted prior close.",
+        )
+        self.assertNotIn(run, self.state()["active_runs"])
+        self.assertIn("Preserved prior value.", self.cli("get", "--key", "upgrade.seed").stdout)
+        self.assertIn(f"[CLOSED:{run} ", self.root.joinpath(".bimri", "log", f"{run}.md").read_text("utf-8"))
+        self.assert_upgrade_reproved()
+
+    def test_prior_policy_authority_completion_recovers_and_reproves(self):
+        run, _proposal = self.seed_prior_store()
+        self.cli(
+            "propose", "--run", run, "--tier", "2", "--new-subject",
+            "--key", "upgrade.committed", "--text", "Completed prior transaction.",
+            engine=self.prior_engine(),
+        )
+        marker = self.crash_prior_command("witness_crash_before_replace", "sync", "--run", run)
+        self.assertEqual(marker["scope"]["completion"]["witness"]["engine_version"], "5.1.1")
+        self.assertIn("Completed prior transaction.", self.cli("get", "--key", "upgrade.committed").stdout)
+        self.assert_upgrade_reproved()
+
+    def test_prior_policy_quarantine_restores_without_blessing_other_drift(self):
+        _run, proposal = self.seed_prior_store()
+        path = self.root.joinpath(".bimri", "proposals", f"{proposal}.json")
+        valid_bytes = path.read_bytes()
+        path.write_bytes(b"{damaged prior proposal")
+        self.cli(
+            "quarantine-authority", "--kind", "proposal", "--id", proposal,
+            "--human-approved", engine=self.prior_engine(),
+        )
+        blocked_path = self.root.joinpath(".bimri", "audit-blocked.json")
+        blocked_bytes = blocked_path.read_bytes()
+        blocked = json.loads(blocked_bytes)
+        self.assertEqual(blocked["prior_witness"]["engine_version"], "5.1.1")
+        replacement = self.workspace / "reviewed-proposal.json"
+        replacement.write_bytes(valid_bytes)
+        unrelated = self.root.joinpath(".bimri", "archive", "unrelated.bin")
+        unrelated.write_bytes(b"unrelated drift")
+        arguments = (
+            "restore-authority", "--kind", "proposal", "--id", proposal,
+            "--from", str(replacement), "--human-approved",
+        )
+        refused = self.cli(*arguments, check=False)
+        self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+        self.assertIn("unrelated.bin", refused.stdout + refused.stderr)
+        self.assertEqual(blocked_path.read_bytes(), blocked_bytes)
+        self.assertEqual(path.read_bytes(), valid_bytes)
+        unrelated.unlink()
+        self.cli(*arguments)
+        self.assertFalse(blocked_path.exists())
+        self.assertIn("Preserved prior value.", self.cli("get", "--key", "upgrade.seed").stdout)
+        self.assert_upgrade_reproved()
+
+    def test_prior_policy_evidence_cannot_bypass_new_text_validation(self):
+        run, _proposal = self.seed_prior_store()
+        self.cli(
+            "propose", "--run", run, "--tier", "2", "--new-subject",
+            "--key", "upgrade.invalid", "--text", "Old accepted value.",
+            "--rationale", "Old rationale\u2028with a separator.", engine=self.prior_engine(),
+        )
+        self.crash_prior_command("witness_crash_before_replace", "sync", "--run", run)
+        refused = self.cli("get", "--key", "upgrade.invalid", check=False)
+        self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+        self.assertIn("authority recovery is required", refused.stderr)
+        engine = load_engine_module("bimri_v512_prior_invalid")
+        self.assertIsNone(engine.load_valid_audit_witness(engine.Paths(self.root), self.state()))
 
     def test_code_update_receipts_from_5_1_1_are_accepted(self):
         self.cli("migrate")
