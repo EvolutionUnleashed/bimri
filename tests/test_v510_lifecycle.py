@@ -3347,7 +3347,7 @@ class V510LifecycleTest(unittest.TestCase):
             timeout=120,
         )
 
-        self.assertIn("BIMRI 5.1.1 installed", installed.stdout)
+        self.assertIn("BIMRI 5.1.2 installed", installed.stdout)
         self.assertIn("Memory preservation: PASSED", installed.stdout)
         self.assertEqual(old_receipt_path.read_bytes(), old_receipt_bytes)
         self.assertEqual(self.root.joinpath("bimri.md").read_bytes(), hot_bytes)
@@ -3373,7 +3373,7 @@ class V510LifecycleTest(unittest.TestCase):
         self.assertTrue(backed_up_states)
         self.assertIn(old_state_bytes, [path.read_bytes() for path in backed_up_states])
         self.assertIn(
-            'ENGINE_VERSION = "5.1.1"',
+            'ENGINE_VERSION = "5.1.2"',
             self.root.joinpath("bimri-engine.py").read_text("utf-8"),
         )
 
@@ -3391,7 +3391,7 @@ class V510LifecycleTest(unittest.TestCase):
             self.protected_snapshot(self.root), protected_after_install
         )
         status = self.cli("status", engine=installed_engine, root=self.root)
-        self.assertIn("BIMRI engine v5.1.1", status.stdout)
+        self.assertIn("BIMRI engine v5.1.2", status.stdout)
 
         def without_derived_audit(snapshot):
             prefixes = (
@@ -3439,7 +3439,7 @@ class V510LifecycleTest(unittest.TestCase):
             root=REPOSITORY,
             timeout=120,
         )
-        self.assertIn("BIMRI 5.1.1 installed", repeated.stdout)
+        self.assertIn("BIMRI 5.1.2 installed", repeated.stdout)
         self.assertIn("Memory preservation: PASSED", repeated.stdout)
         self.assertEqual(
             self.root.joinpath(".bimri", "state.json").read_bytes(),
@@ -3490,7 +3490,7 @@ class V510LifecycleTest(unittest.TestCase):
                 self.assertEqual(
                     interrupted["status"], "prepared-for-authority-activation"
                 )
-                self.assertEqual(interrupted["engine_release"], "5.1.1")
+                self.assertEqual(interrupted["engine_release"], "5.1.2")
                 self.assertEqual(interrupted["memory_format"], "5.1.0")
                 interrupted["engine_release"] = "5.1.0"
                 manifests[0].write_text(
@@ -3518,7 +3518,7 @@ class V510LifecycleTest(unittest.TestCase):
                     root=REPOSITORY,
                     timeout=120,
                 )
-                self.assertIn("BIMRI 5.1.1 installed", retry.stdout)
+                self.assertIn("BIMRI 5.1.2 installed", retry.stdout)
                 self.assertEqual(self.state(case_root)["bimri_version"], "5.1.0")
                 self.assertEqual(case_root.joinpath("bimri.md").read_bytes(), hot_bytes)
                 doctor = self.cli(
@@ -3583,7 +3583,7 @@ class V510LifecycleTest(unittest.TestCase):
             root=REPOSITORY,
             timeout=120,
         )
-        self.assertIn("BIMRI 5.1.1 installed", retry.stdout)
+        self.assertIn("BIMRI 5.1.2 installed", retry.stdout)
         self.assertEqual(self.state()["bimri_version"], "5.1.0")
         self.assertEqual(self.root.joinpath("bimri.md").read_bytes(), hot_bytes)
         doctor = self.cli(
@@ -3688,7 +3688,7 @@ class V510LifecycleTest(unittest.TestCase):
             root=REPOSITORY,
             timeout=120,
         )
-        self.assertIn("BIMRI 5.1.1 installed", retry.stdout)
+        self.assertIn("BIMRI 5.1.2 installed", retry.stdout)
         self.assertEqual(self.state()["bimri_version"], "5.1.0")
         self.assertEqual(self.root.joinpath("bimri.md").read_bytes(), hot_bytes)
         self.assertEqual(

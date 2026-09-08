@@ -1,18 +1,19 @@
 # BIMRI Migration and the v5.1.0 Lifecycle Upgrade
 
-Engine v5.1.1 uses authority format v5.1.0 while retaining the readable v5.0.2
-hot-memory grammar. The upgrade from v5.1.0 is one-way: v5.1.1 stamps its
-own engine release into proposal preflight receipts, and every proposal —
-pending or decided — remains an immutable authority record that a v5.1.0
-engine keeps validating. Once any v5.1.1 proposal has been staged, the
-v5.1.0 engine's `status`, `doctor`, `recall` and `sync` refuse the store
+Engine v5.1.2 uses authority format v5.1.0 while retaining the readable v5.0.2
+hot-memory grammar. The upgrade from v5.1.0 or v5.1.1 is one-way: v5.1.2
+stamps its own engine release into proposal preflight receipts, and every
+proposal, pending or decided, remains an immutable authority record that the
+older engine keeps validating. Once any v5.1.2 proposal has been staged, the
+older engine's `status`, `doctor`, `recall` and `sync` refuse the store
 permanently, and its `start` opens only a degraded run behind the
 `AUTHORITY RECOVERY NEEDED` banner (writing its run log and state entry, as
 the protocol's degraded-run lane allows). Safe rollback exists only by
-restoring the complete pre-update backup taken before the first v5.1.1
-proposal. A store the v5.1.1 engine has only started and closed, with no
-proposal, remains fully readable by v5.1.0, which ignores the derived
-`audit-*` files. The
+restoring the complete pre-update backup taken before the first v5.1.2
+proposal. A store the v5.1.2 engine has only started and closed, with no
+proposal, remains fully readable by v5.1.1, which treats the newer checkpoint
+as a cache miss and re-proves the store, and by v5.1.0, which ignores the
+derived `audit-*` files. The
 engine automatically migrates explicitly versioned v1-v3
 tiered Markdown and the engine-based v4 format. This canonical repository publicly
 distributed the original v1 and streamlined v3 instructions; the parser also
@@ -39,8 +40,8 @@ Make the project quiescent across every runtime boundary:
 2. wait for every BIMRI command to finish;
 3. pause any synchronization or copy operation affecting the folder;
 4. take a complete copy of the whole project folder (`bimri.md` plus the
-   entire `.bimri/` tree) somewhere outside it — this snapshot is the only
-   rollback that exists, because the first v5.1.1 proposal is an
+   entire `.bimri/` tree) somewhere outside it; this snapshot is the only
+   rollback that exists, because the first v5.1.2 proposal is an
    intentional one-way boundary that no older engine can read past;
 5. if v1-v3 was installed in Claude Cowork Global Instructions, disable or
    remove that BIMRI block; and
@@ -269,10 +270,19 @@ idempotently from the prepared receipt.
 Before success, the updater proves that root `bimri.md`, the accepted head and
 hash, and every immutable/unknown pre-existing path remain byte-identical. It
 runs the installed engine's read-only doctor against the activated state and
-records both the old-state backup and the preservation digests. A divergent
-`bimri.md` or damaged core authority stops activation without healing or
-rewriting it. See [`INSTALL.md`](INSTALL.md) for the exact transaction and
-receipt contract.
+records both the old-state backup and the preservation digests. Damaged core
+authority (an unreadable or wrong-version state, a missing or mismatched
+accepted head, invalid head grammar or pointers) stops the update before any
+package or state write. A divergent `bimri.md`, damaged governance records, or
+damaged recovery evidence do not stop activation: the updater leaves those
+bytes untouched, activates the v5.1 state, and finishes in
+`installed-recovery-required` mode with the read-only audit errors listed in
+the receipt, so that the repair tools are installed; the next `start` then
+heals the divergent view as a manual-edit conflict. The receipt records its
+`mode` as `lossless-authority-activation` for this activation and as
+`code-only-update` for a same-format update of a v5.1.0 store to a newer
+engine. See [`INSTALL.md`](INSTALL.md) for the exact transaction and receipt
+contract.
 
 The old-process shutdown is a real precondition. The file lock cannot safely
 upgrade an already-loaded old process that resumes after installation. Once
@@ -281,13 +291,19 @@ the unsupported state version before mutation.
 
 ### v5.0 and v5.0.1 to v5.1.0 authority
 
-Existing v5.0 and v5.0.1 states upgrade automatically under the engine lock.
-Before changing state, the engine validates the complete source state and
-accepted head and preserves an exact content-addressed state backup under
-`.bimri/backups/`. Accepted historical revisions and existing governance
-records are never rewritten. Historical v5.0 and v5.0.1 resolutions retain
-their original effect semantics. The readable hot grammar is normalized only
-through the existing v5.0.2-compatible metadata path.
+Existing v5.0 and v5.0.1 states upgrade under the engine lock during a
+`--quiescent` install; the attestation is checked before version routing, and
+an install without it exits before creating anything in the target. Before
+changing state, the engine validates the complete source state and accepted
+head and preserves an exact content-addressed state backup under
+`.bimri/backups/`. After the state upgrade this route runs the lifecycle repair
+path: it synchronizes the generated view, so a divergent `bimri.md` is healed
+through the manual-edit recovery path during installation rather than at the
+next `start`, rebuilds the index and runs repair-capable validation. Accepted
+historical revisions and existing governance records are never rewritten.
+Historical v5.0 and v5.0.1 resolutions retain their original effect semantics.
+The readable hot grammar is normalized only through the existing
+v5.0.2-compatible metadata path.
 
 For v5.0, if the complete stored profile exactly matches the original defaults,
 the upgrade adopts values of 20 for Tier 1, 40 for Tier 2, 12 for Tier 3, a
@@ -313,6 +329,33 @@ v5.0 defaults expanded or the existing limits were preserved, and records the
 old and active profiles, state-backup path, and any metadata-only revision. A
 full semantic validation runs before `migrate` reports `Validation: PASSED`.
 State/head/metadata preflight failures stop before upgrade authority changes.
+
+### v5.1.0 and v5.1.1 to engine v5.1.2
+
+A v5.1.0 or v5.1.1 store takes the v5.1.2 engine through the same `--quiescent`
+code-only update. The memory format stays v5.1.0, so `bimri.md`, `state.json`
+and every protected path remain byte-identical and the receipt's `mode` is
+`code-only-update`. The first command after the update re-proves the store
+under authority policy version `5.1.2-authority-1` with one full audit, about
+35 seconds on a 700-run store; run `doctor` once before any session so that
+audit seeds the checkpoint outside a hook timeout.
+
+Existing v5.1.1 quarantine and interrupted-operation records retain their
+sealed checkpoint evidence. The updated engine can finish a recorded lifecycle
+write, reconcile an authority completion, and validate an owner-approved
+restoration against the old baseline. It then audits under the new policy
+before enabling warm reads. The update itself does not resolve quarantines
+or approve replacements; unknown policy versions and damaged seals still
+refuse recovery through those records.
+
+Two validation changes in v5.1.2 can touch an existing store. A stored value
+that contains U+0085, U+2028 or U+2029 in a field the engine validates (memory
+text, rationale, falsifier, conflict question, or the journal of an active
+run) is invalid at the next full audit and needs owner repair through the
+quarantine and restore lane in the next section; no known store carries one.
+A stored `contested` trust value still parses and needs nothing, although it
+can no longer be authored. A drift receipt that a v5.1.1 Tier 3 proposal wrote
+stays on disk as retained evidence and needs nothing.
 
 ### Authority Damage Found During Upgrade
 

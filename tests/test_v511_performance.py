@@ -1617,7 +1617,7 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         old_record = json.loads(old_path.read_text("utf-8"))
         self.assertEqual(old_record["bimri_version"], "5.1.0")
         self.assertEqual(
-            old_record["preflight_receipt"]["engine_release"], "5.1.1"
+            old_record["preflight_receipt"]["engine_release"], "5.1.2"
         )
         self.witness_path().unlink(missing_ok=True)
         old_record["preflight_receipt"]["engine_release"] = "5.1.0"
@@ -1647,7 +1647,7 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         )
         self.assertEqual(new_record["bimri_version"], "5.1.0")
         self.assertEqual(
-            new_record["preflight_receipt"]["engine_release"], "5.1.1"
+            new_record["preflight_receipt"]["engine_release"], "5.1.2"
         )
 
     def test_exact_current_parity_and_no_global_record_collection(self):
@@ -3376,6 +3376,143 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         self.assertNotIn("AUTHORITY RECOVERY NEEDED", restarted.stdout)
         served = self.cli("get", "--key", "witness.seed", root=root)
         self.assertIn("witness.seed", served.stdout)
+
+    # v5.1.2: the same ruling applied at the sync, authority-close and
+    # resolve boundaries. Before this, begin_authority_write and
+    # require_governance_for_resolution_retry audited with
+    # write_witness=False and governance_snapshot gated condemnation on
+    # write_witness, so a refused sync wrote a drift receipt, raised, and
+    # left the checkpoint valid: the next warm start printed a clean brief
+    # and exact reads kept serving the damaged store.
+
+    def _damaged_clone(self, label):
+        records = self.seed_authority_graph()
+        root = self.clone_store(label)
+        target = root / records["proposals"].relative_to(self.root)
+        original = target.read_bytes()
+        target.write_bytes(b"{broken authority json")
+        return root, target, original
+
+    def _assert_condemned_and_degraded(
+        self, root, witness_before, original, target
+    ):
+        # Retained-but-invalid: the bytes are the prior baseline and the
+        # epoch moved past it.
+        self.assert_prior_witness_retained_but_invalid(root, witness_before)
+        started = self.cli("start", "--actor", "degraded", root=root)
+        self.assertIn("AUTHORITY RECOVERY NEEDED", started.stdout)
+        read = self.cli("get", "--key", "witness.seed", root=root, check=False)
+        self.assertNotEqual(read.returncode, 0, read.stdout)
+        self.assertRegex(
+            (read.stdout + read.stderr).lower(), r"authority|recovery"
+        )
+        # Exact restoration heals: the next audit passes over the retained
+        # baseline, receipts the epoch advance and publishes afresh.
+        target.write_bytes(original)
+        healed = self.cli("doctor", root=root)
+        self.assertIn("BIMRI doctor: PASSED", healed.stdout)
+        self.assert_drift_receipt(root, pattern=r"epoch|inventory")
+        restarted = self.cli("start", "--actor", "healed", root=root)
+        self.assertNotIn("AUTHORITY RECOVERY NEEDED", restarted.stdout)
+        served = self.cli("get", "--key", "witness.seed", root=root)
+        self.assertIn("witness.seed", served.stdout)
+
+    def test_failed_sync_audit_condemns_the_checkpoint(self):
+        root, target, original = self._damaged_clone("condemned-by-sync")
+        run_id = self.start("warm-sync", root=root)
+        witness_before = self.witness_path(root).read_bytes()
+        refused = self.cli("sync", "--run", run_id, root=root, check=False)
+        self.assert_authority_write_rejects_external_drift(refused)
+        self.assertIn("authority recovery is required", refused.stderr)
+        self._assert_condemned_and_degraded(
+            root, witness_before, original, target
+        )
+
+    def test_failed_authority_close_audit_condemns_the_checkpoint(self):
+        root, target, original = self._damaged_clone("condemned-by-close")
+        # Restore, stage a healthy proposal on a warm run, then damage again
+        # so the close carries an authority proposal through
+        # begin_authority_write.
+        target.write_bytes(original)
+        run_id = self.start("warm-close", root=root)
+        self.propose(
+            run_id,
+            "close.staged",
+            "Staged while healthy.",
+            root=root,
+            new_subject=True,
+        )
+        target.write_bytes(b"{broken authority json")
+        witness_before = self.witness_path(root).read_bytes()
+        refused = self.cli(
+            "close", "--run", run_id, "--summary", "across damage",
+            root=root, check=False,
+        )
+        self.assert_authority_write_rejects_external_drift(refused)
+        self.assertIn("authority recovery is required", refused.stderr)
+        self.assertIn(run_id, self.state(root)["active_runs"])
+        self._assert_condemned_and_degraded(
+            root, witness_before, original, target
+        )
+
+    def test_failed_resolve_audit_condemns_the_checkpoint(self):
+        root, target, original = self._damaged_clone("condemned-by-resolve")
+        # seed_authority_graph resolved its conflict; raise a fresh one
+        # while the store is healthy.
+        target.write_bytes(original)
+        first = self.start("resolve-a", root=root)
+        second = self.start("resolve-b", root=root)
+        candidate = self.propose(
+            first, "resolve.key", "Candidate A.", root=root, new_subject=True
+        )
+        self.propose(
+            second, "resolve.key", "Candidate B.", root=root, new_subject=True
+        )
+        self.cli("sync", "--run", second, root=root)
+        self.cli("sync", "--run", first, root=root)
+        decision = json.loads(
+            root.joinpath(
+                ".bimri", "decisions", f"{candidate}.json"
+            ).read_text("utf-8")
+        )
+        self.assertEqual(decision["outcome"], "contested")
+        conflict_id = decision["conflict_id"]
+        target.write_bytes(b"{broken authority json")
+        witness_before = self.witness_path(root).read_bytes()
+        refused = self.cli(
+            "resolve", conflict_id, "--choose", "current", "--human-approved",
+            root=root, check=False,
+        )
+        self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+        self.assertIn("authority recovery is required", refused.stderr)
+        self.assertFalse(
+            root.joinpath(
+                ".bimri", "resolutions", f"{conflict_id}.json"
+            ).exists()
+        )
+        self._assert_condemned_and_degraded(
+            root, witness_before, original, target
+        )
+
+    def test_lifecycle_close_and_journal_refuse_after_a_refused_sync(self):
+        # Once the engine has proved the store damaged, no later warm
+        # command may republish a checkpoint over it (BIMRI-PROTOCOL 9.5:
+        # close stays blocked).
+        root, _target, _original = self._damaged_clone(
+            "no-republish-after-refusal"
+        )
+        run_id = self.start("warm-plain", root=root)
+        refused = self.cli("sync", "--run", run_id, root=root, check=False)
+        self.assertEqual(refused.returncode, 2)
+        closed = self.cli(
+            "close", "--run", run_id, "--summary", "x", root=root, check=False
+        )
+        self.assertEqual(closed.returncode, 2, closed.stdout + closed.stderr)
+        self.assertIn("authority recovery is required", closed.stderr)
+        self.assertIn(
+            "AUTHORITY RECOVERY NEEDED",
+            self.cli("start", "--actor", "after", root=root).stdout,
+        )
 
 
 class V511ReceiptUnitTest(unittest.TestCase):

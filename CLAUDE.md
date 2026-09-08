@@ -2,7 +2,7 @@
 
 ## Claude Code
 
-Use BIMRI engine v5.1.1 and authority format v5.1.0. The readable hot-memory
+Use BIMRI engine v5.1.2 and authority format v5.1.0. The readable hot-memory
 grammar remains v5.0.2.
 `BIMRI-PROTOCOL.md` is the normative memory protocol.
 

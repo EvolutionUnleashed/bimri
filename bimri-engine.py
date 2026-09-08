@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BIMRI Engine v5.1.1 (authority store v5.1.0; hot grammar v5.0.2)
+BIMRI Engine v5.1.2 (authority store v5.1.0; hot grammar v5.0.2)
 Portable, human-governed memory for local agents.
 
 The shared memory is a generated Markdown view. Agents work in independent
@@ -28,6 +28,7 @@ import argparse
 import copy
 import contextlib
 import datetime as dt
+import errno
 import hashlib
 import json
 import os
@@ -53,8 +54,9 @@ except ImportError:  # pragma: no cover
     msvcrt = None
 
 
-ENGINE_VERSION = "5.1.1"
+ENGINE_VERSION = "5.1.2"
 V5_1_0_ENGINE_VERSION = "5.1.0"
+V5_1_1_ENGINE_VERSION = "5.1.1"
 MEMORY_FORMAT_VERSION = "5.1.0"
 HOT_FORMAT_VERSION = "5.0.2"
 AUDIT_WITNESS_SCHEMA = 1
@@ -66,7 +68,10 @@ AUDIT_DRIFT_KEEP = 200
 AUDIT_DRIFT_DELTA_CAP = 2000
 AUDIT_DRIFT_BLOB_KEEP = 20
 PRIOR_EVIDENCE_INVALID_PREFIX = "prior audit manifest evidence is invalid"
-AUTHORITY_POLICY_VERSION = "5.1.1-authority-1"
+# 5.1.2 refuses Unicode line separators inside stored text, so a verdict a
+# 5.1.1 audit published no longer proves what this engine requires; every
+# existing checkpoint re-proves once under the new policy.
+AUTHORITY_POLICY_VERSION = "5.1.2-authority-1"
 HOOK_TIMEOUT_SECONDS = 90
 PREVIOUS_V5_VERSION = "5.0"
 V5_0_1_VERSION = "5.0.1"
@@ -132,6 +137,9 @@ LEGACY_ACTIVE_NAMES = ("BIMRI.md", "bimri.md")
 LEGACY_BACKUP_NAMES = ("BIMRI-backup.md", "bimri-backup.md")
 
 TRUSTS = {"working", "confirmed", "contested"}
+# Public authoring may only use these. `contested` describes a candidate that
+# a conflict record holds open; the engine derives it and never authors it.
+AUTHORABLE_TRUSTS = {"working", "confirmed"}
 SOURCES = {"user", "agent", "external", "system", "legacy"}
 OUTCOMES = {"success", "partial", "overflow", "fail"}
 OPERATIONS = {"set", "touch", "close"}
@@ -489,6 +497,11 @@ def clean_scalar(value, name, max_chars=500, allow_empty=False):
         raise BimriError(f"{name} must be one line without tabs.")
     if any(ord(ch) < 32 for ch in value):
         raise BimriError(f"{name} contains control characters.")
+    if len(value.splitlines()) > 1:
+        # The hot view and run logs are parsed with str.splitlines(), which
+        # also breaks on U+0085, U+2028 and U+2029. One authored line must
+        # stay one parsed line, or a text could smuggle a second entry.
+        raise BimriError(f"{name} must not contain Unicode line separators.")
     return value.strip()
 
 
@@ -4208,8 +4221,21 @@ def normalize_audit_manifest(manifest):
     return normalized
 
 
-def validate_sealed_audit_witness_record(witness):
-    """Validate a compact checkpoint record from live or blocked evidence."""
+def audit_witness_uses_current_policy(witness):
+    return (
+        witness.get("engine_version") == ENGINE_VERSION
+        and witness.get("memory_format_version") == MEMORY_FORMAT_VERSION
+        and witness.get("policy_version") == AUTHORITY_POLICY_VERSION
+    )
+
+
+def validate_sealed_audit_witness_record(witness, allow_prior_policy=False):
+    """Validate a checkpoint, optionally retaining known prior recovery evidence.
+
+    A 5.1.1 seal remains evidence of an interrupted operation or quarantine.
+    It never satisfies the current read policy; only a full audit can do that.
+    Unknown engine/policy pairs remain invalid even on the recovery path.
+    """
     try:
         expected_fields = {
             "witness_schema", "engine_version", "memory_format_version",
@@ -4226,9 +4252,15 @@ def validate_sealed_audit_witness_record(witness):
             return None
         if (
             witness.get("witness_schema") != AUDIT_WITNESS_SCHEMA
-            or witness.get("engine_version") != ENGINE_VERSION
             or witness.get("memory_format_version") != MEMORY_FORMAT_VERSION
-            or witness.get("policy_version") != AUTHORITY_POLICY_VERSION
+            or not (
+                audit_witness_uses_current_policy(witness)
+                or (
+                    allow_prior_policy
+                    and witness.get("engine_version") == V5_1_1_ENGINE_VERSION
+                    and witness.get("policy_version") == "5.1.1-authority-1"
+                )
+            )
         ):
             return None
         parse_timestamp(witness.get("created_at"), "audit witness timestamp")
@@ -4283,7 +4315,7 @@ def reconcile_engine_checkpoint_for_exact_read(paths):
     )
 
 
-def load_sealed_audit_witness(paths):
+def load_sealed_audit_witness(paths, allow_prior_policy=False):
     """Load the compact checkpoint without consulting authority/history files."""
     path = paths.audit_witness
     if path_is_redirected(path) or not path.is_file():
@@ -4292,7 +4324,9 @@ def load_sealed_audit_witness(paths):
         witness = read_json_strict(path, "audit witness")
     except (BimriError, OSError, UnicodeError, ValueError, TypeError):
         return None
-    return validate_sealed_audit_witness_record(witness)
+    return validate_sealed_audit_witness_record(
+        witness, allow_prior_policy=allow_prior_policy
+    )
 
 
 def load_valid_audit_witness(paths, state, state_hash=None):
@@ -4487,7 +4521,9 @@ def load_audit_transition(paths):
         raise BimriError("audit transition scope is invalid.")
     if marker.get("kind") == "authority":
         validate_frozen_authority_transition_scope(marker["scope"])
-    prior = validate_sealed_audit_witness_record(marker.get("prior_witness"))
+    prior = validate_sealed_audit_witness_record(
+        marker.get("prior_witness"), allow_prior_policy=True
+    )
     if (
         prior is None
         or marker.get("prior_witness_hash") != prior.get("witness_hash")
@@ -4572,7 +4608,7 @@ def write_audit_transition(paths, marker):
 
 def referenced_audit_manifest_hashes(paths):
     hashes = set()
-    witness = load_sealed_audit_witness(paths)
+    witness = load_sealed_audit_witness(paths, allow_prior_policy=True)
     if witness is not None:
         hashes.add(witness["manifest_hash"])
     try:
@@ -5050,6 +5086,13 @@ def write_audit_witness(paths, state, conflicts=None, manifest=None, run_facts=N
             "manifest_count": len(manifest),
             "proposal_runs": proposal_runs,
         }
+        if frozen_completion is not None:
+            # Complete the exact old transaction before publishing a new
+            # policy verdict. Reconciliation has audited its current content,
+            # but its frozen closure must not be rewritten during recovery.
+            frozen_witness = frozen_completion["witness"]
+            witness["engine_version"] = frozen_witness["engine_version"]
+            witness["policy_version"] = frozen_witness["policy_version"]
         witness["witness_hash"] = audit_record_seal(witness, "witness_hash")
         if (
             frozen_completion is not None
@@ -5077,7 +5120,9 @@ def write_audit_witness(paths, state, conflicts=None, manifest=None, run_facts=N
         if paths.audit_witness.exists() and paths.audit_witness.is_dir():
             raise BimriError("audit witness destination is a directory.")
         atomic_write_json(paths.audit_witness, witness)
-        paths.validated_audit_witness = witness
+        paths.validated_audit_witness = (
+            witness if audit_witness_uses_current_policy(witness) else None
+        )
         return True
     except (BimriError, OSError, UnicodeError, ValueError, TypeError):
         paths.validated_audit_witness = None
@@ -5202,7 +5247,9 @@ def validate_frozen_authority_transition_scope(scope):
         if (
             not isinstance(state_file_hash, str)
             or not HASH_RE.fullmatch(state_file_hash)
-            or validate_sealed_audit_witness_record(completion.get("witness"))
+            or validate_sealed_audit_witness_record(
+                completion.get("witness"), allow_prior_policy=True
+            )
             is None
         ):
             raise BimriError("audit transition completion is invalid.")
@@ -5377,7 +5424,9 @@ def publish_lifecycle_checkpoint(paths, state, marker):
     witness["witness_hash"] = audit_record_seal(witness, "witness_hash")
     ensure_audit_manifest_generation(paths, prior)
     atomic_write_json(paths.audit_witness, witness)
-    paths.validated_audit_witness = witness
+    paths.validated_audit_witness = (
+        witness if audit_witness_uses_current_policy(witness) else None
+    )
     clear_audit_transition(paths)
     paths.pending_checkpoint_witness = None
     prune_audit_manifest_generations(paths)
@@ -5769,7 +5818,9 @@ def reconcile_audit_transition(paths, state):
             # Marker durable, first state replace not reached.
             atomic_write_json(paths.audit_witness, prior)
             clear_audit_transition(paths)
-            paths.validated_audit_witness = prior
+            paths.validated_audit_witness = (
+                prior if audit_witness_uses_current_policy(prior) else None
+            )
             prune_audit_manifest_generations(paths)
             return state
         if (
@@ -6034,7 +6085,9 @@ def load_audit_blocked_record(paths):
         if prior_hash is not None or record.get("prior_manifest") is not None:
             raise BimriError("audit blocked prior witness hash is orphaned.")
     else:
-        validated = validate_sealed_audit_witness_record(prior_witness)
+        validated = validate_sealed_audit_witness_record(
+            prior_witness, allow_prior_policy=True
+        )
         if (
             validated is None
             or prior_hash != validated.get("witness_hash")
@@ -6292,7 +6345,15 @@ def governance_snapshot(
     prior_manifest_override=None,
     allowed_manifest_paths=None,
     allow_audit_epoch_advance=False,
+    condemn_on_failure=None,
 ):
+    # Publishing a fresh verdict and invalidating a verdict this audit has
+    # just proved false are separate obligations. A caller that must not
+    # publish (the authority-write preflight, the resolution retry gate)
+    # still owes the invalidation; an explicitly read-only audit owes
+    # neither, so the default follows write_witness.
+    if condemn_on_failure is None:
+        condemn_on_failure = write_witness
     blocked_issues = load_audit_blocked_issues(paths)
     if blocked_issues and not audit_blocked:
         return [], blocked_issues
@@ -6304,7 +6365,8 @@ def governance_snapshot(
         witness = load_valid_audit_witness(paths, state)
         if witness is not None:
             return [], []
-    live_prior_witness = load_sealed_audit_witness(paths)
+    # Prior-policy seals are comparison evidence, never a cached audit pass.
+    live_prior_witness = load_sealed_audit_witness(paths, allow_prior_policy=True)
     blocked_prior_witness = load_audit_blocked_prior_witness(paths)
     blocked_prior_manifest = load_audit_blocked_prior_manifest(paths)
     if prior_witness_override is not None:
@@ -6387,7 +6449,7 @@ def governance_snapshot(
         ]
         if write_witness and prior_witness is None:
             discard_audit_witness(paths)
-        elif write_witness and condemned and not strict_prior_comparison:
+        elif condemn_on_failure and condemned and not strict_prior_comparison:
             condemn_audit_checkpoint(paths, state)
     elif write_witness and (
         not allow_recoverable_applying
@@ -6544,11 +6606,16 @@ def begin_authority_write(
 
     # Missing, corrupt or diverged derived evidence has no prior verdict to
     # reuse. Rebuild trust once with the complete semantic authority audit.
+    # This boundary never publishes (the post-write refresh does), but a
+    # failed audit must still condemn the retained checkpoint so the next
+    # warm start and exact read re-prove the store (owner ruling
+    # 2026-09-02, BIMRI-PROTOCOL 9.5) instead of serving past the refusal.
     conflicts, issues = governance_snapshot(
         paths,
         state,
         use_witness=False,
         write_witness=False,
+        condemn_on_failure=True,
     )
     if issues and not allow_degraded:
         raise BimriError(
@@ -6725,6 +6792,7 @@ def require_governance_for_resolution_retry(
         state,
         use_witness=False,
         write_witness=False,
+        condemn_on_failure=True,
     )
     retry_marker = "resolution status is failed; explicit retry is required."
     target_prefix = f"resolution {conflict_id} ("
@@ -7258,7 +7326,9 @@ def next_pattern_id(paths, state, entries):
         if isinstance(pattern_id, str) and re.fullmatch(r"P\d+", pattern_id):
             numbers.append(int(pattern_id[1:]))
     number = max(numbers + [0]) + 1
-    state["pattern_count"] = number
+    # Allocation is derived from immutable proposal files and the hot view;
+    # state.pattern_count advances only when an accepted apply commits it,
+    # so a propose never writes undeclared authority-influencing state.
     return f"P{number:04d}"
 
 
@@ -7635,6 +7705,11 @@ def preflight_proposal(paths, state, run_meta, proposal):
             "public proposals cannot use system provenance; use user, agent, "
             "or external for the actual source."
         )
+    if proposal["trust"] not in AUTHORABLE_TRUSTS:
+        raise BimriError(
+            "contested trust is derived from a conflict record and cannot be "
+            "authored by a public proposal."
+        )
     if proposal.get("needs_human"):
         raise BimriError(
             "semantic uncertainty is not a memory conflict; ask the owner "
@@ -7895,6 +7970,7 @@ def validate_proposal(
             raise BimriError("proposal preflight receipt fields are invalid.")
         accepted_receipt_engines = {
             ENGINE_VERSION,
+            V5_1_1_ENGINE_VERSION,
             V5_1_0_ENGINE_VERSION,
         }
         if proposal.get("bimri_version") == V5_0_2_VERSION:
@@ -9492,6 +9568,13 @@ def apply_proposal(
         state["cold_current"][cooled["key"]] = make_cold_record(
             cooled, proposal["proposal_id"], archive_date
         )
+    if proposal["tier"] == 3 and proposal["operation"] == "set":
+        # The pattern counter moves inside the declared authority write
+        # scope, never at propose time (v5.1.2).
+        state["pattern_count"] = max(
+            int(state.get("pattern_count", 0)),
+            int(proposal["pattern_id"][1:]),
+        )
     revision = commit_revision(
         paths, state, new_content, f"accepted {proposal['proposal_id']}",
         allow_legacy_overflow=legacy_reduction,
@@ -10021,6 +10104,61 @@ def new_conflict_notices(paths, state, results):
     return notices
 
 
+ORPHAN_INACTIVITY_SECONDS = 86400
+ORPHAN_BRIEF_LIMIT = 5
+
+
+def run_last_seen(meta):
+    """Return a run's last recorded activity as an aware UTC datetime."""
+    if not isinstance(meta, dict):
+        return None
+    for field in ("last_activity_at", "started_at"):
+        value = meta.get(field)
+        if not isinstance(value, str):
+            continue
+        try:
+            seen = dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            continue
+        return seen.replace(tzinfo=dt.timezone.utc)
+    return None
+
+
+def orphan_candidates(state, current_run_id=None, now=None):
+    """List other active runs idle for longer than the inactivity window.
+
+    Idleness is measured from ``last_activity_at``, which journal, propose
+    and sync maintain, and falls back to ``started_at`` for records that
+    lack it. A run with no readable timestamp is a candidate. This is
+    classification only: nothing here closes, stamps or mutates a run.
+    """
+    if now is None:
+        now = dt.datetime.now(dt.timezone.utc)
+    stale = set()
+    for rid, meta in state["active_runs"].items():
+        if rid == current_run_id:
+            continue
+        seen = run_last_seen(meta)
+        if (
+            seen is None
+            or (now - seen).total_seconds() > ORPHAN_INACTIVITY_SECONDS
+        ):
+            stale.add(rid)
+    return sorted(stale)
+
+
+def render_orphan_candidates(stale, limit=ORPHAN_BRIEF_LIMIT):
+    """One bounded brief line; ``status`` carries every active run."""
+    if len(stale) <= limit:
+        return "ORPHAN CANDIDATES (never auto-closed): " + ", ".join(stale)
+    return (
+        f"ORPHAN CANDIDATES (never auto-closed): {len(stale)} runs inactive "
+        f"over {ORPHAN_INACTIVITY_SECONDS // 3600}h; newest "
+        + ", ".join(stale[-limit:])
+        + "; full list: status"
+    )
+
+
 def print_brief(
     paths,
     state,
@@ -10047,21 +10185,9 @@ def print_brief(
     if conflicts is None or authority_issues is None:
         conflicts, authority_issues = governance_snapshot(paths, state)
     print_authority_recovery(authority_issues)
-    stale = []
-    now = dt.datetime.now(dt.timezone.utc)
-    for rid, meta in state["active_runs"].items():
-        if rid == run_id:
-            continue
-        try:
-            started = dt.datetime.strptime(meta["started_at"], "%Y-%m-%dT%H:%M:%SZ")
-            started = started.replace(tzinfo=dt.timezone.utc)
-            if (now - started).total_seconds() > 86400:
-                stale.append(rid)
-        except (KeyError, ValueError):
-            stale.append(rid)
-    stale = sorted(set(stale))
+    stale = orphan_candidates(state, run_id)
     if stale:
-        print("ORPHAN CANDIDATES (never auto-closed): " + ", ".join(stale))
+        print(render_orphan_candidates(stale))
     if errors:
         print("VALIDATION NEEDED:")
         for error in errors[:10]:
@@ -10225,6 +10351,11 @@ def cmd_propose(paths, args):
         raise BimriError(f"unsupported source: {source}")
     if trust not in TRUSTS:
         raise BimriError(f"unsupported trust: {trust}")
+    if trust not in AUTHORABLE_TRUSTS:
+        raise BimriError(
+            "contested trust is derived from a conflict record and cannot be "
+            "authored; use working, or confirmed for a direct human statement."
+        )
     if trust == "confirmed" and source not in {"user", "system"}:
         raise BimriError("only directly human-stated or system memory may be confirmed.")
     if args.target:
@@ -11702,7 +11833,9 @@ def cmd_quarantine_authority(
     with engine_lock(paths):
         state = load_or_initialize(paths)
         blocked_prior = load_audit_blocked_prior_witness(paths)
-        recovery_prior = blocked_prior or load_sealed_audit_witness(paths)
+        recovery_prior = blocked_prior or load_sealed_audit_witness(
+            paths, allow_prior_policy=True
+        )
         recovery_prior_manifest = (
             load_audit_blocked_prior_manifest(paths)
             if blocked_prior is not None
@@ -12056,7 +12189,7 @@ def cmd_restore_authority(
         state = load_or_initialize(paths)
         repair_prior_witness = (
             load_audit_blocked_prior_witness(paths)
-            or load_sealed_audit_witness(paths)
+            or load_sealed_audit_witness(paths, allow_prior_policy=True)
         )
         repair_prior_manifest = load_audit_blocked_prior_manifest(paths)
         path = authority_record_path(paths, kind, record_id)
@@ -12250,6 +12383,62 @@ def retention_order(entry, state):
     )
 
 
+def typed_recall_fields(entry):
+    """Full typed fields of one parsed memory entry for machine-readable recall."""
+    if not entry:
+        return {}
+    tier = int(entry.get("tier", 0) or 0)
+    fields = {"tier": tier}
+    if tier == 1:
+        fields["kind"] = entry.get("kind", "")
+    elif tier == 2:
+        importance = str(entry.get("imp", ""))
+        fields["importance"] = int(importance) if importance.isdigit() else None
+        fields["status"] = entry.get("status", "")
+        fields["first_run"] = entry.get("first", "")
+        fields["last_run"] = entry.get("last", "")
+    elif tier == 3:
+        observations = str(entry.get("obs", ""))
+        fields["confidence"] = entry.get("conf", "")
+        fields["observations"] = (
+            int(observations) if observations.isdigit() else None
+        )
+        fields["evidence"] = [
+            item for item in str(entry.get("ev", "")).split(",") if item
+        ]
+        fields["falsifier"] = entry.get("falsifier", "")
+    if tier in {1, 2}:
+        raw_tags = entry.get("tags", "") or ""
+        try:
+            fields["tags"] = clean_tags(raw_tags)
+        except BimriError:
+            fields["tags"] = [tag for tag in str(raw_tags).split(",") if tag]
+        fields["pointer"] = entry.get("ptr") or ""
+    return fields
+
+
+def typed_proposal_fields(proposal):
+    """Typed fields of a held proposal, mirroring typed_recall_fields."""
+    tier = int(proposal.get("tier", 0) or 0)
+    fields = {"tier": tier, "operation": proposal.get("operation", "")}
+    if tier == 1:
+        fields["kind"] = proposal.get("kind", "")
+    elif tier == 2:
+        fields["importance"] = proposal.get("importance")
+        fields["status"] = proposal.get("status", "")
+    elif tier == 3:
+        fields["confidence"] = proposal.get("confidence", "")
+        fields["observations"] = proposal.get("observations")
+        fields["evidence"] = list(proposal.get("evidence", []) or [])
+        fields["falsifier"] = proposal.get("falsifier", "")
+    if tier in {1, 2}:
+        try:
+            fields["tags"] = clean_tags(proposal.get("tags", []) or [])
+        except BimriError:
+            fields["tags"] = []
+    return fields
+
+
 def exact_current_recall_records(paths, state, key, hot_entries=None):
     """Read one exact subject from current hot/cold storage only."""
     if hot_entries is None:
@@ -12273,6 +12462,7 @@ def exact_current_recall_records(paths, state, key, hot_entries=None):
             "reason": "current",
             "trust": entry.get("trust", ""),
             "source": entry.get("source", ""),
+            "typed": typed_recall_fields(entry),
         })
     cold = state.get("cold_current", {}).get(key)
     if cold is not None:
@@ -12285,6 +12475,7 @@ def exact_current_recall_records(paths, state, key, hot_entries=None):
             "reason": "current",
             "trust": entry.get("trust", ""),
             "source": entry.get("source", ""),
+            "typed": typed_recall_fields(entry),
         })
     return records
 
@@ -12325,6 +12516,7 @@ def held_recall_records(paths, state, key=None):
             "reason": decision["reason"],
             "trust": proposal.get("trust", ""),
             "source": proposal.get("source", ""),
+            "typed": typed_proposal_fields(proposal),
         })
     return records
 
@@ -12349,6 +12541,7 @@ def recall_records(paths, state):
             "reason": "current",
             "trust": entry.get("trust", ""),
             "source": entry.get("source", ""),
+            "typed": typed_recall_fields(entry),
         })
     current_cold_effects = set()
     for key, cold in sorted(state.get("cold_current", {}).items()):
@@ -12362,6 +12555,7 @@ def recall_records(paths, state):
             "reason": "current",
             "trust": entry.get("trust", ""),
             "source": entry.get("source", ""),
+            "typed": typed_recall_fields(entry),
         })
         current_cold_effects.add(
             (cold["archived_by"], cold["raw_line"], "cooled")
@@ -12391,6 +12585,7 @@ def recall_records(paths, state):
             "reason": record["reason"],
             "trust": entry.get("trust", ""),
             "source": entry.get("source", ""),
+            "typed": typed_recall_fields(entry),
         })
     for path in sorted(paths.decisions.glob("R*-Q*.json")):
         if path.is_symlink() or not path.is_file():
@@ -12412,11 +12607,16 @@ def recall_records(paths, state):
             "reason": decision["reason"],
             "trust": proposal.get("trust", ""),
             "source": proposal.get("source", ""),
+            "typed": typed_proposal_fields(proposal),
         })
     return records
 
 
-def cmd_recall(paths, key=None, query=None, history=True, limit=20):
+def cmd_recall(
+    paths, key=None, query=None, history=True, limit=20, output="tsv"
+):
+    if output not in {"tsv", "json"}:
+        raise BimriError("recall output must be tsv or json.")
     if (key is None) == (query is None):
         raise BimriError("recall requires exactly one of --key or --query.")
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
@@ -12473,12 +12673,17 @@ def cmd_recall(paths, key=None, query=None, history=True, limit=20):
             if not history and record["location"] == "HISTORY":
                 continue
         else:
+            typed = record.get("typed", {})
             haystack = " ".join(
-                str(record.get(field, ""))
-                for field in (
-                    "key", "id", "detail", "reason", "location",
-                    "trust", "source",
-                )
+                [
+                    str(record.get(field, ""))
+                    for field in (
+                        "key", "id", "detail", "reason", "location",
+                        "trust", "source",
+                    )
+                ]
+                + list(typed.get("tags", []) or [])
+                + [str(typed.get("falsifier", "") or "")]
             ).casefold()
             if not all(token in haystack for token in search_tokens):
                 continue
@@ -12492,6 +12697,28 @@ def cmd_recall(paths, key=None, query=None, history=True, limit=20):
             item["reason"],
         )
     )
+    if output == "json":
+        payload = {
+            "matches": [
+                dict(
+                    {
+                        "location": record["location"],
+                        "key": record["key"],
+                        "id": record["id"],
+                        "reason": record["reason"],
+                        "trust": record["trust"],
+                        "source": record["source"],
+                        "text": record["detail"],
+                    },
+                    **record.get("typed", {})
+                )
+                for record in matches[:limit]
+            ],
+            "total": len(matches),
+            "omitted": max(0, len(matches) - limit),
+        }
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 0 if matches else 1
     for record in matches[:limit]:
         print(
             "\t".join(
@@ -13486,8 +13713,14 @@ def write_local_runtime_binding(
 def merged_marked_block_content(path, block):
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
     marked = f"{AGENT_BLOCK_START}\n{block.strip()}\n{AGENT_BLOCK_END}"
+    # An orphan START marker in owner prose must not anchor the match: the
+    # lazy span may not cross another START, so only the real block (the
+    # last START before an END) is replaced and the owner text before it
+    # survives (installer red team 2026-09-07, E6b).
     pattern = re.compile(
-        re.escape(AGENT_BLOCK_START) + r".*?" + re.escape(AGENT_BLOCK_END),
+        re.escape(AGENT_BLOCK_START)
+        + r"(?:(?!" + re.escape(AGENT_BLOCK_START) + r").)*?"
+        + re.escape(AGENT_BLOCK_END),
         re.DOTALL,
     )
     if pattern.search(existing):
@@ -14478,6 +14711,7 @@ def code_update_receipt_identity(manifest):
     if identity not in {
         ("5.0.3", V5_0_2_VERSION),
         (V5_1_0_ENGINE_VERSION, MEMORY_FORMAT_VERSION),
+        (V5_1_1_ENGINE_VERSION, MEMORY_FORMAT_VERSION),
         (ENGINE_VERSION, MEMORY_FORMAT_VERSION),
     }:
         raise BimriError(
@@ -15036,13 +15270,14 @@ def activation_manifest_differences(before, after):
     ]
 
 
-def cmd_code_only_update(
-    source_paths,
-    paths,
-    python_executable,
-    quiescent,
-    source_version,
-):
+def require_quiescent_v5_handoff(quiescent, source_version):
+    """Every existing v5 store needs the caller's old-process attestation.
+
+    Both update routes replace the program file and advance the persisted
+    state version. The lock serializes commands but cannot fence a process
+    that already loaded the old engine, so the precondition is the same for
+    the v5.0/v5.0.1 upgrade route and the v5.0.2/v5.1.0 code-only route.
+    """
     if not quiescent:
         raise BimriError(
             f"updating an existing v{source_version} store requires an externally verified "
@@ -15050,6 +15285,16 @@ def cmd_code_only_update(
             "retry install with --quiescent. The lock cannot enforce that "
             "old-process shutdown."
         )
+
+
+def cmd_code_only_update(
+    source_paths,
+    paths,
+    python_executable,
+    quiescent,
+    source_version,
+):
+    require_quiescent_v5_handoff(quiescent, source_version)
     backup_root = paths.root / ".bimri-update-backups"
     policy = CodeUpdateDestinationPolicy(paths)
     backup_dir = None
@@ -15109,7 +15354,14 @@ def cmd_code_only_update(
         state_backup_path = backup_dir / f"state-v{source_version}-exact.json"
         policy.copy(paths.state, state_backup_path)
         manifest.update({
-            "mode": "lossless-authority-activation",
+            # A same-format update touches no memory record, so its receipt
+            # keeps the stricter code-only-update label; only a store written
+            # at an older memory format is activated (v5.1.2).
+            "mode": (
+                "code-only-update"
+                if source_version == MEMORY_FORMAT_VERSION
+                else "lossless-authority-activation"
+            ),
             "source_memory_format": source_version,
             "state_backup": state_backup_path.relative_to(backup_dir).as_posix(),
             "state_backup_sha256": sha256_bytes(source_state_bytes),
@@ -15331,6 +15583,12 @@ def cmd_install(source_paths, target, quiescent=False):
     if target_paths.state.exists() or path_is_redirected(target_paths.state):
         raw_state = read_json_strict(target_paths.state, "target state.json")
         source_version = raw_state.get("bimri_version")
+        if source_version in COMPATIBLE_ARTIFACT_VERSIONS:
+            # Every existing v5 store shares one handoff precondition. Apply it
+            # before routing by source version so the v5.0/v5.0.1 upgrade
+            # route cannot bypass the attestation the v5.0.2/v5.1.0 route
+            # requires. v4 and older keep their own writer-quiescence checks.
+            require_quiescent_v5_handoff(quiescent, source_version)
         if source_version in {V5_0_2_VERSION, MEMORY_FORMAT_VERSION}:
             return cmd_code_only_update(
                 source_paths,
@@ -15533,12 +15791,55 @@ def cmd_install(source_paths, target, quiescent=False):
         print(f"Repair warning: {warning}")
 
 
-def hook_payload():
+def hook_payload_diagnosed():
+    """Parse Claude's hook JSON from stdin and say why it was unusable."""
     try:
-        data = json.load(sys.stdin)
-    except (json.JSONDecodeError, OSError):
-        data = {}
-    return data if isinstance(data, dict) else {}
+        raw = sys.stdin.read()
+    except (OSError, UnicodeError, ValueError) as exc:
+        return {}, f"stdin could not be read ({exc.__class__.__name__})"
+    if not raw or not raw.strip():
+        return {}, "stdin was empty"
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}, "stdin was not valid JSON"
+    if not isinstance(data, dict):
+        return {}, "stdin JSON was not an object"
+    return data, None
+
+
+def hook_payload():
+    payload, _diagnosis = hook_payload_diagnosed()
+    return payload
+
+
+def hook_session_identity(payload):
+    """Return the stable session identity Claude sent, or None."""
+    for field in ("session_id", "transcript_path"):
+        value = payload.get(field)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            value = str(value)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def hook_close_summary(reason):
+    """Bound and flatten the SessionEnd reason so it can never fail a close."""
+    if isinstance(reason, str):
+        text = reason
+    elif reason is None:
+        text = "ended"
+    else:
+        text = str(reason)
+    text = " ".join(
+        "".join(ch if ord(ch) >= 32 else " " for ch in text).split()
+    )
+    if len(text) > 200:
+        text = text[:197] + "..."
+    return f"Claude Code SessionEnd: {text or 'ended'}"
 
 
 def build_parser():
@@ -15571,7 +15872,9 @@ def build_parser():
     propose.add_argument("--kind", choices=sorted(TIER1_KINDS))
     propose.add_argument("--importance", type=int, choices=range(1, 6))
     propose.add_argument("--status", choices=sorted(TIER2_STATUSES))
-    propose.add_argument("--trust", choices=sorted(TRUSTS), default="working")
+    propose.add_argument(
+        "--trust", choices=sorted(AUTHORABLE_TRUSTS), default="working"
+    )
     propose.add_argument("--source", choices=sorted(SOURCES), default="agent")
     propose.add_argument("--tags")
     propose.add_argument("--text")
@@ -15628,15 +15931,18 @@ def build_parser():
     recall_group.add_argument("--query")
     recall.add_argument("--history", action="store_true")
     recall.add_argument("--limit", type=int, default=20)
+    recall.add_argument("--json", action="store_true")
 
     get_memory = sub.add_parser("get")
     get_memory.add_argument("--key", required=True)
     get_memory.add_argument("--history", action="store_true")
     get_memory.add_argument("--limit", type=int, default=20)
+    get_memory.add_argument("--json", action="store_true")
 
     search = sub.add_parser("search")
     search.add_argument("--query", required=True)
     search.add_argument("--limit", type=int, default=20)
+    search.add_argument("--json", action="store_true")
 
     sub.add_parser("status")
     doctor = sub.add_parser("doctor")
@@ -15758,6 +16064,7 @@ def main(argv=None):
                 query=args.query,
                 history=(args.history if args.key is not None else True),
                 limit=args.limit,
+                output="json" if args.json else "tsv",
             )
         elif command == "get":
             return cmd_recall(
@@ -15765,6 +16072,7 @@ def main(argv=None):
                 key=args.key,
                 history=args.history,
                 limit=args.limit,
+                output="json" if args.json else "tsv",
             )
         elif command == "search":
             return cmd_recall(
@@ -15772,6 +16080,7 @@ def main(argv=None):
                 query=args.query,
                 history=True,
                 limit=args.limit,
+                output="json" if args.json else "tsv",
             )
         elif command == "status":
             return cmd_status(paths)
@@ -15811,18 +16120,30 @@ def main(argv=None):
             for warning in migration_warnings:
                 print(f"Repair warning: {warning}")
         elif command == "hook-start":
-            payload = hook_payload()
-            cmd_start(
-                paths, "claude-code",
-                str(payload.get("session_id") or payload.get("transcript_path") or uuid.uuid4()),
-            )
+            payload, diagnosis = hook_payload_diagnosed()
+            session = hook_session_identity(payload)
+            if session is None:
+                # A run without a stable identity can never be closed by the
+                # matching SessionEnd hook, so refuse before any mutation.
+                # SessionStart hooks never block on a non-zero exit: the
+                # session opens without a brief and the wrapper records the
+                # exit code for the operator.
+                raise BimriError(
+                    "hook-start opened no run: "
+                    + (
+                        diagnosis
+                        or "the payload carries no session_id or transcript_path"
+                    )
+                    + ". [hook-identity-missing]"
+                )
+            cmd_start(paths, "claude-code", session)
         elif command == "hook-close":
             payload = hook_payload()
-            session = str(payload.get("session_id") or payload.get("transcript_path") or "")
             cmd_close(
-                paths, actor="claude-code", session=session or None,
+                paths, actor="claude-code",
+                session=hook_session_identity(payload),
                 outcome="partial",
-                summary=f"Claude Code SessionEnd: {payload.get('reason', 'ended')}",
+                summary=hook_close_summary(payload.get("reason", "ended")),
                 allow_unmapped=True,
             )
         elif command == "install":
@@ -15845,5 +16166,89 @@ def main(argv=None):
     return 0
 
 
+def is_closed_console_pipe(stream, error):
+    if isinstance(error, BrokenPipeError) or getattr(error, "errno", None) == errno.EPIPE:
+        return True
+    # Windows can report EINVAL for a disconnected pipe. EINVAL on a regular
+    # output file is a real failure, so require an actual pipe descriptor.
+    if os.name == "nt" and getattr(error, "errno", None) == errno.EINVAL:
+        try:
+            return stat.S_ISFIFO(os.fstat(stream.fileno()).st_mode)
+        except (OSError, ValueError, AttributeError):
+            pass
+    return False
+
+
+def discard_console_buffer(stream):
+    """Drain failed output only after its pipe closed or failure was recorded."""
+    if isinstance(stream, PipeTolerantConsole):
+        stream.discard_output = True
+        stream = stream.stream
+    try:
+        null = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(null, stream.fileno())
+        finally:
+            os.close(null)
+        stream.flush()
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+class PipeTolerantConsole:
+    """Let commands finish when a pipe reader leaves, including mid-command."""
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.discard_output = False
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+    def write(self, text):
+        if not self.discard_output:
+            try:
+                return self.stream.write(text)
+            except OSError as exc:
+                if not is_closed_console_pipe(self.stream, exc):
+                    raise
+                discard_console_buffer(self)
+        return len(text)
+
+    def flush(self):
+        if not self.discard_output:
+            try:
+                self.stream.flush()
+            except OSError as exc:
+                if not is_closed_console_pipe(self.stream, exc):
+                    raise
+                discard_console_buffer(self)
+
+
+def flush_console_streams():
+    """Return false for real output failures; preserve closed-pipe exit codes."""
+    succeeded = True
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None:
+            continue
+        try:
+            stream.flush()
+        except (OSError, ValueError) as exc:
+            if not is_closed_console_pipe(stream, exc):
+                succeeded = False
+                with contextlib.suppress(OSError, ValueError):
+                    print(f"BIMRI ERROR: output failed: {exc}", file=sys.stderr)
+            # Avoid Python replacing the chosen failure code with exit 120.
+            discard_console_buffer(stream)
+    return succeeded
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name)
+        if stream is not None:
+            setattr(sys, name, PipeTolerantConsole(stream))
+    exit_code = main()
+    if not flush_console_streams():
+        exit_code = exit_code or 2
+    sys.exit(exit_code)

@@ -6,7 +6,7 @@ This document is the normative protocol for a portable, human-governed BIMRI
 memory folder. `AGENTS.md` is the short runtime adapter. `bimri-engine.py` is
 the reference implementation.
 
-The reference engine is v5.1.1. The mutable state and new authority-record
+The reference engine is v5.1.2. The mutable state and new authority-record
 format remain v5.1.0, and the readable `bimri.md` line grammar and header remain
 v5.0.2 because v5.1 changes subject lifecycle and residency rather than the
 visible line syntax. Frozen v5.0-v5.0.2 artifacts retain their original version
@@ -119,25 +119,35 @@ durable records. `index.tsv` is a derived, non-authoritative cache. It MAY be
 deleted and rebuilt from canonical hot and cold memory, logs, and archives; an
 index failure MUST NOT alter the outcome of a memory mutation.
 
-Reference-engine note (non-normative): engine v5.1.1 may maintain a compact
+Reference-engine note (non-normative): engine v5.1.2 maintains a compact
 `audit-witness.json` checkpoint and separate `audit-manifest.json` path-and-hash
-evidence for a successful full integrity audit. Current-only reads may validate
-the checkpoint, accepted head, current state, and one selected cold binding
-without traversing historical authority. Authority-changing writes and
-explicit audit, review, search, and historical retrieval perform the full
-check. The checkpoint is a derived cache: divergence from it is a cache miss
-that forces the full semantic audit, never a stored verdict of its own. When
-that audit passes over divergence the engine cannot attribute to its own
-recorded operation, it first durably records a sealed drift receipt
-(bounded to the newest 200, each sealing the diverging paths with prior and
-current hashes up to a documented per-section bound, with the complete
-delta pinned in a validated attachment when truncated) under
-`.bimri/audit-drift/`, then continues; when the audit fails, the store
-refuses into damaged-authority recovery exactly as it would without a
-checkpoint and invalidates the checkpoint (its bytes remain as the prior
-baseline; its epoch binding advances), so later warm reads and starts
-re-prove the store and report the recovery condition rather than serving
-past it.
+evidence for a successful full integrity audit. The checkpoint binds the engine
+release and an authority policy version, so an engine update makes the
+previous checkpoint a cache miss that the next command re-proves. Sealed
+v5.1.1 checkpoints remain valid as comparison evidence in quarantine and
+interrupted-operation records. Recovering those records does not make an old
+policy checkpoint eligible for current reads; the new policy still requires
+a full semantic audit. Current-only
+reads may validate the checkpoint, accepted head, current state, and one
+selected cold binding without traversing historical authority.
+Authority-changing writes (`propose`, `sync`, authority `close`, `resolve`) and
+explicit audit, `status`, review, search, historical retrieval, `index`,
+`maintain` and `migrate` perform the full check. The checkpoint is a derived
+cache: divergence from it is a cache miss that forces the full semantic audit,
+never a stored verdict of its own. When that audit passes over divergence the
+engine cannot attribute to its own recorded operation, it first durably
+records a sealed drift receipt (bounded to the newest 200, each sealing the
+diverging paths with prior and current hashes up to a documented per-section
+bound, with the complete delta pinned in a validated attachment when
+truncated) under `.bimri/audit-drift/`, then continues. When the audit fails
+at any of those boundaries, the store refuses into damaged-authority recovery
+exactly as it would without a checkpoint and invalidates the checkpoint: at
+every boundary except a degraded `propose` its epoch binding advances and its
+bytes remain as the prior baseline, while a degraded `propose` deletes the
+checkpoint file instead. Read-only `doctor`, the quarantine shadow audit and a
+strict restore comparison never invalidate. Either way later warm reads and
+starts re-prove the store and report the recovery condition rather than
+serving past it.
 `audit-blocked.json` appears only while an owner-approved quarantine holds its
 pre-repair baseline; restoration, or a clean doctor pass after it, clears it.
 The witness-protected roots are flat; an unexpected subdirectory prevents a
@@ -190,7 +200,12 @@ new key, unless the versioned event itself is the permanent subject.
 ```
 
 Each entry occupies exactly one line. New or edited text is single-line UTF-8
-and defaults to a maximum of 500 characters. Migration MAY preserve longer
+and defaults to a maximum of 500 characters. Single-line means the value MUST
+NOT contain a newline, carriage return, tab, other control character, or the
+Unicode line separators U+0085, U+2028 and U+2029; the reference parser splits
+the generated view and run logs on those separators, so a value carrying one
+would be read back as two entries. The same rule applies to a rationale,
+falsifier, conflict question and journal text. Migration MAY preserve longer
 inherited v1-v4 text without truncation when its complete serialized entry,
 including metadata, is at most 4,096 characters; Section 14 defines the
 required overflow behavior. The entire generated view defaults to 49,152
@@ -263,7 +278,9 @@ Tier 1 and Tier 2 claims use these trust values:
 - `working`: useful provisional memory.
 - `confirmed`: directly stated or approved by the human, or asserted by a
   trusted system function.
-- `contested`: awaiting a human resolution.
+- `contested`: awaiting a human resolution. It is derived from a conflict
+  record; a proposal MUST NOT be accepted with it, and a stored record that
+  carries it remains valid.
 
 Claims use these source values:
 
@@ -342,8 +359,10 @@ The engine appends:
 ```
 
 Journal IDs are unique within the run. The log is owned by that run and is
-append-only. Journal detail is the durable body behind a small memory
-headline.
+append-only. Journal text follows the Section 5 single-line rule, including
+the Unicode line separators, because a value that parses as two log lines
+could forge a `[CLOSED:...]` marker. Journal detail is the durable body behind
+a small memory headline.
 
 ### 7.3 Propose
 
@@ -387,15 +406,17 @@ unchanged cold subject appear absent or stale. A true same-key generation
 change still requires `sync` before a new proposal is created.
 
 An admitted proposal binds `base_revision` to that current accepted head and
-`base_hash` to the exact keyed line hash, or literal `absent`. It MAY also carry
-one backward-readable `preflight_receipt` containing the engine release that
-created it, accepted-head revision and hash, and observed key hash. The v5.1.1
-engine writes this receipt on every new proposal and stamps v5.1.1; it also
-accepts earlier v5.1.0 receipts. Older v5.1.0 engines reject v5.1.1-authored
-receipts. When present, the receipt MUST validate against the named immutable
-revision before the proposal may create a new concurrent conflict. A
-receipt-less legacy proposal cannot create a new concurrent conflict and must
-be synced and restaged instead. Proposal records remain immutable.
+`base_hash` to the exact keyed line hash, or literal `absent`. It MAY also
+carry one backward-readable `preflight_receipt` containing the engine release
+that created it, accepted-head revision and hash, and observed key hash. The
+v5.1.2 engine writes this receipt on every new proposal and stamps v5.1.2; it
+accepts v5.1.0, v5.1.1 and v5.1.2 receipts. An older engine rejects a receipt
+stamped by a newer release: v5.1.1 rejects v5.1.2-authored receipts and v5.1.0
+rejects both v5.1.1 and v5.1.2. When present, the receipt MUST validate against
+the named immutable revision before the proposal may create a new concurrent
+conflict. A receipt-less legacy proposal cannot create a new concurrent
+conflict and must be synced and restaged instead. Proposal records remain
+immutable.
 
 Every v5.1 proposal carries an explicit Boolean `new_subject`. A proposal based
 on cold-current memory additionally records `base_storage: cold` and binds the
@@ -464,7 +485,11 @@ with no new exceptional event SHOULD remain compact.
 When more than one run is active, an implementation MUST refuse a close that
 does not identify its target. Closing run A MUST NOT close, stamp, mutate, or
 classify run B. A stale run MAY be shown as an orphan candidate, but it MUST
-NOT be auto-closed.
+NOT be auto-closed. The reference engine treats a run as a candidate when its
+last recorded activity (`last_activity_at`, maintained by journal, propose and
+sync, falling back to `started_at`) is more than 24 hours old, and bounds the
+brief line to a count plus the five newest ids once more than five runs
+qualify, with `status` carrying the full list.
 
 ### 7.5 Owner-Authorized Run Recovery
 
@@ -870,7 +895,10 @@ id  key  loc  trust  source  status  file  headline
 ```
 
 The engine indexes hot memory, keyed cold-current records, journal IDs, and
-historical generations. Archived rows MUST retain the stable key. An agent can
+historical generations. Archived rows MUST retain the stable key. The index is
+an export for external tools: the reference engine's `recall`, `get` and
+`search` build their results directly from the accepted head, the cold-current
+map, the archive and held decisions and do not consult it. An agent can
 retrieve an exact subject or discover one from task language without knowing
 its key:
 
@@ -898,8 +926,8 @@ the index is repaired with:
 ```
 
 The index MUST NOT be used as authority for commit, conflict, trust, archive,
-or recovery decisions. A missing or stale index may reduce retrieval quality
-but does not change accepted memory.
+or recovery decisions. A missing or stale index does not change accepted
+memory, and in the reference engine it changes no retrieval result.
 
 ## 12. Validation and Failure Behavior
 
@@ -939,7 +967,7 @@ diverging paths with their prior and current hashes, inline up to the
 engine's documented per-section bound with any remainder counted
 explicitly, and a truncated receipt MUST reference a hash-and-size-pinned
 attachment carrying the complete delta, retained while the receipt is
-retained and validated with it — as is every other referenced attachment.
+retained and validated with it, as is every other referenced attachment.
 A receipt that cannot be durably recorded and validated MUST prevent the
 rebaseline and surface as an error; receipts MUST be seal-validated before
 their content is trusted or reported; and a sealed witness whose
@@ -989,11 +1017,22 @@ then records that external handoff explicitly:
 <verified-python> bimri-engine.py install --target /absolute/project/path --quiescent
 ```
 
+The reference installer checks the attestation before it routes on the stored
+version, so it applies to v5.0 and v5.0.1 stores as well as v5.0.2 and v5.1.x,
+and a refused install creates nothing in the target.
+
 The installer copies the core files and merges a marked BIMRI block into
-existing `AGENTS.md` and `CLAUDE.md`. Fresh and legacy targets initialize or
-migrate memory, rebuild the index, and run the self-check. An existing v5 target
-uses the non-mutating/lossless update path below and does not rebuild memory or
-the index. Installation SHOULD complete without asking setup questions.
+existing `AGENTS.md` and `CLAUDE.md`. The merge replaces only the text between
+a start marker and the first end marker that follows it with no other start
+marker between, so an orphan start marker in owner prose is left in place.
+Fresh and legacy targets initialize or migrate memory, rebuild the index, and
+run the self-check. An existing v5.0.2 or v5.1.0 target uses the
+non-mutating/lossless update path below and does not rebuild memory or the
+index. A v5.0 or v5.0.1 target upgrades its state under Sections 14.3 and 14.4
+and then runs the lifecycle repair path: it synchronizes the generated view
+through the manual-edit recovery rule, rebuilds the index and runs
+repair-capable validation. Installation SHOULD complete without asking setup
+questions.
 Before its first target mutation, the reference installer MUST re-launch
 itself through its resolved absolute `sys.executable` with a fresh private
 sentinel, enforce a bounded timeout, and validate the exact non-empty response.
@@ -1044,15 +1083,19 @@ records use v5.1.0 while the generated hot-memory grammar remains v5.0.2. The
 committed state version is the writer fence: v5.0.3 MUST reject it before
 mutation.
 
-The update receipt mode is `lossless-authority-activation`. It MUST bind the
-exact `state-v5.0.2-exact.json` backup, before/after state hashes, the
+For a v5.0.2 to v5.1.0 activation the update receipt mode is
+`lossless-authority-activation`. It MUST bind the exact
+`state-v5.0.2-exact.json` backup, before/after state hashes, the
 v5.0.2-to-v5.1.0 version transition, and passed hot/head/immutable-evidence
-preservation results. Prepared, terminal, and rollback-incomplete receipts are
-validated against the engine/version contract that created each receipt, so a
-valid interrupted or completed public v5.0.3 update cannot block recovery by a
-v5.1 installer.
+preservation results. For a same-format update, a v5.1.0 store taking a newer
+engine, the mode is `code-only-update`, and terminal validation of that receipt
+MUST require the protected tree and state digests to be unchanged. Prepared,
+terminal, and rollback-incomplete receipts are validated against the
+engine/version contract that created each receipt, so a valid interrupted or
+completed public v5.0.3 update cannot block recovery by a v5.1 installer.
 
-For an existing v5 target, `--quiescent` is mandatory and every installer
+For every existing v5 target, including v5.0 and v5.0.1, `--quiescent` is
+mandatory, MUST be checked before version routing, and every installer
 mutation MUST be serialized by the same engine lock used by runtime commands.
 The flag records the caller's external handoff; the lock cannot fence an
 already-loaded old process. Before upgrading v1-v4, every old writer and
@@ -1088,8 +1131,14 @@ closed, and run `doctor`. Shared `.claude/settings.json` MUST NOT contain the
 machine-specific absolute interpreter.
 
 A hook session ID maps to one run, so the close hook closes only its own
-session. A close hook for an unmapped session MUST be a successful no-op and
-MUST NOT close a singleton run by inference. Explicit `close` remains strict.
+session. A start hook whose payload carries no stable session identity MUST
+NOT open a run under an invented identity; the reference engine exits 2 with a
+message ending in `[hook-identity-missing]` and creates nothing, and the
+session opens without a brief because the harness does not block on that exit
+code. A close hook for an unmapped session MUST be a successful no-op and
+MUST NOT close a singleton run by inference, and the harness-supplied end
+reason MUST be flattened and bounded before it is recorded so that it cannot
+fail the close. Explicit `close` remains strict.
 Hooks are adapters; they do not change the memory format. The Claude
 adapter is optional. Any local agent that follows the universal instructions
 and uses the engine MAY share the same memory within the lock-domain boundary.
