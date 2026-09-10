@@ -3,6 +3,15 @@
 This file records the public BIMRI architecture history. Historical instruction
 files are preserved under [`legacy/`](legacy/) and are not current installers.
 
+## Unreleased
+
+- Atomic text and byte writes now retry brief Windows access-denied or sharing
+  failures while replacing a file. They retry the same flushed temporary file
+  at most six times, with 0.63 seconds of total requested sleep per replacement.
+  Existing preflight, locking, integrity checks and caller warning behavior are
+  unchanged. Persistent failures still propagate to the caller; other errors
+  and non-Windows writes do not gain retries.
+
 ## 5.1.2
 
 - Kept this release engine-only and defects-only. The authority and

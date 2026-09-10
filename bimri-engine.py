@@ -622,6 +622,27 @@ def ensure_directory_durable(directory):
         fsync_directory(created.parent)
 
 
+def _replace_with_windows_retry(source, destination):
+    """Keep atomic replacement when a Windows reader briefly holds the target."""
+    delays = (0.01, 0.02, 0.04, 0.08, 0.16, 0.32)
+    attempt = 0
+    while True:
+        try:
+            os.replace(source, destination)
+            return
+        except OSError as exc:
+            if (
+                os.name != "nt"
+                or getattr(exc, "winerror", None) not in (5, 32)
+                or attempt >= len(delays)
+            ):
+                raise
+            # Retry only this primitive with the same fully flushed temp file.
+            # Persistent permission failures still reach the caller unchanged.
+            time.sleep(delays[attempt])
+            attempt += 1
+
+
 def atomic_write_text(path, content):
     path = Path(path)
     guard_active_code_update(path, "atomic-write")
@@ -634,7 +655,7 @@ def atomic_write_text(path, content):
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp_name, path)
+        _replace_with_windows_retry(temp_name, path)
         fsync_directory(path.parent)
     except Exception:
         with contextlib.suppress(OSError):
@@ -654,7 +675,7 @@ def atomic_write_bytes(path, content):
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp_name, path)
+        _replace_with_windows_retry(temp_name, path)
         fsync_directory(path.parent)
     except Exception:
         with contextlib.suppress(OSError):
