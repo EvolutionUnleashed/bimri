@@ -7674,7 +7674,7 @@ def uncommitted_owner_resolution(paths, state, key):
         intended = resolution["intended_revision_after"]
         if intended <= state["head_revision"]:
             if resolution_candidate_reflected_at_revision(
-                paths, state, conflict, proposal, intended
+                paths, state, conflict, resolution, proposal, intended
             ):
                 continue
         return resolution["conflict_id"]
@@ -8518,6 +8518,110 @@ def validate_resolution_state_bounds(paths, state, resolution):
     return resolution
 
 
+def resolution_close_effect_at_revision(
+    paths, state, conflict, resolution, proposal, revision_number
+):
+    """Prove the owner's removal of the frozen current generation, not its base."""
+    validate_resolution_record(resolution, conflict=conflict)
+    validate_resolution_state_bounds(paths, state, resolution)
+    if (
+        proposal["operation"] != "close"
+        or proposal["proposal_id"] != resolution["choice"]
+        or proposal["proposal_id"] not in conflict["proposal_ids"]
+        or proposal["key"] != conflict["key"]
+        or resolution["revision_before"] < proposal["base_revision"]
+        or revision_number <= resolution["revision_before"]
+        or resolution.get("intended_revision_after", revision_number)
+        != revision_number
+        or (
+            resolution["status"] == "resolved"
+            and resolution["revision_after"] != revision_number
+        )
+    ):
+        return False
+    removed = conflict_current_at_revision(
+        paths, state, conflict, resolution["revision_before"],
+        f"resolution {conflict['conflict_id']} removed current",
+    )
+    if (
+        removed is None
+        or removed["raw"] != conflict.get("current_line")
+        or line_hash(removed["raw"]) != conflict["current_hash"]
+        or resolution.get("archived_raw") != removed["raw"]
+    ):
+        return False
+
+    closed = []
+    for record in archive_records(paths):
+        if record["proposal_id"] != proposal["proposal_id"]:
+            continue
+        entry = parse_entry_line(record["raw_line"])
+        if entry is None:
+            return False
+        if entry.get("key") == proposal["key"]:
+            closed.append(record)
+        elif record["reason"] != "cooled" or entry["tier"] != 2:
+            return False
+        # Other-key cooling can preserve earlier failed attempts. It never
+        # supplies proof of this removal; normal cold authority checks apply.
+    if (
+        len(closed) != 1
+        or closed[0]["reason"] != "closed"
+        or closed[0]["raw_line"] != removed["raw"]
+    ):
+        return False
+
+    entries = authority_revision_entries(
+        paths, state, revision_number,
+        f"resolution {conflict['conflict_id']} close effect",
+    )
+    if find_entry(entries, proposal["key"]) is not None:
+        return False
+    if revision_number == state["head_revision"]:
+        return bool(
+            state.get("last_revision_reason")
+            == f"accepted {proposal['proposal_id']}"
+            and find_current_entry(entries, state, key=proposal["key"]) is None
+        )
+
+    # A durable resolved record is terminal authority even if a crash left
+    # candidate decisions contested. A synthesized completion or an applying
+    # intent plus an orphan revision cannot establish historical commitment.
+    path = resolution_file_path(paths, conflict["conflict_id"])
+    if path_is_redirected(path) or not path.is_file():
+        return False
+    persisted = validate_resolution_record(
+        read_json_strict(path, path.name), conflict=conflict,
+    )
+    if persisted["status"] != "resolved" or persisted != resolution:
+        return False
+    validate_conflict_candidate_decisions(paths, conflict, resolution=resolution)
+    cold = accepted_cold_current_at_revision(
+        paths, state, proposal["key"], revision_number
+    )
+    if cold is None:
+        return True
+    # Historical reconstruction normally uses finalized writer decisions.
+    # Before their redundant finalization, the terminal resolution supersedes
+    # only the exact older cold generation the owner chose to remove.
+    chosen_path = decision_path(paths, proposal["proposal_id"])
+    chosen = validate_decision(
+        read_json_strict(chosen_path, chosen_path.name), proposal["proposal_id"]
+    )
+    cooling_path = decision_path(paths, cold["archive_proposal_id"])
+    cooling = validate_decision(
+        read_json_strict(cooling_path, cooling_path.name),
+        cold["archive_proposal_id"],
+    )
+    return bool(
+        chosen["outcome"] == "contested"
+        and chosen.get("conflict_id") == conflict["conflict_id"]
+        and cold["raw"] == removed["raw"]
+        and cooling["outcome"] == "accepted"
+        and cooling["revision"] < revision_number
+    )
+
+
 def validate_resolution_effect(paths, state, conflict, resolution):
     validate_resolution_state_bounds(paths, state, resolution)
     starting_current = conflict_current_at_revision(
@@ -8566,14 +8670,6 @@ def validate_resolution_effect(paths, state, conflict, resolution):
     )
     choice = resolution["choice"]
     if choice in conflict["proposal_ids"]:
-        current = find_entry(entries, conflict["key"])
-        if current is None:
-            current = accepted_cold_current_at_revision(
-                paths,
-                state,
-                conflict["key"],
-                resolution["revision_after"],
-            )
         proposal = human_confirmed_proposal(
             authority_proposal(paths, state, choice),
             preserve_source=(
@@ -8581,42 +8677,28 @@ def validate_resolution_effect(paths, state, conflict, resolution):
                 in {V5_0_2_VERSION, MEMORY_FORMAT_VERSION}
             ),
         )
-        reflected = proposal_effect_reflected(proposal, current)
-        if not reflected and proposal["operation"] in {"set", "touch"}:
-            reflected = bool(
-                proposal_cooled_effect(
-                    paths,
-                    state,
-                    proposal,
-                    revision=resolution["revision_after"],
-                )
-                or committed_proposal_effect_at_head(
-                    paths, state, proposal, resolution["revision_after"]
-                )
+        if proposal["operation"] == "close":
+            reflected = resolution_close_effect_at_revision(
+                paths, state, conflict, resolution, proposal,
+                resolution["revision_after"],
             )
-        if reflected and proposal["operation"] == "close":
-            removed_raw = conflict.get("current_line")
-            if resolution.get("archived_raw") != removed_raw:
-                raise BimriError(
-                    "chosen close resolution archived_raw does not match its "
-                    "conflict snapshot."
+        else:
+            current = find_entry(entries, conflict["key"])
+            if current is None:
+                current = accepted_cold_current_at_revision(
+                    paths, state, conflict["key"], resolution["revision_after"]
                 )
-            reflected = bool(
-                removed_raw
-                and (
-                    accepted_archive_effect_by_revision(
-                        paths,
-                        state,
-                        removed_raw,
-                        resolution["revision_after"],
-                        candidate_id=proposal["proposal_id"],
-                        skip_validation_id=proposal["proposal_id"],
+            reflected = proposal_effect_reflected(proposal, current)
+            if not reflected and proposal["operation"] in {"set", "touch"}:
+                reflected = bool(
+                    proposal_cooled_effect(
+                        paths, state, proposal,
+                        revision=resolution["revision_after"],
                     )
                     or committed_proposal_effect_at_head(
                         paths, state, proposal, resolution["revision_after"]
                     )
                 )
-            )
         if not reflected:
             raise BimriError(
                 f"resolved conflict {conflict['conflict_id']} names revision "
@@ -10917,9 +10999,14 @@ def recover_interrupted_authority(paths, state):
                     in {V5_0_2_VERSION, MEMORY_FORMAT_VERSION}
                 ),
             )
-            committed = committed_proposal_effect_at_head(
-                paths, state, proposal, intended
-            )
+            if proposal["operation"] == "close":
+                committed = resolution_close_effect_at_revision(
+                    paths, state, conflict, resolution, proposal, intended
+                )
+            else:
+                committed = committed_proposal_effect_at_head(
+                    paths, state, proposal, intended
+                )
         if not committed:
             continue
         completed = dict(resolution)
@@ -11383,9 +11470,13 @@ def resolution_candidate_reflected(
 
 
 def resolution_candidate_reflected_at_revision(
-    paths, state, conflict, proposal, revision_number
+    paths, state, conflict, resolution, proposal, revision_number
 ):
     """Bind crash recovery to the exact precommitted effect revision."""
+    if proposal["operation"] == "close":
+        return resolution_close_effect_at_revision(
+            paths, state, conflict, resolution, proposal, revision_number
+        )
     entries = authority_revision_entries(
         paths,
         state,
@@ -11396,13 +11487,6 @@ def resolution_candidate_reflected_at_revision(
     if current is None:
         current = accepted_cold_current_at_revision(
             paths, state, conflict["key"], revision_number
-        )
-    if proposal["operation"] == "close":
-        return bool(
-            current is None
-            and committed_proposal_effect_at_head(
-                paths, state, proposal, revision_number
-            )
         )
     return bool(
         proposal_effect_reflected(proposal, current)
@@ -11563,7 +11647,7 @@ def cmd_resolve(paths, conflict_id, choice, human_approved=False):
                 if (
                     intended <= state["head_revision"]
                     and resolution_candidate_reflected_at_revision(
-                        paths, state, conflict, proposal, intended
+                        paths, state, conflict, existing, proposal, intended
                     )
                 ):
                     recovered_revision = intended

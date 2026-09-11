@@ -6,8 +6,10 @@ use os._exit so neither BIMRI nor Python gets a chance to unwind or flush state.
 """
 
 import builtins
+import errno
 import importlib.util
 import io
+import json
 import os
 import re
 import subprocess
@@ -273,6 +275,51 @@ def main():
             return original(*args, **kwargs)
 
         engine.apply_proposal = fail_during_resolution_effect
+    elif mode == "resolution_fail_before_archive_append":
+        original = engine.append_line
+        conflict_id = command[1]
+        choice = command[command.index("--choose") + 1]
+        resolution_path = root / ".bimri" / "resolutions" / f"{conflict_id}.json"
+        closed_record = re.compile(
+            r"\[ARCHIVED:\d{4}-\d{2}-\d{2}\] \[BY:"
+            + re.escape(choice) + r"\] \[closed\] .+"
+        )
+
+        def fail_before_selected_archive_append(path, line):
+            if (
+                Path(path).parent == root / ".bimri" / "archive"
+                and closed_record.fullmatch(line)
+            ):
+                resolution = json.loads(resolution_path.read_text("utf-8"))
+                if (
+                    resolution["status"] != "applying"
+                    or resolution["conflict_id"] != conflict_id
+                    or resolution["choice"] != choice
+                ):
+                    raise AssertionError("archive fault reached without matching intent")
+                print("FORCED_ARCHIVE_APPEND_FAILURE:" + choice, file=sys.stderr)
+                raise OSError(errno.EIO, "forced archive append failure")
+            return original(path, line)
+
+        engine.append_line = fail_before_selected_archive_append
+    elif mode == "resolution_crash_after_resolved_record":
+        original = engine.atomic_write_json
+        conflict_id = command[1]
+        choice = command[command.index("--choose") + 1]
+        resolution_path = root / ".bimri" / "resolutions" / f"{conflict_id}.json"
+
+        def crash_after_selected_resolved_record(path, data):
+            result = original(path, data)
+            if (
+                Path(path) == resolution_path
+                and isinstance(data, dict)
+                and data.get("status") == "resolved"
+                and data.get("choice") == choice
+            ):
+                os._exit(120)
+            return result
+
+        engine.atomic_write_json = crash_after_selected_resolved_record
     elif mode == "resolution_crash_after_applying_record":
         original = engine.atomic_write_json
         resolution_dir = root / ".bimri" / "resolutions"

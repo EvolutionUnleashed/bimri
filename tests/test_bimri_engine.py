@@ -7,7 +7,9 @@ root resolution that real agents use.
 
 import concurrent.futures
 import datetime as dt
+import errno
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -2270,7 +2272,7 @@ class BimriCliTest(unittest.TestCase):
         status = self.cli("status", check=False)
         self.assertIn("AUTHORITY RECOVERY NEEDED", status.stdout)
 
-    def test_stale_close_resolution_archives_removed_current_value_after_retry(self):
+    def prepare_stale_close_conflict(self, cold=False, collateral=False):
         creator = self.start("creator")
         created = self.propose(
             creator,
@@ -2306,20 +2308,48 @@ class BimriCliTest(unittest.TestCase):
         )
         close_id = PROPOSAL_RE.search(close_result.stdout).group(0)
 
+        if cold:
+            state = self.state()
+            state["hot_max_bytes"] = len(self.hot().encode("utf-8")) + 32
+            (self.root / ".bimri" / "state.json").write_text(
+                json.dumps(state, indent=2, sort_keys=True) + "\n", "utf-8"
+            )
+        value_b = "Value B that the human ultimately removes."
+        if cold:
+            value_b += " " + "b" * 390
         changed = self.propose(
             changer,
             "stale.close",
-            "Value B that the human ultimately removes.",
+            value_b,
             source="agent",
             trust="working",
         )
         self.cli("sync", "--run", changer)
         self.assertEqual(self.decision(changed)["outcome"], "accepted")
-        line_b = next(
-            line for line in self.hot().splitlines() if "[K:stale.close]" in line
-        )
+        if cold:
+            self.assertNotIn("[K:stale.close]", self.hot())
+            line_b = self.state()["cold_current"]["stale.close"]["raw_line"]
+        else:
+            line_b = next(
+                line for line in self.hot().splitlines() if "[K:stale.close]" in line
+            )
         self.assertIn("Value B that the human ultimately removes.", line_b)
         self.assertNotIn("Value A from the stale run base.", line_b)
+
+        if collateral:
+            self.assertTrue(cold, "collateral fixture requires a cold close")
+            state = self.state()
+            state["hot_max_bytes"] = 16384
+            (self.root / ".bimri" / "state.json").write_text(
+                json.dumps(state, indent=2, sort_keys=True) + "\n", "utf-8"
+            )
+            other_run = self.start("collateral-hot-writer")
+            self.propose(
+                other_run, "collateral.subject", "Other current subject. " + "c" * 300,
+                source="agent", trust="working",
+            )
+            self.cli("sync", "--run", other_run)
+            self.assertIn("[K:collateral.subject]", self.hot())
 
         self.cli("sync", "--run", stale_closer)
         contested = self.decision(close_id)
@@ -2342,21 +2372,50 @@ class BimriCliTest(unittest.TestCase):
         self.assertIn("preserve the exact prior line", review.stdout)
         self.assertNotIn("promote", review.stdout.lower())
 
-        archive_path = (
-            self.root
-            / ".bimri"
-            / "archive"
-            / f"{dt.date.today():%Y-%m}.md"
-        )
-        external_archive = self.root / "external-archive-sentinel.md"
-        external_content = "external archive sentinel\n"
-        external_archive.write_text(external_content, "utf-8")
-        try:
-            archive_path.symlink_to(external_archive)
-        except (NotImplementedError, OSError) as exc:
-            self.skipTest(f"symbolic links unavailable: {exc}")
+        if collateral:
+            collateral_line = next(
+                line for line in self.hot().splitlines()
+                if "[K:collateral.subject]" in line
+            )
+            state = self.state()
+            state["hot_max_bytes"] = (
+                len(self.hot().encode("utf-8"))
+                - len(collateral_line.encode("utf-8")) // 2
+            )
+            (self.root / ".bimri" / "state.json").write_text(
+                json.dumps(state, indent=2, sort_keys=True) + "\n", "utf-8"
+            )
+        return close_id, conflict_id, line_a, line_b, changed
 
-        failed = self.cli(
+    def monthly_archive_snapshot(self):
+        return {
+            path.name: path.read_bytes()
+            for path in (self.root / ".bimri" / "archive").glob("*.md")
+        }
+
+    def test_stale_close_resolution_archives_removed_current_value_after_retry(self):
+        close_id, conflict_id, line_a, line_b, changed = (
+            self.prepare_stale_close_conflict()
+        )
+        archive_before = self.monthly_archive_snapshot()
+        self.assertTrue(archive_before)
+        prior_records = [
+            line
+            for content in archive_before.values()
+            for line in content.decode("utf-8").splitlines()
+        ]
+        self.assertEqual(len(prior_records), 1)
+        self.assertRegex(
+            prior_records[0],
+            r"^\[ARCHIVED:\d{4}-\d{2}-\d{2}\] \[BY:"
+            + re.escape(changed) + r"\] \[replaced\] " + re.escape(line_a) + r"$",
+        )
+        hot_before = (self.root / "bimri.md").read_bytes()
+        revisions = self.root / ".bimri" / "revisions"
+        revisions_before = {path.name: path.read_bytes() for path in revisions.glob("*.md")}
+
+        failed = self.worker(
+            "resolution_fail_before_archive_append",
             "resolve",
             conflict_id,
             "--choose",
@@ -2365,8 +2424,16 @@ class BimriCliTest(unittest.TestCase):
             check=False,
         )
         self.assertEqual(failed.returncode, 2)
-        self.assertIn("monthly archive file cannot be a symbolic link", failed.stderr)
-        self.assertEqual(external_archive.read_text("utf-8"), external_content)
+        self.assertIn("forced archive append failure", failed.stderr)
+        self.assertEqual(
+            failed.stderr.count("FORCED_ARCHIVE_APPEND_FAILURE:" + close_id), 1
+        )
+        self.assertEqual(self.monthly_archive_snapshot(), archive_before)
+        self.assertEqual((self.root / "bimri.md").read_bytes(), hot_before)
+        self.assertEqual(
+            {path.name: path.read_bytes() for path in revisions.glob("*.md")},
+            revisions_before,
+        )
         self.assertIn("[K:stale.close]", self.hot())
         self.assertIn("Value B that the human ultimately removes.", self.hot())
         self.assertEqual(self.state()["head_revision"], 2)
@@ -2376,14 +2443,7 @@ class BimriCliTest(unittest.TestCase):
         )
         failed_resolution = json.loads(resolution_path.read_text("utf-8"))
         self.assertEqual(failed_resolution["status"], "failed")
-        self.assertIn(
-            "Value B that the human ultimately removes.",
-            failed_resolution["archived_raw"],
-        )
-        self.assertNotIn(
-            "Value A from the stale run base.",
-            failed_resolution["archived_raw"],
-        )
+        self.assertEqual(failed_resolution["archived_raw"], line_b)
         self.assertEqual(self.decision(close_id)["outcome"], "contested")
 
         revisions = self.root / ".bimri" / "revisions"
@@ -2393,7 +2453,6 @@ class BimriCliTest(unittest.TestCase):
         self.assertIn("Value B that the human ultimately removes.", revision_b)
         self.assertFalse((revisions / "V000003.md").exists())
 
-        archive_path.unlink()
         recovered = self.cli(
             "resolve",
             conflict_id,
@@ -2411,19 +2470,29 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(final_resolution["status"], "resolved")
         self.assertEqual(final_resolution["revision_before"], 2)
         self.assertEqual(final_resolution["revision_after"], 3)
+        self.assertEqual(final_resolution["archived_raw"], line_b)
         self.assertEqual(final_decision["outcome"], "accepted")
         self.assertEqual(final_decision["initial_outcome"], "contested")
         self.assertEqual(final_decision["resolution_id"], conflict_id)
 
-        archive_text = archive_path.read_text("utf-8")
-        self.assertIn("Value B that the human ultimately removes.", archive_text)
-        self.assertNotIn("Value A from the stale run base.", archive_text)
-        self.assertEqual(archive_text.count(f"[BY:{close_id}]"), 1)
+        archive_after = self.monthly_archive_snapshot()
+        self.assertTrue(set(archive_before).issubset(archive_after))
+        additions = []
+        for name, content in archive_after.items():
+            previous = archive_before.get(name, b"")
+            self.assertTrue(content.startswith(previous), "prior archive bytes changed")
+            additions.extend(content[len(previous):].decode("utf-8").splitlines())
+        self.assertEqual(len(additions), 1)
+        self.assertRegex(
+            additions[0],
+            r"^\[ARCHIVED:\d{4}-\d{2}-\d{2}\] \[BY:"
+            + re.escape(close_id) + r"\] \[closed\] " + re.escape(line_b) + r"$",
+        )
         stable_resolution = resolution_path.read_bytes()
         stable_decision = (
             self.root / ".bimri" / "decisions" / f"{close_id}.json"
         ).read_bytes()
-        stable_archive = archive_path.read_bytes()
+        stable_archive = self.monthly_archive_snapshot()
 
         repeated = self.cli(
             "resolve",
@@ -2438,8 +2507,414 @@ class BimriCliTest(unittest.TestCase):
             (self.root / ".bimri" / "decisions" / f"{close_id}.json").read_bytes(),
             stable_decision,
         )
-        self.assertEqual(archive_path.read_bytes(), stable_archive)
+        self.assertEqual(self.monthly_archive_snapshot(), stable_archive)
         self.assertIn("Open conflicts: 0", self.cli("status").stdout)
+
+    def assert_stale_close_archive_effect(self, fixture, archive_before, collateral=False):
+        close_id, conflict_id, line_a, line_b, _ = fixture
+        archive_after = self.monthly_archive_snapshot()
+        self.assertTrue(set(archive_before).issubset(archive_after))
+        additions = []
+        for name, content in archive_after.items():
+            previous = archive_before.get(name, b"")
+            self.assertTrue(content.startswith(previous), "prior archive bytes changed")
+            additions.extend(content[len(previous):].decode("utf-8").splitlines())
+        closed = [line for line in additions if f"[BY:{close_id}] [closed] " in line]
+        self.assertEqual(len(closed), 1, additions)
+        self.assertRegex(
+            closed[0], r"^\[ARCHIVED:\d{4}-\d{2}-\d{2}\] \[BY:"
+            + re.escape(close_id) + r"\] \[closed\] " + re.escape(line_b) + r"$",
+        )
+        self.assertNotEqual(line_a, line_b)
+        if collateral:
+            cooled = [line for line in additions if f"[BY:{close_id}] [cooled] " in line]
+            self.assertEqual(len(cooled), 1, additions)
+            self.assertIn("[K:collateral.subject]", cooled[0])
+            cold_record = self.state()["cold_current"]["collateral.subject"]
+            self.assertEqual(cold_record["archived_by"], close_id)
+            self.assertTrue(cooled[0].endswith(" " + cold_record["raw_line"]))
+            self.assertEqual(len(additions), 2)
+        else:
+            self.assertEqual(len(additions), 1)
+        self.assertNotIn("[K:stale.close]", self.hot())
+        self.assertNotIn("stale.close", self.state()["cold_current"])
+        resolution = json.loads((
+            self.root / ".bimri" / "resolutions" / f"{conflict_id}.json"
+        ).read_text("utf-8"))
+        self.assertEqual(resolution["status"], "resolved")
+        self.assertEqual(resolution["archived_raw"], line_b)
+        decision = self.decision(close_id)
+        self.assertEqual(decision["outcome"], "accepted")
+        self.assertEqual(decision["initial_outcome"], "contested")
+        self.assertEqual(decision["resolution_id"], conflict_id)
+        self.assertEqual(decision["revision"], resolution["revision_after"])
+        self.assertIn("PASSED", self.cli("doctor", "--read-only").stdout)
+        return resolution
+
+    def assert_old_close_preserves_later_generation(self, fixture, cold=False):
+        close_id, conflict_id, _, _, _ = fixture
+        resolution_path = self.root / ".bimri" / "resolutions" / f"{conflict_id}.json"
+        decision_path = self.root / ".bimri" / "decisions" / f"{close_id}.json"
+        old_resolution = resolution_path.read_bytes()
+        old_decision = decision_path.read_bytes()
+        state = self.state()
+        state["hot_max_bytes"] = 16384
+        (self.root / ".bimri" / "state.json").write_text(
+            json.dumps(state, indent=2, sort_keys=True) + "\n", "utf-8"
+        )
+        other = self.start("later-unrelated")
+        self.propose(other, "later.unrelated", "Unrelated accepted later value.")
+        self.cli("sync", "--run", other)
+        if cold:
+            state = self.state()
+            state["hot_max_bytes"] = len(self.hot().encode("utf-8")) + 32
+            (self.root / ".bimri" / "state.json").write_text(
+                json.dumps(state, indent=2, sort_keys=True) + "\n", "utf-8"
+            )
+        later = self.start("later-reintroduction")
+        value_c = "Value C must survive the old close."
+        if cold:
+            value_c += " " + "z" * 390
+        self.propose(
+            later, "stale.close", value_c, new_subject=True,
+            source="agent", trust="working",
+        )
+        self.cli("sync", "--run", later)
+        if cold:
+            self.assertIn("stale.close", self.state()["cold_current"])
+        else:
+            self.assertIn(value_c, self.hot())
+        head_before = self.state()["head_revision"]
+        hot_before = (self.root / "bimri.md").read_bytes()
+        cold_before = self.state()["cold_current"]
+        archives_before = self.monthly_archive_snapshot()
+        repeated = self.cli("resolve", conflict_id, "--choose", close_id)
+        self.assertIn("already resolved", repeated.stdout)
+        self.assertEqual(self.state()["head_revision"], head_before)
+        self.assertEqual((self.root / "bimri.md").read_bytes(), hot_before)
+        self.assertEqual(self.state()["cold_current"], cold_before)
+        self.assertEqual(self.monthly_archive_snapshot(), archives_before)
+        self.assertEqual(resolution_path.read_bytes(), old_resolution)
+        self.assertEqual(decision_path.read_bytes(), old_decision)
+        self.assertIn(value_c, self.cli("recall", "--key", "stale.close").stdout)
+        self.assertIn("PASSED", self.cli("doctor", "--read-only").stdout)
+
+    def test_stale_close_hot_and_cold_resolution_crash_matrix(self):
+        outer_root = self.root
+        modes = (
+            (None, None),
+            ("resolution_fail_before_archive_append", 2),
+            ("crash_after_revision", 91),
+            ("resolution_crash_after_force_apply", 106),
+            ("resolution_crash_after_resolved_record", 120),
+        )
+        try:
+            for cold in (False, True):
+                for mode, exit_code in modes:
+                    with self.subTest(cold=cold, boundary=mode or "direct"):
+                        self.root = outer_root / f"{cold}-{mode or 'direct'}"
+                        fixture = self.prepare_stale_close_conflict(cold=cold)
+                        close_id, conflict_id, _, line_b, _ = fixture
+                        archive_before = self.monthly_archive_snapshot()
+                        revision_before = self.state()["head_revision"]
+                        expected_head = revision_before + 1
+                        expected_effect = revision_before + 1
+                        orphan_path = None
+                        orphan_before = None
+                        proposal_path = self.root / ".bimri" / "proposals" / f"{close_id}.json"
+                        proposal_before = proposal_path.read_bytes()
+                        resolution_path = self.root / ".bimri" / "resolutions" / f"{conflict_id}.json"
+                        if mode:
+                            stopped = self.worker(
+                                mode, "resolve", conflict_id, "--choose", close_id,
+                                "--human-approved", check=False,
+                            )
+                            self.assertEqual(stopped.returncode, exit_code, stopped.stdout + stopped.stderr)
+                            interrupted = json.loads(resolution_path.read_text("utf-8"))
+                            expected_status = (
+                                "failed" if exit_code == 2 else
+                                "resolved" if exit_code == 120 else "applying"
+                            )
+                            self.assertEqual(interrupted["status"], expected_status)
+                            self.assertEqual(interrupted["archived_raw"], line_b)
+                            self.assertEqual(self.decision(close_id)["outcome"], "contested")
+                            if exit_code == 2:
+                                self.assertEqual(stopped.stderr.count("FORCED_ARCHIVE_APPEND_FAILURE:" + close_id), 1)
+                                self.assertEqual(self.state()["head_revision"], revision_before)
+                                self.assertEqual(self.monthly_archive_snapshot(), archive_before)
+                            elif exit_code == 91:
+                                self.assertEqual(self.state()["head_revision"], revision_before)
+                                orphan_path = self.root / ".bimri" / "revisions" / f"V{revision_before + 1:06d}.md"
+                                orphan_before = orphan_path.read_bytes()
+                                self.assertNotIn(b"[K:stale.close]", orphan_before)
+                                expected_head = revision_before + 2
+                                expected_effect = revision_before + 2
+                            else:
+                                self.assertEqual(self.state()["head_revision"], revision_before + 1)
+                            if exit_code == 106:
+                                self.start("silent-resolution-recovery")
+                                silently_recovered = json.loads(resolution_path.read_text("utf-8"))
+                                self.assertEqual(silently_recovered["status"], "resolved")
+                                self.assertEqual(self.decision(close_id)["outcome"], "accepted")
+                            if exit_code == 120:
+                                # A real later command may itself finalize the durable
+                                # resolved record; it must admit that authority safely.
+                                later = self.start("after-resolved-record-crash")
+                                self.propose(later, "after.crash", "Later unrelated committed value.")
+                                self.cli("sync", "--run", later)
+                                expected_head = self.state()["head_revision"]
+                                self.assertGreater(expected_head, revision_before + 1)
+                        self.cli("resolve", conflict_id, "--choose", close_id, "--human-approved")
+                        resolution = self.assert_stale_close_archive_effect(fixture, archive_before)
+                        self.assertEqual(resolution["revision_before"], revision_before)
+                        self.assertEqual(resolution["revision_after"], expected_effect)
+                        self.assertEqual(self.state()["head_revision"], expected_head)
+                        if orphan_path is not None:
+                            self.assertEqual(orphan_path.read_bytes(), orphan_before)
+                        self.assertEqual(proposal_path.read_bytes(), proposal_before)
+                        stable_archives = self.monthly_archive_snapshot()
+                        self.cli("resolve", conflict_id, "--choose", close_id)
+                        self.assertEqual(self.monthly_archive_snapshot(), stable_archives)
+                        self.assertEqual(self.state()["head_revision"], expected_head)
+                        if mode in (None, "resolution_crash_after_resolved_record"):
+                            self.assert_old_close_preserves_later_generation(fixture, cold=cold)
+        finally:
+            self.root = outer_root
+
+    def test_cold_stale_close_preserves_collateral_pressure_cooling(self):
+        fixture = self.prepare_stale_close_conflict(cold=True, collateral=True)
+        close_id, conflict_id, _, _, _ = fixture
+        before = self.monthly_archive_snapshot()
+        self.cli("resolve", conflict_id, "--choose", close_id, "--human-approved")
+        self.assert_stale_close_archive_effect(fixture, before, collateral=True)
+        self.assert_old_close_preserves_later_generation(fixture)
+
+    def test_stale_close_effect_rejects_invalid_evidence_bindings(self):
+        outer_root = self.root
+        self.root = outer_root / "valid-history"
+        try:
+            fixture = self.prepare_stale_close_conflict()
+            close_id, conflict_id, line_a, line_b, changed = fixture
+            self.cli("resolve", conflict_id, "--choose", close_id, "--human-approved")
+            canonical_root = outer_root / "valid-canonical-head"
+            shutil.copytree(self.root, canonical_root)
+            later = self.start("proof-history")
+            self.propose(later, "proof.unrelated", "Advance past the closed effect.")
+            self.cli("sync", "--run", later)
+            valid_root = self.root
+            spec = importlib.util.spec_from_file_location("bimri_close_proof_test", ENGINE)
+            engine = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(engine)
+
+            def read_proof(root):
+                bdir = root / ".bimri"
+                return (
+                    engine.Paths(root),
+                    json.loads((bdir / "state.json").read_text("utf-8")),
+                    json.loads((bdir / "conflicts" / f"{conflict_id}.json").read_text("utf-8")),
+                    json.loads((bdir / "resolutions" / f"{conflict_id}.json").read_text("utf-8")),
+                    json.loads((bdir / "proposals" / f"{close_id}.json").read_text("utf-8")),
+                )
+
+            paths, state, conflict, resolution, proposal = read_proof(valid_root)
+            effect_revision = resolution["revision_after"]
+            self.assertTrue(engine.resolution_close_effect_at_revision(
+                paths, state, conflict, resolution, proposal, effect_revision
+            ))
+            canonical = read_proof(canonical_root)
+            self.assertTrue(engine.resolution_close_effect_at_revision(
+                *canonical, canonical[3]["revision_after"]
+            ))
+            canonical[1]["last_revision_reason"] = "accepted R999999-Q999"
+            try:
+                reflected = engine.resolution_close_effect_at_revision(
+                    *canonical, canonical[3]["revision_after"]
+                )
+            except engine.BimriError:
+                reflected = False
+            self.assertFalse(reflected, "canonical close proof ignored the committed writer")
+            cases = (
+                "missing-receipt", "duplicate-receipt", "wrong-raw", "wrong-reason",
+                "wrong-writer", "wrong-archived-raw", "wrong-current-line",
+                "wrong-current-hash", "wrong-choice", "wrong-before", "wrong-intended",
+                "missing-terminal", "applying-terminal", "wrong-decision-link",
+                "wrong-decision-revision",
+            )
+            for damage in cases:
+                with self.subTest(damage=damage):
+                    self.root = outer_root / damage
+                    shutil.copytree(valid_root, self.root)
+                    paths, state, conflict, resolution, proposal = read_proof(self.root)
+                    resolution_path = paths.resolutions / f"{conflict_id}.json"
+                    conflict_path = paths.conflicts / f"{conflict_id}.json"
+                    if damage in {
+                        "missing-receipt", "duplicate-receipt", "wrong-raw", "wrong-reason", "wrong-writer"
+                    }:
+                        found = []
+                        for path in paths.archive.glob("*.md"):
+                            lines = path.read_text("utf-8").splitlines(keepends=True)
+                            for index, line in enumerate(lines):
+                                if f"[BY:{close_id}] [closed] " in line:
+                                    found.append((path, lines, index, line))
+                        self.assertEqual(len(found), 1)
+                        path, lines, index, line = found[0]
+                        if damage == "missing-receipt":
+                            lines[index] = ""
+                        elif damage == "duplicate-receipt":
+                            lines[index] = line + line
+                        elif damage == "wrong-raw":
+                            lines[index] = line.replace(line_b, line_a)
+                        elif damage == "wrong-reason":
+                            lines[index] = line.replace("[closed]", "[replaced]", 1)
+                        else:
+                            lines[index] = line.replace(f"[BY:{close_id}]", f"[BY:{changed}]", 1)
+                        path.write_text("".join(lines), "utf-8")
+                    elif damage == "wrong-current-line":
+                        conflict["current_line"] = line_a
+                    elif damage == "wrong-current-hash":
+                        conflict["current_hash"] = "0" * 64
+                    elif damage == "wrong-archived-raw":
+                        resolution["archived_raw"] = line_a
+                    elif damage == "wrong-choice":
+                        resolution["choice"] = changed
+                    elif damage == "wrong-before":
+                        resolution["revision_before"] = 0
+                    elif damage == "wrong-intended":
+                        resolution["intended_revision_after"] = effect_revision + 1
+                    elif damage == "applying-terminal":
+                        resolution["status"] = "applying"
+                        resolution.pop("resolved_at", None)
+                        resolution.pop("revision_after", None)
+                    elif damage.startswith("wrong-decision-"):
+                        decision_path = paths.decisions / f"{close_id}.json"
+                        decision = json.loads(decision_path.read_text("utf-8"))
+                        if damage == "wrong-decision-link":
+                            decision["resolution_id"] = "C999999"
+                        else:
+                            decision["revision"] = effect_revision + 1
+                        decision_path.write_text(json.dumps(decision, indent=2, sort_keys=True) + "\n", "utf-8")
+                    conflict_path.write_text(json.dumps(conflict, indent=2, sort_keys=True) + "\n", "utf-8")
+                    resolution_path.write_text(json.dumps(resolution, indent=2, sort_keys=True) + "\n", "utf-8")
+                    if damage == "missing-terminal":
+                        resolution_path.unlink()
+                    try:
+                        reflected = engine.resolution_close_effect_at_revision(
+                            paths, state, conflict, resolution, proposal, effect_revision
+                        )
+                    except engine.BimriError:
+                        reflected = False
+                    self.assertFalse(reflected, "semantic close proof accepted " + damage)
+                    head_before = self.state()["head_revision"]
+                    hot_before = (self.root / "bimri.md").read_bytes()
+                    archives_before = self.monthly_archive_snapshot()
+                    for command in (
+                        ("doctor", "--read-only"),
+                        ("resolve", conflict_id, "--choose", close_id, "--human-approved"),
+                    ):
+                        refused = self.cli(*command, check=False)
+                        expected_code = 1 if command[0] == "doctor" else 2
+                        self.assertEqual(refused.returncode, expected_code, refused.stdout + refused.stderr)
+                        self.assertNotIn("Traceback", refused.stderr)
+                        self.assertEqual(self.state()["head_revision"], head_before)
+                        self.assertEqual((self.root / "bimri.md").read_bytes(), hot_before)
+                        self.assertEqual(self.monthly_archive_snapshot(), archives_before)
+        finally:
+            self.root = outer_root
+
+    def test_stale_close_head_proof_rejects_live_cold_generation(self):
+        fixture = self.prepare_stale_close_conflict(cold=True)
+        close_id, conflict_id, _, _, _ = fixture
+        authentic_cold = dict(self.state()["cold_current"]["stale.close"])
+        self.cli("resolve", conflict_id, "--choose", close_id, "--human-approved")
+        spec = importlib.util.spec_from_file_location("bimri_close_cold_proof_test", ENGINE)
+        engine = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(engine)
+        paths = engine.Paths(self.root)
+        state = self.state()
+        conflict = json.loads((paths.conflicts / f"{conflict_id}.json").read_text("utf-8"))
+        resolution = json.loads((paths.resolutions / f"{conflict_id}.json").read_text("utf-8"))
+        proposal = json.loads((paths.proposals / f"{close_id}.json").read_text("utf-8"))
+        self.assertTrue(engine.resolution_close_effect_at_revision(
+            paths, state, conflict, resolution, proposal, state["head_revision"]
+        ))
+        state["cold_current"]["stale.close"] = authentic_cold
+        try:
+            reflected = engine.resolution_close_effect_at_revision(
+                engine.Paths(self.root), state, conflict, resolution, proposal,
+                state["head_revision"],
+            )
+        except engine.BimriError:
+            reflected = False
+        self.assertFalse(reflected, "absence from hot memory does not prove cold removal")
+        self.assertNotIn("stale.close", self.state()["cold_current"])
+
+    def test_stale_close_resolution_rejects_redirected_archive_before_intent(self):
+        external_archive = self.root / "external-archive-sentinel.md"
+        external_content = b"external archive sentinel\n"
+        external_archive.write_bytes(external_content)
+        probe = self.root / "file-symlink-capability"
+        try:
+            probe.symlink_to(external_archive)
+        except NotImplementedError as exc:
+            self.skipTest(f"file symlinks unsupported: {exc}")
+        except OSError as exc:
+            unsupported = (
+                os.name == "nt" and getattr(exc, "winerror", None) == 1314
+            ) or (
+                os.name == "posix"
+                and exc.errno in {errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP}
+            )
+            if unsupported:
+                self.skipTest(f"file symlink capability unavailable: {exc}")
+            raise
+        self.assertTrue(probe.is_symlink())
+        self.assertEqual(probe.resolve(), external_archive.resolve())
+        probe.unlink()
+
+        close_id, conflict_id, _, _, _ = self.prepare_stale_close_conflict()
+        archive_before = self.monthly_archive_snapshot()
+        self.assertEqual(len(archive_before), 1)
+        archive_path = self.root / ".bimri" / "archive" / next(iter(archive_before))
+        saved_archive = self.root / "saved-monthly-archive.md"
+        hot_before = (self.root / "bimri.md").read_bytes()
+        revisions = self.root / ".bimri" / "revisions"
+        revisions_before = {path.name: path.read_bytes() for path in revisions.glob("*.md")}
+        decision_before = self.decision(close_id)
+        resolution_path = self.root / ".bimri" / "resolutions" / f"{conflict_id}.json"
+        self.assertFalse(resolution_path.exists())
+        planted_target = None
+        archive_path.replace(saved_archive)
+        try:
+            # Fixture mistakes here must fail, never become capability skips.
+            archive_path.symlink_to(external_archive)
+            planted_target = os.readlink(archive_path)
+            failed = self.cli(
+                "resolve", conflict_id, "--choose", close_id, "--human-approved",
+                check=False,
+            )
+            self.assertEqual(failed.returncode, 2)
+            self.assertIn("audit witness refused redirected path", failed.stderr)
+            self.assertIn(archive_path.relative_to(self.root).as_posix(), failed.stderr)
+            self.assertTrue(archive_path.is_symlink())
+            self.assertEqual(os.readlink(archive_path), planted_target)
+            self.assertEqual(external_archive.read_bytes(), external_content)
+            self.assertEqual((self.root / "bimri.md").read_bytes(), hot_before)
+            self.assertEqual(self.state()["head_revision"], 2)
+            self.assertEqual(
+                {path.name: path.read_bytes() for path in revisions.glob("*.md")},
+                revisions_before,
+            )
+            self.assertEqual(self.decision(close_id), decision_before)
+            self.assertFalse(resolution_path.exists())
+        finally:
+            if archive_path.is_symlink():
+                self.assertIsNotNone(planted_target, "unexpected fixture link")
+                self.assertEqual(os.readlink(archive_path), planted_target)
+                archive_path.unlink()
+            self.assertFalse(archive_path.exists(), "unexpected object at archive path")
+            saved_archive.replace(archive_path)
+        self.assertEqual(self.monthly_archive_snapshot(), archive_before)
+        self.cli("doctor")
 
     def test_archive_idempotence_uses_exact_proposal_metadata(self):
         first_run = self.start("archive-decoy")
