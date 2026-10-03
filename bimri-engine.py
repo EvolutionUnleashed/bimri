@@ -29,6 +29,7 @@ import copy
 import contextlib
 import datetime as dt
 import errno
+import functools
 import hashlib
 import json
 import os
@@ -434,6 +435,9 @@ class Paths:
         # Drift observed by the most recent full audit in this process, for
         # read-only reporting surfaces that must not write a receipt.
         self.last_audit_drift = []
+        # Only enabled by reporting commands while they hold the store lock.
+        # Never persisted or reused by a subsequent command or authority write.
+        self.diagnostic_read_cache = None
 
     @property
     def legacy_active(self):
@@ -893,6 +897,47 @@ def existing_store_lock(paths, timeout=10.0):
         )
     with _held_lock(paths.lock.open("r+b"), timeout):
         yield
+
+
+@contextlib.contextmanager
+def diagnostic_read_scope(paths):
+    """Reuse validated facts during one locked, non-authoring report.
+
+    Status enters this scope only after its lifecycle/view repair. The full
+    governance audit still runs; cached facts merely avoid re-reading and
+    re-validating the same historical dependencies. No authority-writing
+    command enables the scope, and no result survives lock release.
+    """
+    if paths.diagnostic_read_cache is not None:
+        raise BimriError("diagnostic read scopes cannot be nested.")
+    paths.diagnostic_read_cache = {}
+    try:
+        yield
+    finally:
+        paths.diagnostic_read_cache = None
+
+
+def diagnostic_cached(key, clone=copy.deepcopy):
+    """Memoize successful read facts only inside diagnostic_read_scope."""
+    def decorate(function):
+        @functools.wraps(function)
+        def read(paths, *args, **kwargs):
+            cache = paths.diagnostic_read_cache
+            if cache is None:
+                return function(paths, *args, **kwargs)
+            identity = (function.__name__, key(*args, **kwargs))
+            if identity not in cache:
+                cache[identity] = function(paths, *args, **kwargs)
+            # Entry dictionaries are annotated by some readers. A caller
+            # must never mutate the snapshot another validation will see.
+            return clone(cache[identity])
+        return read
+    return decorate
+
+
+def copy_flat_records(records):
+    """Copy records whose values are immutable scalars or Path objects."""
+    return [record.copy() for record in records]
 
 
 def read_json_strict(path, label):
@@ -3276,6 +3321,7 @@ def render_content(lines):
     return "\n".join(lines).rstrip() + "\n"
 
 
+@diagnostic_cached(lambda state: None)
 def referenced_revision_numbers(paths, state):
     numbers = {0, state["head_revision"]}
     for path in paths.decisions.glob("*.json"):
@@ -6573,6 +6619,8 @@ def begin_authority_write(
     scope=None,
 ):
     """Verify prior evidence, then durably invalidate before mutation."""
+    if paths.diagnostic_read_cache is not None:
+        raise BimriError("authority writes cannot use a diagnostic read scope.")
     blocked_issues = load_audit_blocked_issues(paths)
     if blocked_issues:
         raise BimriError(
@@ -8394,6 +8442,7 @@ def validate_proposal_base_snapshot(paths, state, proposal):
     return proposal
 
 
+@diagnostic_cached(lambda state, proposal_id: proposal_id)
 def authority_proposal(paths, state, proposal_id):
     path = proposal_path(paths, proposal_id)
     if not path.exists() or path.is_symlink():
@@ -8411,6 +8460,7 @@ def authority_proposal(paths, state, proposal_id):
     return proposal
 
 
+@diagnostic_cached(lambda state, number, label: number, clone=copy_flat_records)
 def authority_revision_entries(paths, state, number, label):
     validate_revision_number(number, f"{label} revision")
     if number > state["head_revision"]:
@@ -9171,6 +9221,7 @@ def validate_cold_archive_snapshot(
     return exact[0]
 
 
+@diagnostic_cached(lambda: None, clone=copy_flat_records)
 def archive_records(paths):
     records = []
     for target in sorted(paths.archive.glob("*.md")):
@@ -11227,9 +11278,41 @@ def inherited_cold_current_at_revision(paths, state, key, revision_number):
     return entry
 
 
-def accepted_cold_current_at_revision(paths, state, key, revision_number):
-    """Derive the latest accepted keyed generation when it was current-cold."""
+@diagnostic_cached(lambda: None)
+def diagnostic_decisions(paths):
+    """Read decision identities once for a locked historical report."""
+    decisions = []
+    for path in sorted(paths.decisions.glob("R*-Q*.json")):
+        if path.is_symlink() or not path.is_file() or not PROPOSAL_RE.fullmatch(path.stem):
+            continue
+        decisions.append(validate_decision(
+            read_json_strict(path, path.name), path.stem
+        ))
+    return decisions
+
+
+def accepted_writers_for_key(paths, state, key, revision_number):
+    """Index historical writers once inside a locked diagnostic only."""
+    cache = paths.diagnostic_read_cache
+    if cache is not None:
+        identity = ("accepted_writer_index", None)
+        if identity not in cache:
+            grouped = {}
+            for decision in diagnostic_decisions(paths):
+                if decision["outcome"] != "accepted":
+                    continue
+                proposal_id = decision["proposal_id"]
+                proposal = authority_proposal(paths, state, proposal_id)
+                grouped.setdefault(proposal["key"], []).append((
+                    decision["revision"], proposal_id, decision, proposal
+                ))
+            cache[identity] = grouped
+        return copy.deepcopy([
+            writer for writer in cache[identity].get(key, [])
+            if writer[0] <= revision_number
+        ])
     writers = []
+    # Keep the original per-record validation path outside reports.
     for path in sorted(paths.decisions.glob("R*-Q*.json")):
         if path.is_symlink() or not path.is_file() or not PROPOSAL_RE.fullmatch(path.stem):
             continue
@@ -11238,9 +11321,17 @@ def accepted_cold_current_at_revision(paths, state, key, revision_number):
         )
         if decision["outcome"] != "accepted" or decision["revision"] > revision_number:
             continue
-        proposal = authority_proposal(paths, state, path.stem)
+        proposal_id = path.stem
+        proposal = authority_proposal(paths, state, proposal_id)
         if proposal["key"] == key:
-            writers.append((decision["revision"], path.stem, decision, proposal))
+            writers.append((decision["revision"], proposal_id, decision, proposal))
+    return writers
+
+
+@diagnostic_cached(lambda state, key, revision_number: (key, revision_number))
+def accepted_cold_current_at_revision(paths, state, key, revision_number):
+    """Derive the latest accepted keyed generation when it was current-cold."""
+    writers = accepted_writers_for_key(paths, state, key, revision_number)
     if not writers:
         return inherited_cold_current_at_revision(
             paths, state, key, revision_number
@@ -12899,7 +12990,7 @@ def cmd_review(paths, conflict_id=None, show_all=False, offset=0, limit=20):
         conflict_id = validate_fixed_id(
             conflict_id, CONFLICT_RE, "conflict ID"
         )
-    with existing_store_lock(paths):
+    with existing_store_lock(paths), diagnostic_read_scope(paths):
         state = load_current_state_read_only(paths)
         conflicts, authority_issues = governance_snapshot(
             paths,
@@ -12980,63 +13071,64 @@ def cmd_status(paths):
     with engine_lock(paths):
         state = load_or_initialize(paths)
         sync_generated_view(paths, state)
-        conflicts, authority_issues = governance_snapshot(
-            paths,
-            state,
-            use_witness=False,
-        )
-        content = revision_path(
-            paths, state["head_revision"]
-        ).read_text(encoding="utf-8")
-        _, status_entries, errors, counts = validate_hot_content(
-            content, state, allow_legacy_overflow=True
-        )
-        outcomes = {}
-        for log in paths.logs.glob("R*.md"):
-            if log.is_symlink():
-                raise BimriError(
-                    f"run log cannot be a symbolic link: {log.name}"
+        with diagnostic_read_scope(paths):
+            conflicts, authority_issues = governance_snapshot(
+                paths,
+                state,
+                use_witness=False,
+            )
+            content = revision_path(
+                paths, state["head_revision"]
+            ).read_text(encoding="utf-8")
+            _, status_entries, errors, counts = validate_hot_content(
+                content, state, allow_legacy_overflow=True
+            )
+            outcomes = {}
+            for log in paths.logs.glob("R*.md"):
+                if log.is_symlink():
+                    raise BimriError(
+                        f"run log cannot be a symbolic link: {log.name}"
+                    )
+                match = re.search(
+                    r"^\[OUTCOME:(success|partial|overflow|fail)\]",
+                    log.read_text(encoding="utf-8"),
+                    re.MULTILINE,
                 )
-            match = re.search(
-                r"^\[OUTCOME:(success|partial|overflow|fail)\]",
-                log.read_text(encoding="utf-8"),
-                re.MULTILINE,
+                if match:
+                    outcomes[match.group(1)] = outcomes.get(match.group(1), 0) + 1
+            groups = classify_review_records(paths, state, conflicts)
+            counts_by_review = review_counts(groups)
+            conflict_total = len(conflicts)
+            proposal_total = sum(
+                PROPOSAL_RE.fullmatch(path.stem) is not None
+                for path in paths.proposals.glob("*.json")
             )
-            if match:
-                outcomes[match.group(1)] = outcomes.get(match.group(1), 0) + 1
-        groups = classify_review_records(paths, state, conflicts)
-        counts_by_review = review_counts(groups)
-        conflict_total = len(conflicts)
-        proposal_total = sum(
-            PROPOSAL_RE.fullmatch(path.stem) is not None
-            for path in paths.proposals.glob("*.json")
-        )
-        revision_total = sum(
-            re.fullmatch(r"V\d{6}\.md", path.name) is not None
-            for path in paths.revisions.glob("V*.md")
-        )
-        held_candidates = []
-        current_by_key = {
-            entry.get("key"): entry
-            for entry in status_entries if entry.get("key")
-        }
-        for key in state.get("cold_current", {}):
-            current_by_key[key] = cold_entry(state, key=key)
-        for path in sorted(paths.decisions.glob("R*-Q*.json")):
-            if path.is_symlink() or not path.is_file():
-                continue
-            data = read_json_strict(path, path.name)
-            if data.get("outcome") != "held":
-                continue
-            decision = validate_decision(data, path.stem)
-            proposal = authority_proposal(paths, state, path.stem)
-            if proposal_equivalent(
-                proposal, current_by_key.get(proposal["key"])
-            ):
-                continue
-            held_candidates.append(
-                (proposal["key"], decision["reason"], proposal["proposal_id"])
+            revision_total = sum(
+                re.fullmatch(r"V\d{6}\.md", path.name) is not None
+                for path in paths.revisions.glob("V*.md")
             )
+            held_candidates = []
+            current_by_key = {
+                entry.get("key"): entry
+                for entry in status_entries if entry.get("key")
+            }
+            for key in state.get("cold_current", {}):
+                current_by_key[key] = cold_entry(state, key=key)
+            for path in sorted(paths.decisions.glob("R*-Q*.json")):
+                if path.is_symlink() or not path.is_file():
+                    continue
+                data = read_json_strict(path, path.name)
+                if data.get("outcome") != "held":
+                    continue
+                decision = validate_decision(data, path.stem)
+                proposal = authority_proposal(paths, state, path.stem)
+                if proposal_equivalent(
+                    proposal, current_by_key.get(proposal["key"])
+                ):
+                    continue
+                held_candidates.append(
+                    (proposal["key"], decision["reason"], proposal["proposal_id"])
+                )
     print(
         f"BIMRI engine v{ENGINE_VERSION} | memory format "
         f"v{MEMORY_FORMAT_VERSION} | revision V{state['head_revision']:06d} | "

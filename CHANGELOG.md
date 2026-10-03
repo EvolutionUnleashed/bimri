@@ -5,6 +5,14 @@ files are preserved under [`legacy/`](legacy/) and are not current installers.
 
 ## Unreleased
 
+- `review` and `status` reuse validated historical dependencies within one
+  locked report and index accepted writers by subject. This removes repeated
+  revision, proposal and archive validation during historical satisfaction
+  checks. Every report still performs the full governance audit; the temporary
+  cache is discarded before releasing the lock and is refused by authority
+  writes. Output, authority formats and write-time validation are unchanged.
+  These commands still hold the exclusive store lock for their audit, so this
+  optimization does not establish a bounded session-start latency guarantee.
 - Atomic text and byte writes now retry brief Windows access-denied or sharing
   failures while replacing a file. They retry the same flushed temporary file
   at most six times, with 0.63 seconds of total requested sleep per replacement.
