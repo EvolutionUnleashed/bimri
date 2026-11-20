@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BIMRI Engine v5.1.2 (authority store v5.1.0; hot grammar v5.0.2)
+BIMRI Engine v5.2.0 (authority store v5.1.0; state v5.2.0; hot grammar v5.0.2)
 Portable, human-governed memory for local agents.
 
 The shared memory is a generated Markdown view. Agents work in independent
@@ -42,6 +42,7 @@ import sys
 import tempfile
 import time
 import uuid
+import weakref
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 try:  # pragma: no cover - platform-specific import
@@ -55,12 +56,25 @@ except ImportError:  # pragma: no cover
     msvcrt = None
 
 
-ENGINE_VERSION = "5.1.2"
+ENGINE_VERSION = "5.2.0"
 V5_1_0_ENGINE_VERSION = "5.1.0"
 V5_1_1_ENGINE_VERSION = "5.1.1"
+V5_1_2_ENGINE_VERSION = "5.1.2"
+# Every authority artifact (proposal, decision, conflict, resolution, witness
+# memory_format_version) stays at the v5.1.0 memory format. Only the state
+# file's version moves, and only on the first authority write (writer gate).
 MEMORY_FORMAT_VERSION = "5.1.0"
+PRIOR_STATE_FORMAT_VERSION = "5.1.0"
+STATE_FORMAT_VERSION = "5.2.0"
+READABLE_STATE_VERSIONS = frozenset({
+    PRIOR_STATE_FORMAT_VERSION, STATE_FORMAT_VERSION,
+})
 HOT_FORMAT_VERSION = "5.0.2"
-AUDIT_WITNESS_SCHEMA = 1
+AUDIT_WITNESS_SCHEMA = 2
+AUDIT_FACTS_SCHEMA = 1
+SAVE_TICKET_SCHEMA = 1
+SETTLEMENT_SCHEMA = 1
+AUDIT_VERDICT_SCHEMA = 1
 AUDIT_MANIFEST_SCHEMA = 1
 AUDIT_BLOCKED_SCHEMA = 1
 AUDIT_DRIFT_SCHEMA = 1
@@ -68,11 +82,110 @@ AUDIT_TRANSITION_SCHEMA = 1
 AUDIT_DRIFT_KEEP = 200
 AUDIT_DRIFT_DELTA_CAP = 2000
 AUDIT_DRIFT_BLOB_KEEP = 20
+# Copy-under-lock audits (D5.3; DESIGN section 05 2-6). The budget bounds
+# only Phase A of a capture, the part taken under the store lock: the mutable
+# small files, the byte length of every in-place-appended file (log/,
+# archive/) and a name/size/mtime_ns inventory of the linked roots. It is the
+# time another command can wait on doctor, review or a full-check read, and
+# it does not grow with history (Phase B links and copies with the lock free).
+# Shipped value (build step 8): Phase A measured three times by doctor on a
+# clone of the ~4,475-file reference store, median 107 ms on a loaded machine
+# (88/107/173 ms; 53 ms quiet: 52/53/54 ms), rounded up with a 14x margin;
+# a 50,000-entry tree measured 209-250 ms.
+AUDIT_COPY_BUDGET_MS = 1500
+AUDIT_COPY_BUDGET_MAX_MS = 600000
+AUDIT_COPY_PREFIX = ".bimri-audit-copy-"
+# Hard links are safe only for roots whose every writer is exclusive-create
+# or temp+os.replace. A future in-place writer under one of these would
+# corrupt a copy mid-audit, so the list is explicit and closed; log/ and
+# archive/ (append_line writes them in place) are byte-copied, never linked.
+AUDIT_COPY_LINKED_ROOTS = (
+    "proposals", "decisions", "conflicts", "resolutions", "revisions",
+    "recovery", "settlements", "migrations",
+)
+AUDIT_COPY_SMALL_FILES = (
+    "state.json", "index.tsv", "audit-witness.json", "audit-manifest.json",
+    "audit-blocked.json", "audit-transition.json", "audit-verdict.json",
+)
+# backups/ holds the legacy and v4 migration backups the migration markers
+# bind (read by every read-only audit of a migrated store); it does not grow
+# with history.
+AUDIT_COPY_SMALL_DIRS = ("audit-manifests", "audit-drift", "saves", "backups")
+# A negative copy result on a moved store re-validates at most this many
+# per-record findings on live bytes (section 05 3.5 item 3).
+AUDIT_COPY_CONFIRM_LIMIT = 200
+AUDIT_COPY_FINDING_RE = re.compile(
+    r"(proposal|decision|conflict|resolution|settlement) (\S+) \(([^()\s]+)\): "
+)
+AUDIT_COPY_DRIFT_LINES = 20
 PRIOR_EVIDENCE_INVALID_PREFIX = "prior audit manifest evidence is invalid"
-# 5.1.2 refuses Unicode line separators inside stored text, so a verdict a
-# 5.1.1 audit published no longer proves what this engine requires; every
-# existing checkpoint re-proves once under the new policy.
-AUTHORITY_POLICY_VERSION = "5.1.2-authority-1"
+# 5.2.0 binds a facts generation and the full-audit time into a schema-2
+# checkpoint, so a verdict an earlier engine published no longer proves what
+# this engine requires; every existing checkpoint re-proves once.
+AUTHORITY_POLICY_VERSION = "5.2.0-authority-1"
+# Sealed checkpoints older engines wrote stay readable as comparison evidence
+# inside transition markers and blocked records, never as a current verdict.
+PRIOR_AUDIT_POLICY_PAIRS = frozenset({
+    (V5_1_1_ENGINE_VERSION, "5.1.1-authority-1"),
+    (V5_1_2_ENGINE_VERSION, "5.1.2-authority-1"),
+})
+AUDIT_WITNESS_SCHEMA_1_FIELDS = frozenset({
+    "witness_schema", "engine_version", "memory_format_version",
+    "policy_version", "created_at", "head_revision", "head_hash",
+    "state_hash", "write_state_hash", "audit_epoch",
+    "run_authority_hash", "manifest_hash", "manifest_count",
+    "proposal_runs", "witness_hash",
+})
+AUDIT_WITNESS_FIELDS = AUDIT_WITNESS_SCHEMA_1_FIELDS | frozenset({
+    "facts_hash", "audited_at", "audit_origin", "scoped_publications",
+})
+AUDIT_ORIGINS = ("full", "scoped", "lifecycle")
+AUDIT_FACTS_FIELDS = frozenset({
+    "facts_schema", "created_at", "manifest_hash", "run_facts",
+    "run_authority_hash", "unsettled", "applying_resolutions",
+    "open_conflicts", "held", "settled", "writers_by_key", "watermarks",
+    "facts_hash",
+})
+AUDIT_VERDICT_FIELDS = frozenset({
+    "verdict_schema", "created_at", "source", "status", "head_revision",
+    "head_hash", "audit_epoch", "manifest_hash", "issue_count", "issues",
+    "copy_capture_ms", "verdict_hash",
+})
+REQUEST_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,99}$")
+OBSERVED_TOKEN_RE = re.compile(
+    r"^V(?P<revision>\d{6}):(?:(?P<storage>hot|cold|head):(?P<hash>[0-9a-f]{64})"
+    r"|(?P<absent>absent))$"
+)
+SAVE_TICKET_FIELDS = frozenset({
+    "ticket_schema", "bimri_version", "engine_release", "request_id", "actor",
+    "status", "created_at", "updated_at", "started_on", "intent",
+    "intent_hash", "observed", "run_id", "proposal_id", "entry_id",
+    "revision", "archive_months", "planned_at", "proposal_sha256",
+    "log_sha256", "result", "finished_at", "ticket_hash",
+})
+SAVE_INTENT_FIELDS = (
+    "operation", "new_subject", "tier", "key", "target", "kind",
+    "importance", "status", "trust", "source", "tags", "text", "rationale",
+    "confidence", "observations", "evidence", "falsifier", "settles",
+    "observed",
+)
+SAVE_PLAN_FIELDS = (
+    "run_id", "proposal_id", "entry_id", "revision", "archive_months",
+    "planned_at", "proposal_sha256", "log_sha256",
+)
+SAVE_RESULT_FIELDS = frozenset({
+    "outcome", "decision", "revision", "conflict_id", "reason", "token",
+    "settled", "cooled", "error",
+})
+SAVE_OUTCOMES = ("accepted", "unchanged", "held", "stale", "conflict", "failed")
+SAVE_RESULT_DECISIONS = frozenset({
+    "accepted", "noop", "held", "contested", "abandoned", None,
+})
+SAVE_EXIT_CODES = {
+    "accepted": 0, "unchanged": 0, "held": 1, "stale": 1, "conflict": 1,
+    "failed": 2,
+}
+SAVE_SOURCES = ("user", "agent", "external")
 HOOK_TIMEOUT_SECONDS = 90
 PREVIOUS_V5_VERSION = "5.0"
 V5_0_1_VERSION = "5.0.1"
@@ -102,10 +215,15 @@ LOG_PROPOSAL_RE = re.compile(
     re.MULTILINE,
 )
 PATTERN_ID_RE = re.compile(r"^P\d+$")
+# v5.2.0 (D2.10): Tier 2 and Tier 3 subjects may be current-but-cold; Tier 1
+# is never cooled. A Tier 3 cold record carries its pattern ID.
+COLD_TIERS = (2, 3)
+COLD_ENTRY_ID_RES = {2: LEGACY_ENTRY_RE, 3: PATTERN_ID_RE}
 ACTOR_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 KEY_RE = re.compile(r"^[a-z0-9]+(?:[.-][a-z0-9]+)*$")
 TAG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,39}$")
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+CONTROL_CHARACTER_RE = re.compile(r"[\x00-\x1f]")
 LEGACY_VERSION_RE = re.compile(
     r"^<!--\s*BIMRI\s+v(?P<version>[123])(?:\.\d+)?\b[^>]*-->$",
     re.IGNORECASE,
@@ -226,7 +344,9 @@ V5_0_HOT_TEMPLATE = """# BIMRI Memory
 """
 
 DEFAULT_STATE = {
-    "bimri_version": MEMORY_FORMAT_VERSION,
+    # A new store is born at the v5.2.0 state format; existing v5.1.0 states
+    # move only on their first authority write (writer gate).
+    "bimri_version": STATE_FORMAT_VERSION,
     "project_id": "unset",
     "cadence_class": "interactive",
     "run_count": 0,
@@ -253,6 +373,12 @@ DECAY_DAYS = [
     (1, 1.0), (3, 0.8), (5, 0.5), (10, 0.35),
     (15, 0.2), (20, 0.15), (10**9, 0.1),
 ]
+# v5.2.0: a confirmed subject with a known date never decays below the
+# 10-day value, so an owner rule outranks aging agent notes; the 0.1 floor
+# for a missing or unparseable date is never lifted (unknown age stays
+# conservatively coolable).
+CONFIRMED_DECAY_FLOOR = 0.35
+PATTERN_CONFIDENCE_WEIGHT = {"emerging": 1, "developing": 2, "established": 3}
 CADENCE_CLASSES = {"interactive", "daily_cron", "hourly_cron"}
 
 HOT_TEMPLATE = """# BIMRI Memory
@@ -330,6 +456,32 @@ class BimriError(RuntimeError):
     pass
 
 
+class BimriBusy(BimriError):
+    """The store lock stayed held for the whole wait (exit 2, never FAILED)."""
+
+
+class AuditCopyDeferred(BimriError):
+    """A copy capture gave up; the partial copy has already been removed."""
+
+    def __init__(
+        self, reason, files_done, bytes_done, elapsed_ms, budget_ms=None
+    ):
+        self.reason = reason
+        self.files_done = files_done
+        self.bytes_done = bytes_done
+        self.elapsed_ms = elapsed_ms
+        self.budget_ms = budget_ms
+        super().__init__(self.describe())
+
+    def describe(self):
+        if self.reason == "budget":
+            return (
+                f"copy budget {self.budget_ms} ms exceeded after "
+                f"{self.files_done:,} files"
+            )
+        return f"store changed during capture after {self.files_done:,} files"
+
+
 class PressureCoolingUnavailable(BimriError):
     pass
 
@@ -351,6 +503,65 @@ def active_code_update_policy(policy):
 def guard_active_code_update(path, operation):
     if _ACTIVE_CODE_UPDATE_POLICY is not None:
         _ACTIVE_CODE_UPDATE_POLICY.guard(path, operation)
+
+
+# Every live Paths object, so a protected write can be attributed to a store
+# whose scoped authority transition is recording what it writes. The write
+# primitives take no Paths argument; a store opts in by making its
+# scoped_write_set a set, and nothing is recorded otherwise.
+_LIVE_PATHS = weakref.WeakSet()
+
+
+def note_protected_write(path):
+    """Record a protected write for scoped publication's undeclared-write guard.
+
+    The observed set is a guard, never the source of the published
+    inventory: scoped publication rehashes from disk and refuses a protected
+    path the transition did not declare.
+    """
+    try:
+        recorders = [
+            paths for paths in list(_LIVE_PATHS)
+            if isinstance(getattr(paths, "scoped_write_set", None), set)
+        ]
+    except RuntimeError:  # pragma: no cover - concurrent GC during iteration
+        recorders = []
+    if not recorders:
+        return
+    try:
+        candidate = Path(os.path.abspath(os.fspath(path)))
+    except (TypeError, ValueError):
+        return
+    resolved = None
+    for paths in recorders:
+        try:
+            relative = candidate.relative_to(paths.root)
+        except ValueError:
+            # Paths.root is resolved; a caller may name the same file through
+            # an unresolved spelling (short names, a symlinked temp root).
+            if resolved is None:
+                try:
+                    resolved = Path(os.path.realpath(str(candidate)))
+                except (OSError, ValueError):
+                    resolved = candidate
+            try:
+                relative = resolved.relative_to(paths.root)
+            except ValueError:
+                continue
+        parts = relative.parts
+        if parts == ("bimri.md",) or (parts and parts[0] == ".bimri"):
+            paths.scoped_write_set.add(relative.as_posix())
+
+
+def begin_scoped_write_recording(paths):
+    """Start recording protected writes for one scoped transition."""
+    paths.scoped_write_set = set()
+    return paths.scoped_write_set
+
+
+def end_scoped_write_recording(paths):
+    paths.scoped_write_set = None
+    paths.scoped_checkpoint = None
 
 
 def path_is_reparse_point(path):
@@ -411,10 +622,15 @@ class Paths:
         self.audit_blocked = self.bdir / "audit-blocked.json"
         self.audit_drift = self.bdir / "audit-drift"
         self.audit_transition = self.bdir / "audit-transition.json"
+        self.audit_verdict = self.bdir / "audit-verdict.json"
+        self.saves = self.bdir / "saves"
+        self.saves_open = self.saves / "open"
+        self.saves_done = self.saves / "done"
         self.lock = self.bdir / "engine.lock"
         self.logs = self.bdir / "log"
         self.proposals = self.bdir / "proposals"
         self.decisions = self.bdir / "decisions"
+        self.settlements = self.bdir / "settlements"
         self.revisions = self.bdir / "revisions"
         self.conflicts = self.bdir / "conflicts"
         self.resolutions = self.bdir / "resolutions"
@@ -438,6 +654,41 @@ class Paths:
         # Only enabled by reporting commands while they hold the store lock.
         # Never persisted or reused by a subsequent command or authority write.
         self.diagnostic_read_cache = None
+        # Root-relative protected paths written during a scoped authority
+        # transition (None outside one), and the prior checkpoint evidence
+        # that transition publishes from. Process-local; a resumed
+        # publication rebuilds both from the durable transition marker.
+        self.scoped_write_set = None
+        self.scoped_checkpoint = None
+        # The facts generation of the valid checkpoint read by this process
+        # under its lock: (facts_hash, facts). A writer reads facts instead
+        # of scanning history; never persisted, re-validated by hash.
+        self.checkpoint_facts_cache = None
+        # >0 while a full audit runs in this process: it re-proves the store
+        # and never reads the checkpoint's facts in place of the files.
+        self.full_audit_depth = 0
+        # current_run_date_references for the lock's duration (D4.6),
+        # keyed by the head it was computed from; commit_revision clears it.
+        self.run_date_references_cache = None
+        # {(archive proposal id, base hash): YYYY-MM} for cold bases proven
+        # month-scoped under this lock (D4.3); cleared with the lock.
+        self.cold_base_months = None
+        # True when resolve's gate took the checkpoint path (no transition,
+        # valid checkpoint): its write then opens checkpoint-scoped.
+        self.resolution_gate_scoped = False
+        # Why the last write_audit_witness call in this process failed.
+        self.last_witness_error = None
+        # A live save marker this process could not finish (D3.4.4 R0c):
+        # (request_id, reason). Writers refuse with the wedged line.
+        self.wedged_save = None
+        # The filesystem error that stopped this process finishing a live
+        # save marker (section 03 9): the marker stays resumable, a read
+        # serves memory around it and a writer fails with this error.
+        self.pending_save_error = None
+        # True when the last load_or_initialize(audit_when_cold=False) skipped
+        # the cold-store audit and recovery; doctor's live path finishes it.
+        self.cold_load_deferred = False
+        _LIVE_PATHS.add(self)
 
     @property
     def legacy_active(self):
@@ -453,7 +704,8 @@ class Paths:
             self.bdir, self.logs, self.proposals, self.decisions,
             self.revisions, self.conflicts, self.resolutions, self.archive,
             self.inbox, self.backups, self.recovery, self.migrations,
-            self.audit_manifests,
+            self.audit_manifests, self.saves, self.saves_open,
+            self.saves_done, self.settlements,
         )
 
 
@@ -499,7 +751,7 @@ def clean_scalar(value, name, max_chars=500, allow_empty=False):
         raise BimriError(f"{name} exceeds {max_chars} characters.")
     if any(ch in value for ch in ("\n", "\r", "\t")):
         raise BimriError(f"{name} must be one line without tabs.")
-    if any(ord(ch) < 32 for ch in value):
+    if CONTROL_CHARACTER_RE.search(value):
         raise BimriError(f"{name} contains control characters.")
     if len(value.splitlines()) > 1:
         # The hot view and run logs are parsed with str.splitlines(), which
@@ -549,7 +801,7 @@ def validate_fixed_id(value, regex, name):
     return value
 
 
-def ensure_layout(paths):
+def ensure_layout(paths, defer_write_dirs=False):
     guard_active_code_update(paths.root, "layout-mkdir")
     if path_is_redirected(paths.bdir):
         raise BimriError(
@@ -563,6 +815,13 @@ def ensure_layout(paths):
                 "link or reparse point."
             )
         existed = directory.exists()
+        if not existed and defer_write_dirs and directory in (
+            paths.audit_manifests, paths.saves, paths.saves_open,
+            paths.saves_done, paths.settlements,
+        ):
+            # 5.1.0 predates manifest storage, and all 5.1 releases predate
+            # saves and settlements. Reads preserve their original layout.
+            continue
         directory.mkdir(parents=True, exist_ok=True)
         if not existed:
             fsync_directory(directory.parent)
@@ -650,6 +909,7 @@ def _replace_with_windows_retry(source, destination):
 def atomic_write_text(path, content):
     path = Path(path)
     guard_active_code_update(path, "atomic-write")
+    note_protected_write(path)
     ensure_directory_durable(path.parent)
     if path.exists() and path.is_symlink():
         raise BimriError(f"refusing to replace symbolic link: {path}")
@@ -670,6 +930,7 @@ def atomic_write_text(path, content):
 def atomic_write_bytes(path, content):
     path = Path(path)
     guard_active_code_update(path, "atomic-write")
+    note_protected_write(path)
     ensure_directory_durable(path.parent)
     if path.exists() and path.is_symlink():
         raise BimriError(f"refusing to replace symbolic link: {path}")
@@ -695,6 +956,7 @@ def atomic_replace_symlink_json(path, expected_target, data):
     """Replace one verified symlink entry without ever following its target."""
     path = Path(path)
     guard_active_code_update(path, "atomic-symlink-replace")
+    note_protected_write(path)
     ensure_directory_durable(path.parent)
     try:
         current_target = os.readlink(path)
@@ -732,6 +994,7 @@ def atomic_copy_file(source, destination):
     source = Path(source)
     destination = Path(destination)
     guard_active_code_update(destination, "atomic-copy")
+    note_protected_write(destination)
     ensure_directory_durable(destination.parent)
     if destination.exists() and destination.is_symlink():
         raise BimriError(f"refusing to restore through symbolic link: {destination}")
@@ -789,6 +1052,7 @@ def write_generated_view(paths, content, warn_only=False):
 def exclusive_write_bytes(path, content):
     path = Path(path)
     guard_active_code_update(path, "exclusive-write")
+    note_protected_write(path)
     ensure_directory_durable(path.parent)
     if path.exists() or path.is_symlink():
         raise FileExistsError(str(path))
@@ -828,17 +1092,74 @@ def exclusive_write_text(path, content):
     return exclusive_write_bytes(path, content.encode("utf-8"))
 
 
-def append_line(path, line):
-    clean_scalar(line, "journal line", 12000)
+def remove_protected_file(path):
+    """The one deletion primitive for .bimri records (a crash-test seam).
+
+    It calls os.unlink and nothing else, so a fault injector can count every
+    durable deletion the same way on every Python version.
+    """
+    os.unlink(os.fspath(path))
+
+
+def clean_tsv_record_line(line, name="record line", max_chars=12000):
+    """One tab-separated record line: tabs allowed, nothing else invisible."""
+    if not isinstance(line, str) or not line.strip():
+        raise BimriError(f"{name} cannot be empty.")
+    if len(line) > max_chars:
+        raise BimriError(f"{name} exceeds {max_chars} characters.")
+    if any(ord(ch) < 32 and ch != "\t" for ch in line):
+        raise BimriError(f"{name} contains control characters.")
+    if len(line.splitlines()) > 1:
+        raise BimriError(f"{name} must not contain Unicode line separators.")
+    return line
+
+
+def append_line(path, line, tsv=False):
+    """Append one line and fsync it (the one append primitive).
+
+    ``tsv=True`` is the save-receipts form (D2.7): ``line`` is one
+    tab-separated record line or a sequence of them, written by one append
+    and one fsync; a torn final line left by a crash mid-append is
+    terminated first so a new record never fuses with it.
+    """
+    if tsv:
+        records = [line] if isinstance(line, str) else list(line)
+        if not records:
+            raise BimriError("record line cannot be empty.")
+        for record in records:
+            clean_tsv_record_line(record)
+    else:
+        clean_scalar(line, "journal line", 12000)
     path = Path(path)
     guard_active_code_update(path, "append")
-    if path.is_symlink():
+    note_protected_write(path)
+    if path_is_redirected(path):
         raise BimriError(f"refusing to append through symbolic link: {path}")
     created = not path.exists()
-    with path.open("a", encoding="utf-8", newline="\n") as handle:
-        handle.write(line.rstrip() + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+    if not tsv and (path.parent.name == "archive" or line.startswith(("[OUTCOME:", "[CLOSED:"))):
+        # An archive row or run footer is one recovery boundary. A short
+        # write or a process exit must leave either the old or new file.
+        prior = b"" if created else path.read_bytes()
+        if prior and not prior.endswith(b"\n"):
+            raise BimriError(f"unfinished line at the end of {path}; restore its verified bytes before appending.")
+        atomic_write_bytes(path, prior + (line.rstrip() + "\n").encode("utf-8"))
+        return
+    if tsv:
+        payload = "".join(record.rstrip() + "\n" for record in records)
+        with path.open("ab+") as handle:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell():
+                handle.seek(-1, os.SEEK_END)
+                if handle.read(1) != b"\n":
+                    payload = "\n" + payload
+            handle.write(payload.encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+    else:
+        with path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(line.rstrip() + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
     if created:
         fsync_directory(path.parent)
 
@@ -862,7 +1183,7 @@ def _held_lock(handle, timeout):
             except (BlockingIOError, OSError):
                 time.sleep(0.02 + random.random() * 0.03)
         if not locked:
-            raise BimriError("BIMRI is busy. Retry the command.")
+            raise BimriBusy("BIMRI is busy. Retry the command.")
         yield
     finally:
         if locked:
@@ -880,7 +1201,18 @@ def engine_lock(paths, timeout=10.0):
     preflight_legacy_source(paths)
     ensure_layout(paths)
     with _held_lock(paths.lock.open("r+b"), timeout):
-        yield
+        clear_lock_scoped_caches(paths)
+        try:
+            yield
+        finally:
+            clear_lock_scoped_caches(paths)
+
+
+def clear_lock_scoped_caches(paths):
+    """Facts and run-date caches live for one lock hold only (D4.6)."""
+    paths.checkpoint_facts_cache = None
+    paths.run_date_references_cache = None
+    paths.cold_base_months = None
 
 
 @contextlib.contextmanager
@@ -896,7 +1228,11 @@ def existing_store_lock(paths, timeout=10.0):
             "create it."
         )
     with _held_lock(paths.lock.open("r+b"), timeout):
-        yield
+        clear_lock_scoped_caches(paths)
+        try:
+            yield
+        finally:
+            clear_lock_scoped_caches(paths)
 
 
 @contextlib.contextmanager
@@ -936,8 +1272,18 @@ def diagnostic_cached(key, clone=copy.deepcopy):
 
 
 def copy_flat_records(records):
-    """Copy records whose values are immutable scalars or Path objects."""
-    return [record.copy() for record in records]
+    """Copy records whose values are immutable scalars or Path objects.
+
+    An archive record's parsed ``entry`` is the one nested dict; it is
+    copied too so no reader can annotate another reader's snapshot.
+    """
+    copies = []
+    for record in records:
+        duplicate = record.copy()
+        if isinstance(duplicate.get("entry"), dict):
+            duplicate["entry"] = dict(duplicate["entry"])
+        copies.append(duplicate)
+    return copies
 
 
 def read_json_strict(path, label):
@@ -973,7 +1319,7 @@ def record_migration_receipt(paths, action, source_version=None, **details):
 
 
 def validate_cold_current(value):
-    """Validate canonical pointers to current-but-not-hot Tier 2 subjects."""
+    """Validate canonical pointers to current-but-not-hot Tier 2/3 subjects."""
     if not isinstance(value, dict):
         raise BimriError("state cold_current must be an object.")
     required = {
@@ -988,12 +1334,18 @@ def validate_cold_current(value):
             raise BimriError(
                 f"state cold_current record {key} has invalid fields."
             )
-        if record.get("key") != key or record.get("tier") != 2:
+        if (
+            record.get("key") != key
+            or isinstance(record.get("tier"), bool)
+            or record.get("tier") not in COLD_TIERS
+        ):
             raise BimriError(
                 f"state cold_current record {key} has an invalid key or tier."
             )
         validate_fixed_id(
-            record.get("entry_id"), LEGACY_ENTRY_RE, "cold entry ID"
+            record.get("entry_id"),
+            COLD_ENTRY_ID_RES[record["tier"]],
+            "cold entry ID",
         )
         validate_fixed_id(
             record.get("archived_by"), PROPOSAL_RE, "cold archive proposal ID"
@@ -1012,12 +1364,13 @@ def validate_cold_current(value):
         entry = parse_entry_line(raw_line)
         if (
             entry is None
-            or entry["tier"] != 2
+            or entry["tier"] != record["tier"]
             or entry.get("key") != key
             or entry.get("id") != record.get("entry_id")
         ):
             raise BimriError(
-                f"state cold_current record {key} does not match its Tier 2 line."
+                f"state cold_current record {key} does not match its "
+                f"Tier {record['tier']} line."
             )
         if record.get("line_hash") != line_hash(raw_line):
             raise BimriError(
@@ -1043,7 +1396,7 @@ def validate_state(state, accepted_versions=None):
     for key in ("run_count", "conflict_count", "head_revision"):
         if state[key] > 999999:
             raise BimriError(f"state field {key} exceeds its six-digit ID space.")
-    accepted_versions = accepted_versions or {MEMORY_FORMAT_VERSION}
+    accepted_versions = accepted_versions or set(READABLE_STATE_VERSIONS)
     if state.get("bimri_version") not in accepted_versions:
         raise BimriError(f"unsupported BIMRI state version: {state.get('bimri_version')}")
     if state.get("legacy_migration") not in (None, "legacy-to-v5"):
@@ -1118,13 +1471,43 @@ def current_run_date_references(paths, state):
                 value for value in (entry.get("first"), entry.get("last"))
                 if value
             )
+        elif entry.get("tier") == 3:
+            # v5.2.0: a pattern's retention clock is its evidence runs.
+            referenced.update(evidence_runs(entry))
     for record in state.get("cold_current", {}).values():
         entry = parse_entry_line(record["raw_line"])
-        if entry is not None:
+        if entry is None:
+            continue
+        if entry.get("tier") == 3:
+            referenced.update(evidence_runs(entry))
+        else:
             referenced.update(
                 value for value in (entry.get("first"), entry.get("last"))
                 if value
             )
+    return referenced
+
+
+def cached_run_date_references(paths, state):
+    """current_run_date_references for the lock's duration (D4.6).
+
+    Keyed by everything the references derive from (head, active and
+    session runs, cold-current), so a state write that changes none of
+    them reuses one parse of the head; commit_revision and every lock
+    acquisition clear it.
+    """
+    key = audit_witness_digest({
+        "head_revision": state.get("head_revision"),
+        "head_hash": state.get("head_hash"),
+        "active_runs": sorted(state.get("active_runs", {})),
+        "session_runs": state.get("session_runs", {}),
+        "cold_current": state.get("cold_current", {}),
+    })
+    cached = paths.run_date_references_cache
+    if cached is not None and cached[0] == key:
+        return set(cached[1])
+    referenced = current_run_date_references(paths, state)
+    paths.run_date_references_cache = (key, frozenset(referenced))
     return referenced
 
 
@@ -1138,7 +1521,7 @@ def prepare_state_for_save(paths, state):
             ),
         )
         try:
-            protected = current_run_date_references(paths, state)
+            protected = cached_run_date_references(paths, state)
         except (BimriError, OSError, UnicodeError):
             # Journals and proposal staging remain durable during authority
             # recovery. If current references cannot be proven, preserve the
@@ -1153,7 +1536,9 @@ def prepare_state_for_save(paths, state):
                 key: state["run_dates"][key]
                 for key in keys if key in retained
             }
-    validate_state(state)
+    # The only post-validation change above selects a subset of the same
+    # validated run-date pairs; all other state, including cold bindings,
+    # is unchanged. Rechecking every cold record here repeats the input check.
     return state
 
 
@@ -2590,7 +2975,7 @@ def stage_v5_0_metadata_revision(paths, state, content, normalized=None):
 
 def finalize_current_v5_metadata(paths, state):
     """Normalize stale v5.0 view metadata in current-version authority."""
-    if state.get("bimri_version") != MEMORY_FORMAT_VERSION:
+    if state.get("bimri_version") not in READABLE_STATE_VERSIONS:
         return None
     head = revision_path(paths, state["head_revision"])
     if not head.is_file() or head.is_symlink():
@@ -2785,8 +3170,19 @@ def require_complete_v5_state(raw, allow_lifecycle_defaults=False):
         )
 
 
-def load_or_initialize(paths):
-    ensure_layout(paths)
+def load_or_initialize(paths, finish_saves=True, audit_when_cold=True,
+                       defer_write_dirs=False):
+    """Load (or create, or migrate) the store under the engine lock.
+
+    finish_saves=False leaves a live save marker for the caller (recover-save)
+    instead of running the resume ladder (D3.4.1). audit_when_cold=False skips the cold-store full audit and load-time
+    recovery of a current-format store whose checkpoint is not valid (section
+    05 L9): markers are still reconciled and legacy formats still migrate.
+    The skip is recorded on paths.cold_load_deferred so a caller that then
+    audits live (doctor) can finish exactly what was skipped.
+    """
+    paths.cold_load_deferred = False
+    ensure_layout(paths, defer_write_dirs=defer_write_dirs)
     legacy_plan = discover_legacy_migration(paths)
     if legacy_plan is not None:
         return migrate_legacy(paths, legacy_plan)
@@ -2821,7 +3217,7 @@ def load_or_initialize(paths):
         finalize_legacy_migration(paths, state)
         reject_unclaimed_legacy_roots(paths)
         return upgrade_v5_state(paths, state, source_version)
-    if raw.get("bimri_version") != MEMORY_FORMAT_VERSION:
+    if raw.get("bimri_version") not in READABLE_STATE_VERSIONS:
         raise BimriError(
             f"unsupported BIMRI state version: {raw.get('bimri_version')}"
         )
@@ -2830,6 +3226,15 @@ def load_or_initialize(paths):
     merged.update(raw)
     state = validate_state(merged)
     state = reconcile_audit_transition(paths, state)
+    if finish_saves:
+        # D3.4.1: a live save marker is finished by every reconciling load;
+        # that completes an allocation the save already made.
+        state = finish_pending_save(paths, state)
+    if load_live_save_marker(paths) is not None:
+        # A save this load could not (or was told not to) finish keeps its
+        # marker: nothing below may audit, publish or recover around it.
+        # Writers refuse with its line; reports name it.
+        return state
     witness = load_valid_audit_witness(paths, state)
     if witness is not None and not load_audit_blocked_issues(paths):
         validate_checkpoint_head(paths, state)
@@ -2845,6 +3250,35 @@ def load_or_initialize(paths):
             metadata_revision=None,
         )
         return state
+    if not audit_when_cold:
+        # Quick reports (status; section 05 L9) never seed or re-prove a
+        # checkpoint: without a valid one they report the recorded
+        # conditions and leave the one live full audit to doctor and to the
+        # next writer (D5.1, Decisions 17). A live marker was already offered
+        # to reconcile above, legacy formats still migrated before this
+        # point, and the cheap legacy-root refusals below hold on every load.
+        finalize_legacy_migration(paths, state)
+        reject_unclaimed_legacy_roots(paths)
+        record_migration_receipt(
+            paths,
+            "verified",
+            source_version=MEMORY_FORMAT_VERSION,
+            limits=limits_profile(state),
+            metadata_revision=None,
+        )
+        paths.cold_load_deferred = True
+        return state
+    return complete_cold_load(paths, state)
+
+
+def complete_cold_load(paths, state):
+    """The cold branch of load_or_initialize: residency, full audit, recovery.
+
+    Runs on a current-format store whose checkpoint is not valid. doctor's
+    live path calls it after load_or_initialize(audit_when_cold=False), so
+    an auto-taken live audit behaves exactly as v5.1.2's doctor did.
+    """
+    paths.cold_load_deferred = False
     validate_current_residency(paths, state)
     finalize_legacy_migration(paths, state)
     reject_unclaimed_legacy_roots(paths)
@@ -2855,8 +3289,17 @@ def load_or_initialize(paths):
     if not recovery_gate_issues:
         metadata_revision = finalize_current_v5_metadata(paths, state)
         if authority_has_recoverable_applying(paths):
+            # Load-time recovery only finishes an intent already recorded.
+            # A v5.2.0 intent is recorded after the writer gate flipped, so
+            # on a v5.1.0 state this finishes a v5.1.x intent in its own
+            # format, often writing nothing at all: the read, start or
+            # journal that loaded the store keeps the rollback window
+            # (D0.2, D0.6).
             enter_authority_write_after_audit(
-                paths, state, operation="recover-interrupted-authority"
+                paths,
+                state,
+                operation="recover-interrupted-authority",
+                writer_gate=False,
             )
         recover_interrupted_authority(paths, state)
     record_migration_receipt(
@@ -3067,8 +3510,10 @@ def overflow_vector(content, state):
 
 def strictly_reduces_overflow(before, after, state):
     old = overflow_vector(before, state)
+    if old is None or not any(old):
+        return False
     new = overflow_vector(after, state)
-    if old is None or new is None or not any(old):
+    if new is None:
         return False
     return all(new_value <= old_value for new_value, old_value in zip(new, old)) and any(
         new_value < old_value for new_value, old_value in zip(new, old)
@@ -3214,8 +3659,8 @@ def entry_from_residency_evidence(paths, record, prefix, raw_line, label):
         validate_cold_archive_snapshot(
             paths, raw_line, proposal_id, archive_date, label
         )
-        if entry.get("tier") != 2:
-            raise BimriError(f"{label} cold line must be Tier 2.")
+        if entry.get("tier") not in COLD_TIERS:
+            raise BimriError(f"{label} cold line must be Tier 2 or Tier 3.")
         entry["archive_proposal_id"] = proposal_id
         entry["archive_date"] = archive_date
     return entry
@@ -3241,8 +3686,9 @@ def validate_cold_snapshot_revision(paths, state, entry, revision, label):
 
 
 def make_cold_record(entry, proposal_id, archived_on):
-    if entry.get("tier") != 2:
-        raise BimriError("only Tier 2 entries may become cold-current.")
+    tier = entry.get("tier")
+    if isinstance(tier, bool) or tier not in COLD_TIERS:
+        raise BimriError("only Tier 2 or Tier 3 entries may become cold-current.")
     raw_line = clean_scalar(
         entry.get("raw"), "cold raw line", MAX_SERIALIZED_ENTRY_CHARS
     )
@@ -3253,10 +3699,10 @@ def make_cold_record(entry, proposal_id, archived_on):
         raise BimriError("cold archive date is invalid.") from exc
     return {
         "entry_id": validate_fixed_id(
-            entry.get("id"), LEGACY_ENTRY_RE, "cold entry ID"
+            entry.get("id"), COLD_ENTRY_ID_RES[tier], "cold entry ID"
         ),
         "key": clean_key(entry.get("key")),
-        "tier": 2,
+        "tier": tier,
         "raw_line": raw_line,
         "line_hash": line_hash(raw_line),
         "archived_by": validate_fixed_id(
@@ -3504,15 +3950,77 @@ def next_commit_revision_number(paths, state):
     return number
 
 
-def commit_revision(paths, state, content, reason, allow_legacy_overflow=False):
+def scoped_checkpoint_months(paths):
+    """{YYYY-MM: sha256} of every archive month in a scoped write's prior
+    manifest M0, or None outside a scoped transition (D4.3)."""
+    scoped = paths.scoped_checkpoint
+    if not isinstance(scoped, dict):
+        return None
+    by_path = scoped.get("m0_by_path")
+    if by_path is None:
+        return None
+    months = {}
+    for relative, digest in by_path.items():
+        parts = PurePosixPath(relative).parts
+        if (
+            len(parts) == 3
+            and parts[1] == "archive"
+            and parts[2].endswith(".md")
+            and re.fullmatch(r"\d{4}-\d{2}", parts[2][:-3])
+        ):
+            months[parts[2][:-3]] = digest
+    return months
+
+
+def commit_revision(
+    paths, state, content, reason, allow_legacy_overflow=False,
+    planned_number=None,
+):
     _, entries, errors, _ = validate_hot_content(
         content, state, allow_legacy_overflow=allow_legacy_overflow
     )
     if errors:
         raise BimriError("cannot commit invalid hot memory: " + "; ".join(errors))
-    validate_current_residency(paths, state, hot_entries=entries)
-    number = next_commit_revision_number(paths, state)
-    exclusive_write_text(revision_path(paths, number), content)
+    checkpoint_months = scoped_checkpoint_months(paths)
+    if checkpoint_months is None:
+        validate_current_residency(paths, state, hot_entries=entries)
+    else:
+        validate_current_residency(
+            paths, state, hot_entries=entries,
+            checkpoint_months=checkpoint_months,
+        )
+    paths.run_date_references_cache = None
+    if planned_number is None:
+        number = next_commit_revision_number(paths, state)
+        exclusive_write_text(revision_path(paths, number), content)
+    else:
+        # A save writes exactly the revision its marker declared. An orphan
+        # of that number is this save's own crashed write (the marker
+        # excluded every other writer): adopt it only when its bytes are
+        # the identical effect, never re-render it to a later number.
+        number = planned_number
+        target = revision_path(paths, number)
+        if number <= state["head_revision"]:
+            raise BimriError(
+                f"planned revision V{number:06d} is not beyond the head."
+            )
+        if target.exists() or target.is_symlink():
+            if (
+                target.is_symlink()
+                or not target.is_file()
+                or target.read_bytes() != content.encode("utf-8")
+            ):
+                raise BimriError(
+                    f"planned revision V{number:06d} already exists with "
+                    "different bytes."
+                )
+        else:
+            if next_commit_revision_number(paths, state) != number:
+                raise BimriError(
+                    f"planned revision V{number:06d} is no longer the next "
+                    "free revision."
+                )
+            exclusive_write_text(target, content)
     state["head_revision"] = number
     state["head_hash"] = sha256_text(content)
     state["last_revision_reason"] = clean_scalar(reason, "revision reason", 300)
@@ -3583,6 +4091,32 @@ def authority_directories(paths):
         "conflict": paths.conflicts,
         "resolution": paths.resolutions,
     }
+
+
+def owner_abandoned_decision(paths, proposal_id):
+    """The owner-asserted `abandoned` decision of a proposal, else None."""
+    path = decision_path(paths, proposal_id)
+    if path_is_redirected(path) or not path.is_file():
+        return None
+    try:
+        decision = validate_decision(
+            read_json_strict(path, path.name), proposal_id
+        )
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        return None
+    if (
+        decision["outcome"] == "abandoned"
+        and decision.get("authority") == "human-asserted"
+    ):
+        return decision
+    return None
+
+
+def quarantined_proposal_is_abandoned(paths, proposal_id):
+    """A quarantined proposal the owner then cancelled (recover-save
+    --cancel) is closed authority: an owner-asserted abandoned decision says
+    its effect never happened, so the stub needs no restore."""
+    return owner_abandoned_decision(paths, proposal_id) is not None
 
 
 def is_quarantine_stub(data):
@@ -3670,12 +4204,26 @@ def validate_quarantine_stub(paths, path, stub, kind, record_id):
     return stub
 
 
-def logged_proposal_records(paths, state, include_run_status=False):
-    """Return durable proposal references and processing expectations."""
+def logged_proposal_records(
+    paths, state, include_run_status=False, run_ids=None
+):
+    """Return durable proposal references and processing expectations.
+
+    run_ids bounds the scan to the named run logs (scoped recovery); None
+    reads every run log.
+    """
     records = []
     issues = []
     closed_by_run = {}
-    for log in sorted(paths.logs.glob("R*.md")):
+    if run_ids is None:
+        logs = sorted(paths.logs.glob("R*.md"))
+    else:
+        logs = [
+            paths.logs / f"{run_id}.md"
+            for run_id in sorted(set(run_ids))
+            if RUN_RE.fullmatch(run_id)
+        ]
+    for log in logs:
         if not RUN_RE.fullmatch(log.stem):
             continue
         if log.is_symlink() or not log.is_file():
@@ -3708,8 +4256,13 @@ def logged_proposal_records(paths, state, include_run_status=False):
     return records, issues
 
 
-def authority_reference_issues(paths, state):
-    records, issues = logged_proposal_records(paths, state)
+def authority_reference_issues(paths, state, only=None):
+    """Run-log anchors; only= bounds the check to a scoped transition."""
+    records, issues = logged_proposal_records(
+        paths,
+        state,
+        run_ids=None if only is None else only.get("run", ()),
+    )
     referenced_ids = {record[0] for record in records}
     for proposal_id, run_id, closed in records:
         ppath = proposal_path(paths, proposal_id)
@@ -3746,7 +4299,15 @@ def authority_reference_issues(paths, state):
     # Also cover the narrow crash window after proposal-file creation but
     # before the run-log marker. A later sync/close backfills the marker before
     # deciding; until then, the immutable proposal file still proves identity.
-    for ppath in sorted(paths.proposals.glob("R*-Q*.json")):
+    if only is None:
+        proposal_candidates = sorted(paths.proposals.glob("R*-Q*.json"))
+    else:
+        proposal_candidates = [
+            paths.proposals / f"{proposal_id}.json"
+            for proposal_id in sorted(only.get("proposal", ()))
+            if PROPOSAL_RE.fullmatch(proposal_id)
+        ]
+    for ppath in proposal_candidates:
         if (
             not PROPOSAL_RE.fullmatch(ppath.stem)
             or ppath.stem in referenced_ids
@@ -3787,14 +4348,25 @@ def authority_reference_issues(paths, state):
                 "durably processed."
             )
 
-    present_conflicts = {
-        int(path.stem[1:])
-        for path in paths.conflicts.glob("C*.json")
-        if CONFLICT_RE.fullmatch(path.stem)
-    }
+    if only is None:
+        present_conflicts = {
+            int(path.stem[1:])
+            for path in paths.conflicts.glob("C*.json")
+            if CONFLICT_RE.fullmatch(path.stem)
+        }
+        conflict_numbers = range(1, state["conflict_count"] + 1)
+    else:
+        # A scoped transition can only have allocated the conflicts above
+        # the counter it began with.
+        low, high = only.get("conflict_numbers", (0, 0))
+        conflict_numbers = range(low + 1, high + 1)
+        present_conflicts = {
+            number for number in conflict_numbers
+            if paths.conflicts.joinpath(f"C{number:06d}.json").exists()
+        }
     missing_conflicts = [
         number
-        for number in range(1, state["conflict_count"] + 1)
+        for number in conflict_numbers
         if number not in present_conflicts
     ]
     for number in missing_conflicts[:50]:
@@ -3990,12 +4562,51 @@ def expected_missing_authority_ids(paths, state):
 
 
 def authority_storage_issues(
-    paths, state, allow_recoverable_applying=False
+    paths, state, allow_recoverable_applying=False, only=None
 ):
+    """Semantic replay of authority records (see _authority_storage_issues).
+
+    The full replay never consults the checkpoint it re-proves: checkpoint
+    facts are off while it runs (checkpoint_facts returns None).
+    """
+    if only is not None:
+        return _authority_storage_issues(
+            paths, state, allow_recoverable_applying, only
+        )
+    paths.full_audit_depth += 1
+    try:
+        return _authority_storage_issues(
+            paths, state, allow_recoverable_applying, None
+        )
+    finally:
+        paths.full_audit_depth -= 1
+
+
+def _authority_storage_issues(
+    paths, state, allow_recoverable_applying=False, only=None
+):
+    """Semantic replay of authority records.
+
+    only= is a scoped transition's record ids by kind ({"proposal",
+    "decision", "conflict", "resolution", "run", "conflict_numbers"}); each
+    named record is validated exactly as the full replay validates it,
+    dependencies included, and run-log anchors are checked for the scoped
+    runs only. None replays every record.
+    """
     issues = []
     for kind, directory in authority_directories(paths).items():
         regex = PROPOSAL_RE if kind in {"proposal", "decision"} else CONFLICT_RE
-        for path in sorted(directory.glob("*.json")):
+        if only is None:
+            candidates = sorted(directory.glob("*.json"))
+        else:
+            candidates = []
+            for record_id in sorted(only.get(kind, ())):
+                if not regex.fullmatch(record_id):
+                    continue
+                candidate = directory / f"{record_id}.json"
+                if candidate.exists() or candidate.is_symlink():
+                    candidates.append(candidate)
+        for path in candidates:
             if not regex.fullmatch(path.stem):
                 continue
             relative = path.relative_to(paths.root).as_posix()
@@ -4008,6 +4619,10 @@ def authority_storage_issues(
                     validate_quarantine_stub(
                         paths, path, data, kind, record_id
                     )
+                    if kind == "proposal" and quarantined_proposal_is_abandoned(
+                        paths, record_id
+                    ):
+                        continue
                     raise BimriError(
                         "record is quarantined; validate a repaired copy and "
                         "restore it before shared-memory writes resume."
@@ -4023,14 +4638,35 @@ def authority_storage_issues(
                 )
             except (BimriError, OSError, UnicodeError) as exc:
                 issues.append(f"{kind} {path.stem} ({relative}): {exc}")
-    issues.extend(authority_reference_issues(paths, state))
+    files = (sorted(paths.settlements.glob("*")) if only is None else
+             [settlement_path(paths, pid) for pid in only.get("settlement", ())])
+    for file in files:
+        try:
+            if file.suffix != ".json":
+                raise BimriError("unrecognised settlement filename")
+            read_settlement(paths, state, file.stem)
+        except (ValueError, BimriError, OSError) as exc:
+            issues.append(f"settlement {file.stem} ({file.relative_to(paths.root).as_posix()}): {exc}")
+    issues.extend(authority_reference_issues(paths, state, only=only))
     return issues
 
 
-def scan_open_conflicts(paths, state):
+def scan_open_conflicts(paths, state, only=None):
+    """Open conflicts and conflict damage; only= bounds it to named ids."""
     items = []
     issues = []
-    for path in sorted(paths.conflicts.glob("C*.json")):
+    if only is None:
+        candidates = sorted(paths.conflicts.glob("C*.json"))
+    else:
+        candidates = [
+            paths.conflicts / f"{conflict_id}.json"
+            for conflict_id in sorted(set(only))
+            if CONFLICT_RE.fullmatch(conflict_id)
+        ]
+        candidates = [
+            path for path in candidates if path.exists() or path.is_symlink()
+        ]
+    for path in candidates:
         if not CONFLICT_RE.fullmatch(path.stem):
             continue
         relative = path.relative_to(paths.root).as_posix()
@@ -4091,6 +4727,7 @@ def audit_witness_roots(paths):
         paths.revisions,
         paths.archive,
         paths.recovery,
+        paths.settlements,
     )
 
 
@@ -4098,6 +4735,8 @@ def audit_witness_manifest(paths):
     """Hash a closed inventory without following redirected directory entries."""
     manifest = []
     for root in audit_witness_roots(paths):
+        if root == paths.settlements and not root.exists() and not path_is_redirected(root):
+            continue  # Versions prior to 5.2 have no settlement records.
         if path_is_redirected(root) or not root.is_dir():
             raise BimriError(
                 f"audit witness root {root.relative_to(paths.root)} is missing "
@@ -4171,6 +4810,64 @@ def audit_witness_run_facts(paths, state):
     return facts
 
 
+def audit_witness_run_facts_for_runs(paths, state, run_ids):
+    """Run facts of the named runs only, under the full scan's exact rules."""
+    del state
+    facts = []
+    for run_id in sorted(set(run_ids)):
+        validate_fixed_id(run_id, RUN_RE, "audit run fact run ID")
+        log = paths.logs / f"{run_id}.md"
+        markers = []
+        closed = False
+        if log.exists() or log.is_symlink():
+            if path_is_redirected(log) or not log.is_file():
+                raise BimriError(f"run log is missing or unsafe: {log.name}")
+            try:
+                content = log.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                content = None
+            if content is not None:
+                for proposal_id in dict.fromkeys(
+                    match.group("proposal_id")
+                    for match in LOG_PROPOSAL_RE.finditer(content)
+                ):
+                    if not proposal_id.startswith(f"{run_id}-Q"):
+                        raise BimriError(
+                            f"run log {log.name} references another run's "
+                            f"proposal {proposal_id}."
+                        )
+                    markers.append(proposal_id)
+                closed = re.search(
+                    rf"^\[CLOSED:{re.escape(run_id)}(?:\s|\])",
+                    content,
+                    re.MULTILINE,
+                ) is not None
+        files = {
+            path.stem
+            for path in paths.proposals.glob(f"{run_id}-Q*.json")
+            if PROPOSAL_RE.fullmatch(path.stem)
+        }
+        for proposal_id in sorted(set(markers) | files):
+            facts.append({
+                "proposal_id": proposal_id,
+                "run_id": run_id,
+                "file_present": proposal_id in files,
+                "marker_present": proposal_id in markers,
+                "closed": closed,
+            })
+    return facts
+
+
+def merge_scoped_run_facts(prior_rows, run_ids, rows):
+    """Replace only the named runs' rows in a prior run-fact list."""
+    run_ids = set(run_ids)
+    kept = [row for row in prior_rows if row["run_id"] not in run_ids]
+    return sorted(
+        [dict(row) for row in kept] + [dict(row) for row in rows],
+        key=lambda row: row["proposal_id"],
+    )
+
+
 def audit_witness_proposal_runs(run_facts, state):
     """Bind bases only for proposal-bearing runs that remain active."""
     active = state.get("active_runs", {})
@@ -4233,7 +4930,27 @@ def audit_witness_write_state_payload(state):
 
 
 def audit_witness_write_state_hash(state):
-    return audit_witness_digest(audit_witness_write_state_payload(state))
+    """Digest of audit_witness_write_state_payload, without the deep copy:
+    the payload is only serialized here, so a shallow view that omits the
+    same bookkeeping fields hashes to the identical bytes."""
+    payload = dict(state)
+    payload.pop("last_started_at", None)
+    payload.pop("last_closed_at", None)
+    payload.pop("_audit_epoch", None)
+    active_runs = payload.get("active_runs", {})
+    if isinstance(active_runs, dict):
+        payload["active_runs"] = {
+            run_id: (
+                {
+                    field: value for field, value in metadata.items()
+                    if field != "last_activity_at"
+                }
+                if isinstance(metadata, dict)
+                else metadata
+            )
+            for run_id, metadata in active_runs.items()
+        }
+    return audit_witness_digest(payload)
 
 
 def audit_witness_digest(value):
@@ -4257,7 +4974,7 @@ def discard_audit_witness(paths):
     path = paths.audit_witness
     try:
         if path.is_symlink() or (path.exists() and not path.is_dir()):
-            path.unlink()
+            remove_protected_file(path)
             fsync_directory(path.parent)
     except OSError:
         # A derived cache must never turn a valid authority operation into a
@@ -4290,47 +5007,83 @@ def normalize_audit_manifest(manifest):
 
 def audit_witness_uses_current_policy(witness):
     return (
-        witness.get("engine_version") == ENGINE_VERSION
+        witness.get("witness_schema") == AUDIT_WITNESS_SCHEMA
+        and witness.get("engine_version") == ENGINE_VERSION
         and witness.get("memory_format_version") == MEMORY_FORMAT_VERSION
         and witness.get("policy_version") == AUTHORITY_POLICY_VERSION
     )
 
 
+def audit_witness_schema(witness):
+    """Return 1 or 2 for a checkpoint record's field set, else None."""
+    if not isinstance(witness, dict):
+        return None
+    fields = set(witness)
+    if fields == AUDIT_WITNESS_FIELDS:
+        return 2
+    if fields == AUDIT_WITNESS_SCHEMA_1_FIELDS:
+        return 1
+    return None
+
+
 def validate_sealed_audit_witness_record(witness, allow_prior_policy=False):
     """Validate a checkpoint, optionally retaining known prior recovery evidence.
 
-    A 5.1.1 seal remains evidence of an interrupted operation or quarantine.
-    It never satisfies the current read policy; only a full audit can do that.
-    Unknown engine/policy pairs remain invalid even on the recovery path.
+    A schema-1 seal from v5.1.1 or v5.1.2 remains evidence of an interrupted
+    operation or quarantine. It never satisfies the current read policy; only
+    a full audit can do that. The current verdict is schema 2 under the
+    current engine/policy triple. Unknown engine/policy pairs remain invalid
+    even on the recovery path.
     """
     try:
-        expected_fields = {
-            "witness_schema", "engine_version", "memory_format_version",
-            "policy_version", "created_at", "head_revision", "head_hash",
-            "state_hash", "write_state_hash", "audit_epoch",
-            "run_authority_hash", "manifest_hash", "manifest_count",
-            "proposal_runs", "witness_hash",
-        }
-        if set(witness) != expected_fields:
+        schema = audit_witness_schema(witness)
+        if schema is None:
             return None
         if witness.get("witness_hash") != audit_record_seal(
             witness, "witness_hash"
         ):
             return None
         if (
-            witness.get("witness_schema") != AUDIT_WITNESS_SCHEMA
+            witness.get("witness_schema") != schema
             or witness.get("memory_format_version") != MEMORY_FORMAT_VERSION
-            or not (
-                audit_witness_uses_current_policy(witness)
-                or (
-                    allow_prior_policy
-                    and witness.get("engine_version") == V5_1_1_ENGINE_VERSION
-                    and witness.get("policy_version") == "5.1.1-authority-1"
-                )
-            )
         ):
             return None
-        parse_timestamp(witness.get("created_at"), "audit witness timestamp")
+        if schema == AUDIT_WITNESS_SCHEMA:
+            if not audit_witness_uses_current_policy(witness):
+                return None
+        elif not (
+            allow_prior_policy
+            and (
+                witness.get("engine_version"),
+                witness.get("policy_version"),
+            ) in PRIOR_AUDIT_POLICY_PAIRS
+        ):
+            return None
+        created_at = parse_timestamp(
+            witness.get("created_at"), "audit witness timestamp"
+        )
+        if schema == AUDIT_WITNESS_SCHEMA:
+            facts_hash = witness.get("facts_hash")
+            if not isinstance(facts_hash, str) or not HASH_RE.fullmatch(
+                facts_hash
+            ):
+                return None
+            audited_at = parse_timestamp(
+                witness.get("audited_at"), "audit witness full-audit timestamp"
+            )
+            if audited_at > created_at:
+                return None
+            origin = witness.get("audit_origin")
+            if origin not in AUDIT_ORIGINS:
+                return None
+            scoped = witness.get("scoped_publications")
+            if (
+                isinstance(scoped, bool)
+                or not isinstance(scoped, int)
+                or scoped < 0
+                or (origin == "full" and scoped != 0)
+            ):
+                return None
         validate_revision_number(
             witness.get("head_revision"), "audit witness head revision"
         )
@@ -4370,13 +5123,17 @@ def reconcile_engine_checkpoint_for_exact_read(paths):
     if path_is_redirected(paths.state) or not paths.state.is_file():
         raise BimriError("lifecycle checkpoint state is missing or unsafe.")
     raw = read_json_strict(paths.state, "state.json")
-    if raw.get("bimri_version") != MEMORY_FORMAT_VERSION:
+    if raw.get("bimri_version") not in READABLE_STATE_VERSIONS:
         raise BimriError("lifecycle checkpoint requires current-format state.")
     require_complete_v5_state(raw)
     state = fresh_state()
     state.update(raw)
     validate_state(state)
     reconcile_audit_transition(paths, state)
+    # D3.4.1: a warm read finishes a live save marker too. Its writes go
+    # through the primitives, which create their parent directories durably
+    # under this read lock (R-N).
+    finish_pending_save(paths, state)
     return not (
         paths.audit_transition.exists() or paths.audit_transition.is_symlink()
     )
@@ -4476,14 +5233,19 @@ def load_audit_manifest_evidence(paths, witness, manifest_override=None):
     return manifest
 
 
-def write_audit_manifest_generation(paths, manifest_record):
+def checkpoint_record_bytes(record):
+    """Derived evidence is sealed over its JSON values, independent of layout."""
+    serialized = json.dumps(record, separators=(",", ":"), sort_keys=True)
+    return (serialized + "\n").encode("utf-8")
+
+
+def write_audit_manifest_generation(paths, manifest_record, encoded=None):
     generation = audit_manifest_generation_path(
         paths, manifest_record["manifest_hash"]
     )
     if path_is_redirected(paths.audit_manifests):
         raise BimriError("audit manifest generation directory is redirected.")
     ensure_directory_durable(paths.audit_manifests)
-    encoded = canonical_json_bytes(manifest_record)
     if generation.exists() or generation.is_symlink():
         if path_is_redirected(generation) or not generation.is_file():
             raise BimriError("audit manifest generation conflicts with evidence.")
@@ -4503,6 +5265,8 @@ def write_audit_manifest_generation(paths, manifest_record):
         ):
             raise BimriError("audit manifest generation conflicts with evidence.")
     else:
+        if encoded is None:
+            encoded = checkpoint_record_bytes(manifest_record)
         exclusive_write_bytes(generation, encoded)
     return generation
 
@@ -4548,6 +5312,494 @@ def ensure_audit_manifest_generation(paths, witness, manifest=None):
     return manifest
 
 
+AUDIT_RUN_FACT_FIELDS = frozenset({
+    "proposal_id", "run_id", "file_present", "marker_present", "closed",
+})
+AUDIT_FACTS_UNSETTLED_FIELDS = (
+    "applying_decisions", "applying_resolutions", "failed_resolutions",
+)
+AUDIT_FACTS_CONTENT_FIELDS = (
+    "unsettled", "applying_resolutions", "open_conflicts", "held",
+    "settled", "writers_by_key", "watermarks",
+)
+AUDIT_FACTS_PATTERN_LINE_RE = re.compile(r"^\[P(\d+)\] ")
+AUDIT_FACTS_PROPOSAL_REFERENCE_RE = re.compile(rb"\bR(\d{6})-Q(\d{3})\b")
+
+
+def audit_facts_generation_path(paths, facts_hash):
+    if not isinstance(facts_hash, str) or not HASH_RE.fullmatch(facts_hash):
+        raise BimriError("audit facts generation hash is invalid.")
+    return paths.audit_manifests / f"facts-{facts_hash}.json"
+
+
+def normalize_audit_run_facts(run_facts):
+    """Validate the governance-relevant run facts a checkpoint binds."""
+    if not isinstance(run_facts, list):
+        raise BimriError("audit run facts must be a list.")
+    normalized = []
+    previous = None
+    for row in run_facts:
+        if not isinstance(row, dict) or set(row) != AUDIT_RUN_FACT_FIELDS:
+            raise BimriError("audit run fact fields are invalid.")
+        proposal_id = row.get("proposal_id")
+        run_id = row.get("run_id")
+        if (
+            not isinstance(proposal_id, str)
+            or not PROPOSAL_RE.fullmatch(proposal_id)
+            or not isinstance(run_id, str)
+            or not RUN_RE.fullmatch(run_id)
+            or not proposal_id.startswith(run_id + "-Q")
+        ):
+            raise BimriError("audit run fact identity is invalid.")
+        if any(
+            not isinstance(row.get(field), bool)
+            for field in ("file_present", "marker_present", "closed")
+        ):
+            raise BimriError("audit run fact flags are invalid.")
+        if previous is not None and proposal_id <= previous:
+            raise BimriError("audit run facts are not sorted and unique.")
+        previous = proposal_id
+        normalized.append({
+            "proposal_id": proposal_id,
+            "run_id": run_id,
+            "file_present": row["file_present"],
+            "marker_present": row["marker_present"],
+            "closed": row["closed"],
+        })
+    return normalized
+
+
+def _audit_facts_id_list(value, regex, label):
+    if not isinstance(value, list) or value != sorted(set(value)):
+        raise BimriError(f"audit facts {label} must be a sorted unique list.")
+    for item in value:
+        if not isinstance(item, str) or not regex.fullmatch(item):
+            raise BimriError(f"audit facts {label} entry is invalid.")
+    return value
+
+
+def _audit_facts_count(value, label, maximum=None):
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        or (maximum is not None and value > maximum)
+    ):
+        raise BimriError(f"audit facts {label} is invalid.")
+    return value
+
+
+def audit_facts_unsettled(facts):
+    """True when a facts record names any applying or failed authority."""
+    unsettled = facts.get("unsettled") or {}
+    return any(unsettled.get(field) for field in AUDIT_FACTS_UNSETTLED_FIELDS)
+
+
+def validate_audit_facts_record(record, witness=None):
+    """Validate one facts generation exactly, optionally against its witness."""
+    if not isinstance(record, dict) or set(record) != AUDIT_FACTS_FIELDS:
+        raise BimriError("audit facts fields are invalid.")
+    if record.get("facts_schema") != AUDIT_FACTS_SCHEMA:
+        raise BimriError("audit facts schema is invalid.")
+    parse_timestamp(record.get("created_at"), "audit facts timestamp")
+    for field in ("manifest_hash", "run_authority_hash", "facts_hash"):
+        value = record.get(field)
+        if not isinstance(value, str) or not HASH_RE.fullmatch(value):
+            raise BimriError(f"audit facts {field} is invalid.")
+    run_facts = normalize_audit_run_facts(record.get("run_facts"))
+    if record["run_authority_hash"] != audit_witness_digest(run_facts):
+        raise BimriError("audit facts run authority hash does not match its rows.")
+    unsettled = record.get("unsettled")
+    if (
+        not isinstance(unsettled, dict)
+        or set(unsettled) != set(AUDIT_FACTS_UNSETTLED_FIELDS)
+    ):
+        raise BimriError("audit facts unsettled fields are invalid.")
+    _audit_facts_id_list(
+        unsettled["applying_decisions"], PROPOSAL_RE, "applying decisions"
+    )
+    _audit_facts_id_list(
+        unsettled["applying_resolutions"], CONFLICT_RE, "applying resolutions"
+    )
+    _audit_facts_id_list(
+        unsettled["failed_resolutions"], CONFLICT_RE, "failed resolutions"
+    )
+    applying = record.get("applying_resolutions")
+    if not isinstance(applying, list):
+        raise BimriError("audit facts applying resolutions are invalid.")
+    previous = None
+    for row in applying:
+        if not isinstance(row, dict) or set(row) != {
+            "conflict_id", "key", "choice", "intended_revision_after",
+        }:
+            raise BimriError("audit facts applying resolution row is invalid.")
+        if (
+            not isinstance(row["conflict_id"], str)
+            or not CONFLICT_RE.fullmatch(row["conflict_id"])
+            or not isinstance(row["key"], str)
+            or not KEY_RE.fullmatch(row["key"])
+            or not isinstance(row["choice"], str)
+            or not PROPOSAL_RE.fullmatch(row["choice"])
+            or (previous is not None and row["conflict_id"] <= previous)
+        ):
+            raise BimriError("audit facts applying resolution row is invalid.")
+        _audit_facts_count(
+            row["intended_revision_after"], "intended revision", 999999
+        )
+        previous = row["conflict_id"]
+    open_conflicts = record.get("open_conflicts")
+    if not isinstance(open_conflicts, list):
+        raise BimriError("audit facts open conflicts are invalid.")
+    previous = None
+    for row in open_conflicts:
+        if (
+            not isinstance(row, dict)
+            or set(row) != {"conflict_id", "key", "type"}
+            or not isinstance(row["conflict_id"], str)
+            or not CONFLICT_RE.fullmatch(row["conflict_id"])
+            or not isinstance(row["key"], str)
+            or not KEY_RE.fullmatch(row["key"])
+            or row["type"] not in CONFLICT_TYPES
+            or (previous is not None and row["conflict_id"] <= previous)
+        ):
+            raise BimriError("audit facts open conflict row is invalid.")
+        previous = row["conflict_id"]
+    held = _audit_facts_id_list(record.get("held"), PROPOSAL_RE, "held")
+    settled = record.get("settled")
+    if not isinstance(settled, dict):
+        raise BimriError("audit facts settled map is invalid.")
+    for held_id, settled_by in settled.items():
+        if (
+            not isinstance(held_id, str)
+            or not PROPOSAL_RE.fullmatch(held_id)
+            or not isinstance(settled_by, str)
+            or not (
+                settled_by == "owner-dismissed"
+                or PROPOSAL_RE.fullmatch(settled_by)
+            )
+            or held_id in held
+        ):
+            raise BimriError("audit facts settled entry is invalid.")
+    writers = record.get("writers_by_key")
+    if not isinstance(writers, dict):
+        raise BimriError("audit facts writers are invalid.")
+    for key, writer in writers.items():
+        if (
+            not isinstance(key, str)
+            or not KEY_RE.fullmatch(key)
+            or not isinstance(writer, dict)
+            or set(writer) != {"proposal_id", "revision", "run_id"}
+            or not isinstance(writer["proposal_id"], str)
+            or not PROPOSAL_RE.fullmatch(writer["proposal_id"])
+            or not isinstance(writer["run_id"], str)
+            or not RUN_RE.fullmatch(writer["run_id"])
+            or not writer["proposal_id"].startswith(writer["run_id"] + "-Q")
+        ):
+            raise BimriError("audit facts writer entry is invalid.")
+        _audit_facts_count(writer["revision"], "writer revision", 999999)
+    watermarks = record.get("watermarks")
+    if (
+        not isinstance(watermarks, dict)
+        or set(watermarks) != {"proposal", "pattern", "conflict", "run"}
+        or not isinstance(watermarks["proposal"], dict)
+    ):
+        raise BimriError("audit facts watermarks are invalid.")
+    for run_id, number in watermarks["proposal"].items():
+        if not isinstance(run_id, str) or not RUN_RE.fullmatch(run_id):
+            raise BimriError("audit facts proposal watermark run is invalid.")
+        _audit_facts_count(number, "proposal watermark", 999)
+    _audit_facts_count(watermarks["pattern"], "pattern watermark")
+    _audit_facts_count(watermarks["conflict"], "conflict watermark", 999999)
+    _audit_facts_count(watermarks["run"], "run watermark", 999999)
+    if record["facts_hash"] != audit_record_seal(record, "facts_hash"):
+        raise BimriError("audit facts seal is invalid.")
+    if witness is not None:
+        if (
+            witness.get("facts_hash") != record["facts_hash"]
+            or witness.get("run_authority_hash") != record["run_authority_hash"]
+            or witness.get("manifest_hash") != record["manifest_hash"]
+            or witness.get("created_at") != record["created_at"]
+        ):
+            raise BimriError(
+                "audit facts generation does not match its checkpoint."
+            )
+    return record
+
+
+def finalize_audit_facts(content, created_at, manifest_hash, run_facts):
+    """Seal facts content for one publication's timestamp and inventory."""
+    record = {
+        "facts_schema": AUDIT_FACTS_SCHEMA,
+        "created_at": created_at,
+        "manifest_hash": manifest_hash,
+        "run_facts": normalize_audit_run_facts(run_facts),
+    }
+    for field in AUDIT_FACTS_CONTENT_FIELDS:
+        record[field] = copy.deepcopy(content[field])
+    record["run_authority_hash"] = audit_witness_digest(record["run_facts"])
+    record["facts_hash"] = audit_record_seal(record, "facts_hash")
+    return validate_audit_facts_record(record)
+
+
+def _audit_facts_json(path):
+    """Parse one derived-cache input; damage is the full audit's to report."""
+    if path_is_redirected(path) or not path.is_file():
+        return None, None
+    try:
+        raw = path.read_bytes()
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return None, None
+    return (data if isinstance(data, dict) else None), raw
+
+
+def _note_audit_proposal_watermark(watermarks, proposal_id):
+    match = re.fullmatch(r"(R\d{6})-Q(\d{3})", proposal_id)
+    if match:
+        run_id, number = match.group(1), int(match.group(2))
+        watermarks[run_id] = max(watermarks.get(run_id, 0), number)
+
+
+def build_audit_facts(
+    paths, state, run_facts, manifest_hash, created_at=None, conflicts=None
+):
+    """Derive the facts generation of a full checkpoint from full-path scans.
+
+    Every value is a pure function of durable bytes (the timestamp is the
+    publishing witness's), so rebuilding the same publication after a crash
+    serializes to the same seal.
+    """
+    run_facts = normalize_audit_run_facts(run_facts)
+    proposal_watermarks = {}
+    applying_decisions = []
+    held = []
+    accepted = []
+    for path in sorted(paths.decisions.glob("*.json")):
+        if not PROPOSAL_RE.fullmatch(path.stem):
+            continue
+        _note_audit_proposal_watermark(proposal_watermarks, path.stem)
+        data, _raw = _audit_facts_json(path)
+        if data is None:
+            continue
+        outcome = data.get("outcome")
+        if outcome == "applying":
+            applying_decisions.append(path.stem)
+        elif outcome == "held":
+            held.append(path.stem)
+        elif outcome == "accepted":
+            revision = data.get("revision")
+            if (
+                isinstance(revision, int)
+                and not isinstance(revision, bool)
+                and 0 <= revision <= 999999
+            ):
+                accepted.append((path.stem, revision))
+    conflict_keys = {}
+    conflict_numbers = [state["conflict_count"]]
+    for path in sorted(paths.conflicts.glob("*.json")):
+        if not CONFLICT_RE.fullmatch(path.stem):
+            continue
+        conflict_numbers.append(int(path.stem[1:]))
+        data, raw = _audit_facts_json(path)
+        if raw is not None:
+            for match in AUDIT_FACTS_PROPOSAL_REFERENCE_RE.finditer(raw):
+                _note_audit_proposal_watermark(
+                    proposal_watermarks, match.group(0).decode("ascii")
+                )
+        if data is not None and isinstance(data.get("key"), str):
+            conflict_keys[path.stem] = data["key"]
+    applying_resolutions = []
+    failed_resolutions = []
+    applying_rows = []
+    for path in sorted(paths.resolutions.glob("*.json")):
+        if not CONFLICT_RE.fullmatch(path.stem):
+            continue
+        data, raw = _audit_facts_json(path)
+        if raw is not None:
+            for match in AUDIT_FACTS_PROPOSAL_REFERENCE_RE.finditer(raw):
+                _note_audit_proposal_watermark(
+                    proposal_watermarks, match.group(0).decode("ascii")
+                )
+        if data is None:
+            continue
+        status = data.get("status")
+        if status == "failed":
+            failed_resolutions.append(path.stem)
+        elif status == "applying":
+            applying_resolutions.append(path.stem)
+            choice = data.get("choice")
+            candidates = data.get("proposal_ids")
+            intended = data.get("intended_revision_after")
+            key = conflict_keys.get(path.stem)
+            if (
+                isinstance(choice, str)
+                and PROPOSAL_RE.fullmatch(choice)
+                and isinstance(candidates, list)
+                and choice in candidates
+                and isinstance(intended, int)
+                and not isinstance(intended, bool)
+                and 0 <= intended <= 999999
+                and isinstance(key, str)
+                and KEY_RE.fullmatch(key)
+            ):
+                applying_rows.append({
+                    "conflict_id": path.stem,
+                    "key": key,
+                    "choice": choice,
+                    "intended_revision_after": intended,
+                })
+    if conflicts is None:
+        conflicts, _conflict_issues = scan_open_conflicts(paths, state)
+    open_conflicts = {}
+    for item in conflicts:
+        conflict_id = item.get("conflict_id")
+        if (
+            isinstance(conflict_id, str)
+            and CONFLICT_RE.fullmatch(conflict_id)
+            and isinstance(item.get("key"), str)
+            and KEY_RE.fullmatch(item["key"])
+            and item.get("type") in CONFLICT_TYPES
+        ):
+            open_conflicts[conflict_id] = {
+                "conflict_id": conflict_id,
+                "key": item["key"],
+                "type": item["type"],
+            }
+    proposal_keys = {}
+    pattern_numbers = [state["pattern_count"]]
+    run_numbers = [state["run_count"]]
+    for path in sorted(paths.proposals.glob("*.json")):
+        if not PROPOSAL_RE.fullmatch(path.stem):
+            continue
+        _note_audit_proposal_watermark(proposal_watermarks, path.stem)
+        data, _raw = _audit_facts_json(path)
+        if data is None:
+            continue
+        key = data.get("key")
+        if isinstance(key, str) and KEY_RE.fullmatch(key):
+            proposal_keys[path.stem] = key
+        pattern_id = data.get("pattern_id")
+        if isinstance(pattern_id, str) and re.fullmatch(r"P\d+", pattern_id):
+            pattern_numbers.append(int(pattern_id[1:]))
+    for row in run_facts:
+        _note_audit_proposal_watermark(proposal_watermarks, row["proposal_id"])
+    head = revision_path(paths, state["head_revision"])
+    if head.is_file() and not path_is_redirected(head):
+        try:
+            head_text = head.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            head_text = ""
+        for line in head_text.splitlines():
+            match = AUDIT_FACTS_PATTERN_LINE_RE.match(line)
+            if match:
+                pattern_numbers.append(int(match.group(1)))
+    for record in state.get("cold_current", {}).values():
+        entry_id = record.get("entry_id") if isinstance(record, dict) else None
+        if isinstance(entry_id, str) and re.fullmatch(r"P\d+", entry_id):
+            pattern_numbers.append(int(entry_id[1:]))
+    for log in paths.logs.glob("R*.md"):
+        if RUN_RE.fullmatch(log.stem):
+            run_numbers.append(int(log.stem[1:]))
+    run_numbers.extend(int(run_id[1:]) for run_id in proposal_watermarks)
+    writers = {}
+    for proposal_id, revision in accepted:
+        key = proposal_keys.get(proposal_id)
+        if key is None:
+            continue
+        current = writers.get(key)
+        if current is None or (revision, proposal_id) > (
+            current["revision"], current["proposal_id"]
+        ):
+            writers[key] = {
+                "proposal_id": proposal_id,
+                "revision": revision,
+                "run_id": proposal_id.split("-Q", 1)[0],
+            }
+    content = {
+        "unsettled": {
+            "applying_decisions": sorted(set(applying_decisions)),
+            "applying_resolutions": sorted(set(applying_resolutions)),
+            "failed_resolutions": sorted(set(failed_resolutions)),
+        },
+        "applying_resolutions": sorted(
+            applying_rows, key=lambda row: row["conflict_id"]
+        ),
+        "open_conflicts": [
+            open_conflicts[conflict_id] for conflict_id in sorted(open_conflicts)
+        ],
+        "held": sorted(pid for pid in held if not settlement_path(paths, pid).exists()),
+        "settled": {
+            pid: read_settlement(paths, state, pid)["settled_by"]
+            for pid in held if settlement_path(paths, pid).exists()
+        },
+        "writers_by_key": writers,
+        "watermarks": {
+            "proposal": dict(sorted(proposal_watermarks.items())),
+            "pattern": max(pattern_numbers + [0]),
+            "conflict": max(conflict_numbers + [0]),
+            "run": max(run_numbers + [0]),
+        },
+    }
+    return finalize_audit_facts(
+        content, created_at or now_iso(), manifest_hash, run_facts
+    )
+
+
+def write_audit_facts_generation(paths, record):
+    """Publish one content-addressed facts generation (exclusive create)."""
+    record = validate_audit_facts_record(record)
+    generation = audit_facts_generation_path(paths, record["facts_hash"])
+    if path_is_redirected(paths.audit_manifests):
+        raise BimriError("audit manifest generation directory is redirected.")
+    ensure_directory_durable(paths.audit_manifests)
+    if generation.exists() or generation.is_symlink():
+        if path_is_redirected(generation) or not generation.is_file():
+            raise BimriError("audit facts generation conflicts with evidence.")
+        try:
+            existing = validate_audit_facts_record(
+                read_json_strict(generation, "audit facts generation")
+            )
+        except (BimriError, OSError, UnicodeError, ValueError, TypeError) as exc:
+            raise BimriError(
+                "audit facts generation conflicts with evidence."
+            ) from exc
+        if existing != record:
+            raise BimriError("audit facts generation conflicts with evidence.")
+    else:
+        exclusive_write_bytes(generation, checkpoint_record_bytes(record))
+    return generation
+
+
+def load_audit_facts_evidence(paths, witness, facts_override=None):
+    """Load the facts generation a schema-2 checkpoint names, exactly.
+
+    Missing or invalid facts behind a sealed checkpoint are damaged evidence,
+    exactly like a missing manifest generation: callers refuse to rebaseline
+    blind and the full audit decides.
+    """
+    try:
+        if audit_witness_schema(witness) != AUDIT_WITNESS_SCHEMA:
+            raise BimriError(
+                "audit facts are named only by a schema-2 checkpoint."
+            )
+        if facts_override is not None:
+            return validate_audit_facts_record(
+                copy.deepcopy(facts_override), witness
+            )
+        path = audit_facts_generation_path(paths, witness.get("facts_hash"))
+        if path_is_redirected(path) or not path.is_file():
+            raise BimriError("audit facts generation is missing or unsafe.")
+        record = read_json_strict(path, "audit facts generation")
+        return validate_audit_facts_record(record, witness)
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError) as exc:
+        message = str(exc)
+        if message.startswith(PRIOR_EVIDENCE_INVALID_PREFIX):
+            raise
+        raise BimriError(
+            PRIOR_EVIDENCE_INVALID_PREFIX + f": {message}"
+        ) from exc
+
+
 def clear_audit_transition(paths):
     path = paths.audit_transition
     if path_is_redirected(path):
@@ -4555,7 +5807,7 @@ def clear_audit_transition(paths):
     if path.exists():
         if not path.is_file():
             raise BimriError("audit transition marker is not a regular file.")
-        path.unlink()
+        remove_protected_file(path)
         fsync_directory(path.parent)
 
 
@@ -4674,43 +5926,69 @@ def write_audit_transition(paths, marker):
 
 
 def referenced_audit_manifest_hashes(paths):
+    """Manifest and facts generation hashes that live evidence still names.
+
+    The live witness, the blocked record's prior witness and the transition
+    marker's prior witness each keep their manifest generation and, for a
+    schema-2 checkpoint, their facts generation.
+    """
     hashes = set()
-    witness = load_sealed_audit_witness(paths, allow_prior_policy=True)
-    if witness is not None:
-        hashes.add(witness["manifest_hash"])
+
+    def keep_witness(witness):
+        if not isinstance(witness, dict):
+            return
+        if isinstance(witness.get("manifest_hash"), str):
+            hashes.add(witness["manifest_hash"])
+        if isinstance(witness.get("facts_hash"), str):
+            hashes.add(witness["facts_hash"])
+
+    keep_witness(load_sealed_audit_witness(paths, allow_prior_policy=True))
     try:
         blocked = load_audit_blocked_record(paths)
     except (BimriError, OSError, UnicodeError, ValueError, TypeError):
         blocked = None
     if blocked and blocked.get("prior_witness"):
-        hashes.add(blocked["prior_witness"]["manifest_hash"])
+        keep_witness(blocked["prior_witness"])
     try:
         transition = load_audit_transition(paths)
     except (BimriError, OSError, UnicodeError, ValueError, TypeError):
         transition = None
     if transition:
         hashes.add(transition["prior_manifest_hash"])
+        keep_witness(transition.get("prior_witness"))
+        completion = transition.get("scope", {}).get("completion")
+        if isinstance(completion, dict):
+            keep_witness(completion.get("witness"))
     return hashes
 
 
-def prune_audit_manifest_generations(paths):
-    """Bound derived evidence after every completed publication."""
+def prune_audit_manifest_generations(paths, facts_only=False):
+    """Bound derived evidence after every completed publication.
+
+    facts_only=True prunes only unreferenced facts generations. Every
+    publication does that, because a facts generation carries its
+    publication's timestamp and so, unlike a manifest generation, is never
+    reused by content.
+    """
     keep = referenced_audit_manifest_hashes(paths)
     try:
         children = list(paths.audit_manifests.iterdir())
     except (FileNotFoundError, OSError):
         return
     for path in children:
-        if (
-            path_is_redirected(path)
-            or not path.is_file()
-            or not HASH_RE.fullmatch(path.stem)
-            or path.suffix != ".json"
-            or path.stem in keep
-        ):
+        if path_is_redirected(path) or not path.is_file():
+            continue
+        if path.suffix != ".json":
+            continue
+        stem = path.stem
+        if stem.startswith("facts-"):
+            stem = stem[len("facts-"):]
+        elif facts_only:
+            continue
+        if not HASH_RE.fullmatch(stem) or stem in keep:
             continue
         try:
-            path.unlink()
+            remove_protected_file(path)
         except OSError:
             continue
     fsync_directory(paths.audit_manifests)
@@ -4948,7 +6226,7 @@ def prune_audit_drift_receipts(paths):
     """
     for path in list_audit_drift_receipts(paths)[:-AUDIT_DRIFT_KEEP]:
         with contextlib.suppress(OSError):
-            path.unlink()
+            remove_protected_file(path)
     referenced = retained_drift_receipt_attachment_paths(paths)
     try:
         attachments = sorted(
@@ -4968,7 +6246,7 @@ def prune_audit_drift_receipts(paths):
         return
     for path in attachments[:-AUDIT_DRIFT_BLOB_KEEP]:
         with contextlib.suppress(OSError):
-            path.unlink()
+            remove_protected_file(path)
 
 
 def validate_audit_drift_receipt(paths, path, record):
@@ -5097,33 +6375,111 @@ def audit_drift_summary(paths, limit=3):
     return len(children), newest, sorted(damaged)
 
 
-def write_audit_witness(paths, state, conflicts=None, manifest=None, run_facts=None):
-    """Publish detailed audit evidence, then its compact read checkpoint."""
-    del conflicts  # Read projections never come from the checkpoint.
+def _withhold_audit_witness(paths):
+    """Refuse publication over unsettled authority, keeping W0 under a marker."""
+    paths.validated_audit_witness = None
+    if not (
+        paths.audit_transition.exists()
+        or paths.audit_transition.is_symlink()
+    ):
+        discard_audit_witness(paths)
+    return False
+
+
+def frozen_completion_facts(
+    paths, state, frozen_witness, run_facts, manifest_hash, facts=None,
+    conflicts=None,
+):
+    """Reuse or rebuild, byte for byte, the facts a frozen completion sealed.
+
+    A crash after the completion seal may or may not have left the facts
+    generation on disk. Present and valid: reused as is. Absent: rebuilt by
+    the producer the frozen origin names with the frozen timestamp, and the
+    rebuilt seal must equal the frozen one. Present but unsafe: the
+    publication fails as a conflicting manifest generation does.
+    """
+    expected = frozen_witness["facts_hash"]
+    created_at = frozen_witness["created_at"]
+    if facts is not None:
+        candidate = finalize_audit_facts(
+            facts, created_at, manifest_hash, run_facts
+        )
+        if candidate["facts_hash"] == expected:
+            return candidate
+    generation = audit_facts_generation_path(paths, expected)
+    if generation.exists() or generation.is_symlink():
+        if path_is_redirected(generation) or not generation.is_file():
+            raise BimriError("audit facts generation conflicts with evidence.")
+        return validate_audit_facts_record(
+            read_json_strict(generation, "audit facts generation"),
+            frozen_witness,
+        )
+    if frozen_witness.get("audit_origin") != "full":
+        raise BimriError(
+            "a frozen scoped completion cannot rebuild its facts without "
+            "its scoped evidence."
+        )
+    candidate = build_audit_facts(
+        paths,
+        state,
+        run_facts,
+        manifest_hash,
+        created_at=created_at,
+        conflicts=conflicts,
+    )
+    if candidate["facts_hash"] != expected:
+        raise BimriError(
+            "live authority no longer matches its frozen completed checkpoint."
+        )
+    return candidate
+
+
+def write_audit_witness(
+    paths,
+    state,
+    conflicts=None,
+    manifest=None,
+    run_facts=None,
+    facts=None,
+    witness_fields=None,
+):
+    """Publish detailed audit evidence, then its compact read checkpoint.
+
+    Order: the exact completion is sealed into a live authority marker, then
+    the facts generation, the manifest generation, the manifest alias and the
+    witness. With facts=None (every full audit) the facts generation is
+    derived from the full-path scans and the witness records a full origin.
+    A scoped publication passes its successor facts (whose unsettled lists
+    replace the full unsettled scan) and the witness fields that carry the
+    last full audit forward. A frozen completion is republished exactly.
+    """
     try:
-        if authority_has_unsettled_records(paths):
-            paths.validated_audit_witness = None
-            if not (
-                paths.audit_transition.exists()
-                or paths.audit_transition.is_symlink()
-            ):
-                discard_audit_witness(paths)
-            return False
-        if run_facts is None:
-            run_facts = audit_witness_run_facts(paths, state)
-        if manifest is None:
-            manifest = audit_witness_manifest(paths)
-        manifest = normalize_audit_manifest(manifest)
-        manifest_hash = audit_witness_digest(manifest)
         transition = load_audit_transition(paths)
         frozen_completion = (
             transition.get("scope", {}).get("completion")
             if transition is not None and transition["kind"] == "authority"
             else None
         )
-        created_at = (
-            frozen_completion["witness"]["created_at"]
+        frozen_witness = (
+            frozen_completion["witness"]
             if frozen_completion is not None
+            else None
+        )
+        if facts is not None:
+            if audit_facts_unsettled(facts):
+                return _withhold_audit_witness(paths)
+        elif authority_has_unsettled_records(paths):
+            return _withhold_audit_witness(paths)
+        if run_facts is None:
+            run_facts = audit_witness_run_facts(paths, state)
+        if manifest is None:
+            manifest = audit_witness_manifest(paths)
+        manifest = normalize_audit_manifest(manifest)
+        run_facts = normalize_audit_run_facts(run_facts)
+        manifest_hash = audit_witness_digest(manifest)
+        created_at = (
+            frozen_witness["created_at"]
+            if frozen_witness is not None
             else now_iso()
         )
         manifest_record = {
@@ -5153,13 +6509,76 @@ def write_audit_witness(paths, state, conflicts=None, manifest=None, run_facts=N
             "manifest_count": len(manifest),
             "proposal_runs": proposal_runs,
         }
-        if frozen_completion is not None:
+        facts_record = None
+        if frozen_witness is not None:
             # Complete the exact old transaction before publishing a new
             # policy verdict. Reconciliation has audited its current content,
             # but its frozen closure must not be rewritten during recovery.
-            frozen_witness = frozen_completion["witness"]
             witness["engine_version"] = frozen_witness["engine_version"]
             witness["policy_version"] = frozen_witness["policy_version"]
+            if audit_witness_schema(frozen_witness) == AUDIT_WITNESS_SCHEMA:
+                for field in (
+                    "facts_hash", "audited_at", "audit_origin",
+                    "scoped_publications",
+                ):
+                    witness[field] = frozen_witness[field]
+                facts_record = frozen_completion_facts(
+                    paths,
+                    state,
+                    frozen_witness,
+                    run_facts,
+                    manifest_hash,
+                    facts=facts,
+                    conflicts=conflicts,
+                )
+            else:
+                # A sealed v5.1.x completion is republished in its own
+                # schema; the next command re-proves it as a cache miss.
+                witness["witness_schema"] = frozen_witness.get(
+                    "witness_schema"
+                )
+        else:
+            if facts is None:
+                facts_record = build_audit_facts(
+                    paths,
+                    state,
+                    run_facts,
+                    manifest_hash,
+                    created_at=created_at,
+                    conflicts=conflicts,
+                )
+                origin_fields = {
+                    "audited_at": created_at,
+                    "audit_origin": "full",
+                    "scoped_publications": 0,
+                }
+            else:
+                facts_record = finalize_audit_facts(
+                    facts, created_at, manifest_hash, run_facts
+                )
+                origin_fields = witness_fields
+                if origin_fields is None:
+                    prior = (
+                        transition.get("prior_witness")
+                        if transition is not None
+                        else None
+                    )
+                    if audit_witness_schema(prior) != AUDIT_WITNESS_SCHEMA:
+                        raise BimriError(
+                            "a scoped publication requires a schema-2 prior "
+                            "checkpoint."
+                        )
+                    origin_fields = {
+                        "audited_at": prior["audited_at"],
+                        "audit_origin": "scoped",
+                        "scoped_publications": prior["scoped_publications"] + 1,
+                    }
+            witness.update({
+                "audited_at": origin_fields["audited_at"],
+                "audit_origin": origin_fields["audit_origin"],
+                "scoped_publications": origin_fields["scoped_publications"],
+                "facts_hash": facts_record["facts_hash"],
+            })
         witness["witness_hash"] = audit_record_seal(witness, "witness_hash")
         if (
             frozen_completion is not None
@@ -5168,20 +6587,29 @@ def write_audit_witness(paths, state, conflicts=None, manifest=None, run_facts=N
             raise BimriError(
                 "live authority no longer matches its frozen completed checkpoint."
             )
-        # Freeze the exact M1/run/state/head closure before either M1 or W1 is
-        # published. Recovery compares against this record and never expands
-        # scope from the post-crash tree.
+        if (
+            audit_witness_schema(witness) == AUDIT_WITNESS_SCHEMA
+            and validate_sealed_audit_witness_record(witness) is None
+        ):
+            raise BimriError("audit witness candidate is invalid.")
+        # Freeze the exact M1/F1/run/state/head closure before M1, F1 or W1
+        # is published. Recovery compares against this record and never
+        # expands scope from the post-crash tree.
         seal_authority_transition_completion(paths, state, witness)
         if path_is_redirected(paths.audit_manifest):
             raise BimriError("audit manifest destination is redirected.")
         if paths.audit_manifest.exists() and paths.audit_manifest.is_dir():
             raise BimriError("audit manifest destination is a directory.")
-        # Publish immutable evidence first. The fixed alias remains for
-        # operators and transitional installs; checkpoints resolve the
-        # content-addressed generation so replacing the alias cannot strand
-        # an older witness after a crash.
-        write_audit_manifest_generation(paths, manifest_record)
-        atomic_write_json(paths.audit_manifest, manifest_record)
+        # Publish immutable evidence first: the facts generation, then the
+        # manifest generation. The fixed alias remains for operators and
+        # transitional installs; checkpoints resolve the content-addressed
+        # generations so replacing the alias cannot strand an older witness
+        # after a crash.
+        if facts_record is not None:
+            write_audit_facts_generation(paths, facts_record)
+        manifest_bytes = checkpoint_record_bytes(manifest_record)
+        write_audit_manifest_generation(paths, manifest_record, manifest_bytes)
+        atomic_write_bytes(paths.audit_manifest, manifest_bytes)
         if path_is_redirected(paths.audit_witness):
             raise BimriError("audit witness destination is redirected.")
         if paths.audit_witness.exists() and paths.audit_witness.is_dir():
@@ -5190,8 +6618,15 @@ def write_audit_witness(paths, state, conflicts=None, manifest=None, run_facts=N
         paths.validated_audit_witness = (
             witness if audit_witness_uses_current_policy(witness) else None
         )
+        # The replaced checkpoint's facts generation is no longer named by
+        # live evidence (markers and blocked records keep theirs).
+        prune_audit_manifest_generations(paths, facts_only=True)
+        paths.last_witness_error = None
         return True
-    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError) as exc:
+        # Kept for a caller that must report why publication failed (a
+        # save's L9 re-raises a filesystem error such as a full disk).
+        paths.last_witness_error = exc
         paths.validated_audit_witness = None
         if not (
             paths.audit_transition.exists()
@@ -5221,8 +6656,158 @@ def sealed_witness_matches_state(witness, state, include_write_state=True):
         return False
 
 
-def frozen_authority_transition_scope(paths, operation, run_id, scope):
-    """Freeze immutable authority inputs before the first transition write."""
+AUDIT_WITNESS_ROOT_NAMES = (
+    "proposals", "decisions", "conflicts", "resolutions", "revisions",
+    "archive", "recovery", "settlements",
+)
+SCOPED_DECLARATION_OPERATIONS = frozenset({
+    "propose", "sync", "close-authority-run", "resolve",
+})
+
+
+def scoped_protected_path_is_valid(value):
+    """A root-relative POSIX path naming one file under a witnessed root."""
+    if not isinstance(value, str) or not value or "\\" in value:
+        return False
+    pure = PurePosixPath(value)
+    return (
+        not pure.is_absolute()
+        and pure.as_posix() == value
+        and ".." not in pure.parts
+        and len(pure.parts) == 3
+        and pure.parts[0] == ".bimri"
+        and pure.parts[1] in AUDIT_WITNESS_ROOT_NAMES
+        and pure.parts[2] not in {"", ".", ".."}
+    )
+
+
+def scoped_protected_file_hash(paths, relative):
+    """Live sha256 of one scoped protected path, or "absent"."""
+    if not scoped_protected_path_is_valid(relative):
+        raise BimriError(f"scoped protected path is invalid: {relative}")
+    path = paths.root.joinpath(*PurePosixPath(relative).parts)
+    if path_is_redirected(path):
+        raise BimriError(f"scoped protected path is redirected: {relative}")
+    if not (path.exists() or path.is_symlink()):
+        return "absent"
+    if not path.is_file():
+        raise BimriError(f"scoped protected path is not a file: {relative}")
+    try:
+        return sha256_bytes(path.read_bytes())
+    except OSError as exc:
+        raise BimriError(
+            f"scoped protected path could not be read: {relative}: {exc}"
+        ) from exc
+
+
+def _scoped_revision_path(number):
+    return f".bimri/revisions/V{number:06d}.md"
+
+
+def legacy_authority_scope_paths(
+    paths, state, operation, run_id, proposal_ids, conflict_id=None,
+    prior_facts=None, archive_date=None,
+):
+    """Declared and dependency paths of a legacy authority operation.
+
+    Declared paths are the only protected records the operation may create
+    or replace; dependency paths are the immutable records it reads. Scoped
+    recovery rehashes exactly these (plus the revisions the head moved
+    through) instead of the whole protected inventory.
+    """
+    declared = set()
+    dependencies = set()
+    head = state["head_revision"]
+    dependencies.add(_scoped_revision_path(head))
+    archive_month = f".bimri/archive/{(archive_date or today())[:7]}.md"
+    keys = set()
+    if operation == "propose":
+        declared.update(
+            f".bimri/proposals/{proposal_id}.json"
+            for proposal_id in proposal_ids
+        )
+        meta = state.get("active_runs", {}).get(run_id or "")
+        base = meta.get("base_revision") if isinstance(meta, dict) else None
+        if isinstance(base, int) and not isinstance(base, bool) and base >= 0:
+            dependencies.add(_scoped_revision_path(base))
+        if run_id and RUN_RE.fullmatch(run_id):
+            # Also bind prior same-run rows now absent from a directory listing.
+            for row in (prior_facts or {}).get("run_facts", ()):
+                if row["run_id"] == run_id:
+                    pid = row["proposal_id"]
+                    dependencies.update({f".bimri/proposals/{pid}.json", f".bimri/decisions/{pid}.json"})
+            # The same-run preflight reads this run's staged proposals and
+            # their decisions (one run's prefix, never the history).
+            for directory, root in (
+                (paths.proposals, "proposals"), (paths.decisions, "decisions"),
+            ):
+                for path in directory.glob(f"{run_id}-Q*.json"):
+                    if PROPOSAL_RE.fullmatch(path.stem):
+                        dependencies.add(f".bimri/{root}/{path.name}")
+    else:
+        for proposal_id in proposal_ids:
+            relative = f".bimri/proposals/{proposal_id}.json"
+            dependencies.add(relative)
+            declared.add(f".bimri/decisions/{proposal_id}.json")
+            existing, _raw = _audit_facts_json(decision_path(paths, proposal_id))
+            if isinstance(existing, dict):
+                for field in ("conflict_id", "resolution_id"):
+                    cid = existing.get(field)
+                    if isinstance(cid, str) and CONFLICT_RE.fullmatch(cid):
+                        dependencies.update({f".bimri/conflicts/{cid}.json", f".bimri/resolutions/{cid}.json"})
+            ppath = proposal_path(paths, proposal_id)
+            if ppath.is_file() and not path_is_redirected(ppath):
+                try:
+                    data = json.loads(ppath.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, ValueError):
+                    data = None
+                if isinstance(data, dict):
+                    base = data.get("base_revision")
+                    if (
+                        isinstance(base, int)
+                        and not isinstance(base, bool)
+                        and 0 <= base <= 999999
+                    ):
+                        dependencies.add(_scoped_revision_path(base))
+                    for pid in data.get("settles", []):
+                        validate_fixed_id(pid, PROPOSAL_RE, "held proposal ID")
+                        declared.add(f".bimri/settlements/{pid}.json")
+                        dependencies.update({f".bimri/proposals/{pid}.json",
+                                             f".bimri/decisions/{pid}.json"})
+                    if isinstance(data.get("key"), str):
+                        keys.add(data["key"])
+        for offset in range(1, max(len(proposal_ids), 1) + 1):
+            if head + offset <= 999999:
+                declared.add(_scoped_revision_path(head + offset))
+        declared.add(archive_month)
+        if operation in {"sync", "close-authority-run"}:
+            count = state["conflict_count"]
+            for offset in range(1, len(proposal_ids) + 1):
+                if count + offset <= 999999:
+                    declared.add(f".bimri/conflicts/C{count + offset:06d}.json")
+            # A stale base may join an open same-key conflict instead of
+            # allocating a new one.
+            for row in (prior_facts or {}).get("open_conflicts", []):
+                if row.get("key") in keys:
+                    cid = row["conflict_id"]
+                    declared.add(f".bimri/conflicts/{cid}.json")
+                    dependencies.add(f".bimri/resolutions/{cid}.json")
+        if operation == "resolve" and conflict_id:
+            dependencies.add(f".bimri/conflicts/{conflict_id}.json")
+            declared.add(f".bimri/resolutions/{conflict_id}.json")
+    return sorted(declared), sorted(dependencies - declared)
+
+
+def frozen_authority_transition_scope(
+    paths, operation, run_id, scope, state=None, prior_facts=None,
+    extra_dependencies=(),
+):
+    """Freeze immutable authority inputs before the first transition write.
+
+    extra_dependencies are protected paths the caller's preflight read
+    (a cold base month, a moved head's observed revision); they join the
+    computed dependency set of a legacy operation.
+    """
     frozen = copy.deepcopy(scope or {})
     proposal_ids = set()
     for value in frozen.get("proposal_ids", []):
@@ -5230,6 +6815,16 @@ def frozen_authority_transition_scope(paths, operation, run_id, scope):
             value, PROPOSAL_RE, "audit transition proposal ID"
         ))
     if operation in {"sync", "close-authority-run"} and run_id:
+        log = run_log_path(paths, run_id)
+        if path_is_redirected(log) or not log.is_file():
+            raise BimriError(f"{run_id} log is missing or unsafe.")
+        proposal_ids.update(row["proposal_id"] for row in (prior_facts or {}).get("run_facts", ())
+                            if row["run_id"] == run_id)
+        for reference in LOG_PROPOSAL_RE.finditer(log.read_text(encoding="utf-8")):
+            pid = reference.group("proposal_id")
+            if not pid.startswith(run_id + "-"):
+                raise BimriError(f"{run_id} log references a different run's proposal.")
+            proposal_ids.add(pid)
         proposal_ids.update(
             path.stem
             for path in paths.proposals.glob(f"{run_id}-Q*.json")
@@ -5280,6 +6875,32 @@ def frozen_authority_transition_scope(paths, operation, run_id, scope):
         raise BimriError("audit transition contains an unscoped proposal hash.")
     frozen["proposal_ids"] = proposal_ids
     frozen["proposal_hashes"] = proposal_hashes
+    if (
+        "declared_paths" not in frozen
+        and "dependency_hashes" not in frozen
+        and state is not None
+        and operation in SCOPED_DECLARATION_OPERATIONS
+    ):
+        if operation in {"sync", "close-authority-run", "resolve"}:
+            frozen.setdefault("started_on", today())
+        declared, dependencies = legacy_authority_scope_paths(
+            paths,
+            state,
+            operation,
+            run_id,
+            proposal_ids,
+            conflict_id=conflict_id if operation == "resolve" else None,
+            prior_facts=prior_facts,
+            archive_date=frozen.get("started_on"),
+        )
+        dependencies = sorted(
+            (set(dependencies) | set(extra_dependencies)) - set(declared)
+        )
+        frozen["declared_paths"] = declared
+        frozen["dependency_hashes"] = {
+            relative: scoped_protected_file_hash(paths, relative)
+            for relative in dependencies
+        }
     # The exact post-effect checkpoint is sealed after all engine effects are
     # durable but before manifest/witness publication. A crash before that seal
     # remains an incomplete transition and is never inferred from live files.
@@ -5306,6 +6927,80 @@ def validate_frozen_authority_transition_scope(scope):
         digest = proposal_hashes[proposal_id]
         if not isinstance(digest, str) or not HASH_RE.fullmatch(digest):
             raise BimriError("audit transition proposal hash is invalid.")
+    # Optional v5.2 scope keys; a v5.1.x marker carries none of them and
+    # recovers through the full replay.
+    if "request_id" in scope:
+        request_id = scope["request_id"]
+        if (
+            not isinstance(request_id, str)
+            or not REQUEST_ID_RE.fullmatch(request_id)
+        ):
+            raise BimriError("audit transition request ID is invalid.")
+    if "ticket_hash" in scope:
+        ticket_hash = scope["ticket_hash"]
+        if not isinstance(ticket_hash, str) or not HASH_RE.fullmatch(ticket_hash):
+            raise BimriError("audit transition ticket hash is invalid.")
+    if "settles" in scope:
+        settles = scope["settles"]
+        if (
+            not isinstance(settles, list)
+            or settles != sorted(set(settles))
+            or any(
+                not isinstance(item, str) or not PROPOSAL_RE.fullmatch(item)
+                for item in settles
+            )
+        ):
+            raise BimriError("audit transition settled candidates are invalid.")
+    if "intent" in scope:
+        # A save marker carries the caller's exact intent so an R0a rebuild
+        # of a lost ticket keeps its intent_hash (and a retry still replays).
+        validate_save_intent(scope["intent"])
+    if "started_on" in scope:
+        started_on = scope["started_on"]
+        try:
+            if not isinstance(started_on, str):
+                raise ValueError(started_on)
+            dt.date.fromisoformat(started_on)
+        except ValueError as exc:
+            raise BimriError(
+                "audit transition save start date is invalid."
+            ) from exc
+    if "run_log" in scope:
+        run_log = scope["run_log"]
+        pure = PurePosixPath(run_log) if isinstance(run_log, str) else None
+        if (
+            pure is None
+            or pure.is_absolute()
+            or pure.as_posix() != run_log
+            or ".." in pure.parts
+            or tuple(pure.parts[:2]) != (".bimri", "log")
+            or len(pure.parts) != 3
+            or pure.suffix != ".md"
+            or not RUN_RE.fullmatch(pure.stem)
+        ):
+            raise BimriError("audit transition run log is invalid.")
+    if "declared_paths" in scope:
+        declared = scope["declared_paths"]
+        if (
+            not isinstance(declared, list)
+            or declared != sorted(set(declared))
+            or any(not scoped_protected_path_is_valid(item) for item in declared)
+        ):
+            raise BimriError("audit transition declared paths are invalid.")
+    if "dependency_hashes" in scope:
+        dependencies = scope["dependency_hashes"]
+        if not isinstance(dependencies, dict) or any(
+            not scoped_protected_path_is_valid(path)
+            or not isinstance(digest, str)
+            or not (digest == "absent" or HASH_RE.fullmatch(digest))
+            for path, digest in dependencies.items()
+        ):
+            raise BimriError("audit transition dependency hashes are invalid.")
+    if ("declared_paths" in scope) != ("dependency_hashes" in scope):
+        raise BimriError(
+            "audit transition declared paths and dependency hashes must "
+            "travel together."
+        )
     completion = scope.get("completion")
     if completion is not None:
         if set(completion) != {"state_file_hash", "witness"}:
@@ -5358,18 +7053,46 @@ def seal_authority_transition_completion(paths, state, witness):
 
 
 def begin_authority_checkpoint_transition(
-    paths, state, operation, run_id=None, scope=None
+    paths, state, operation, run_id=None, scope=None, writer_gate=True,
+    extra_dependencies=(), proven_prior=None,
 ):
-    """Persist W0/M0 and dirty the state epoch before authority mutation."""
+    """Persist W0/M0/F0 and dirty the state epoch before authority mutation.
+
+    The same state write that advances the epoch moves a v5.1.0 state to the
+    v5.2.0 state format: the first authority write is the writer gate that
+    makes a v5.1.2 engine refuse the store before any mutation. Only
+    load-time recovery of an already recorded intent passes
+    writer_gate=False.
+    """
     prior = paths.validated_audit_witness or load_sealed_audit_witness(paths)
     if prior is None or not sealed_witness_matches_state(prior, state):
         raise BimriError(
             "cannot begin an authority transition without an intact checkpoint."
         )
-    ensure_audit_manifest_generation(paths, prior)
+    # A prior checkpoint whose facts generation is missing is damaged
+    # evidence: refuse before the marker, never mid-transition. A scoped
+    # caller (proven_prior = (witness, facts)) loaded both from their
+    # content-addressed generations under this lock a moment ago.
+    if (
+        proven_prior is not None
+        and proven_prior[0] is prior
+        and audit_manifest_generation_path(
+            paths, prior["manifest_hash"]
+        ).is_file()
+    ):
+        prior_facts = proven_prior[1]
+    else:
+        prior_facts = load_audit_facts_evidence(paths, prior)
+        ensure_audit_manifest_generation(paths, prior)
     before = state_audit_epoch(state)
     frozen_scope = frozen_authority_transition_scope(
-        paths, operation, run_id, scope
+        paths,
+        operation,
+        run_id,
+        scope,
+        state=state,
+        prior_facts=prior_facts,
+        extra_dependencies=extra_dependencies,
     )
     marker = write_audit_transition(paths, {
         "transition_schema": AUDIT_TRANSITION_SCHEMA,
@@ -5392,6 +7115,14 @@ def begin_authority_checkpoint_transition(
         "log_append": None,
     })
     state["_audit_epoch"] = marker["epoch_after"]
+    if (
+        writer_gate
+        and state.get("bimri_version") == PRIOR_STATE_FORMAT_VERSION
+    ):
+        # One-way writer gate (D0.2), bound into the same durable write as
+        # the dirty bit. The marker's pre-write state still says v5.1.0;
+        # recovery whitelists exactly this delta.
+        state["bimri_version"] = STATE_FORMAT_VERSION
     # The epoch is the durable dirty bit. A crash after this replace makes W0
     # unreadable while W0 and its content-addressed M0 remain recoverable.
     save_state(paths, state)
@@ -5413,6 +7144,10 @@ def begin_lifecycle_checkpoint_transition(
     paths, state, post_state, operation, run_id, log_path, post_log_text
 ):
     """Write ahead one bounded start/close state+log transition."""
+    if paths.audit_transition.exists() or paths.audit_transition.is_symlink():
+        # D3.5: a lifecycle write never runs beside an unfinished authority
+        # operation (a degraded start would squat a planned save run id).
+        refuse_lifecycle_write_under_authority_marker(paths)
     prior = paths.validated_audit_witness
     if prior is None or not sealed_witness_matches_state(prior, state):
         return None
@@ -5480,6 +7215,9 @@ def publish_lifecycle_checkpoint(paths, state, marker):
         or state["head_hash"] != prior["head_hash"]
     ):
         raise BimriError("lifecycle state does not match its durable transition.")
+    # W1 = W0 with the lifecycle-only state binding recomputed. A schema-2
+    # prior carries its facts generation, full-audit time and scoped count
+    # unchanged; only the origin of this publication is recorded.
     witness = dict(prior)
     witness.update({
         "state_hash": audit_witness_state_hash(
@@ -5488,6 +7226,8 @@ def publish_lifecycle_checkpoint(paths, state, marker):
         "write_state_hash": audit_witness_write_state_hash(state),
         "audit_epoch": state_audit_epoch(state),
     })
+    if audit_witness_schema(witness) == AUDIT_WITNESS_SCHEMA:
+        witness["audit_origin"] = "lifecycle"
     witness["witness_hash"] = audit_record_seal(witness, "witness_hash")
     ensure_audit_manifest_generation(paths, prior)
     atomic_write_json(paths.audit_witness, witness)
@@ -5521,6 +7261,14 @@ def authority_transition_state_issues(marker, state):
     before = copy.deepcopy(marker["pre_write_state"])
     current = audit_witness_write_state_payload(state)
     operation = marker["operation"]
+    if (
+        before.get("bimri_version") == PRIOR_STATE_FORMAT_VERSION
+        and current.get("bimri_version") == STATE_FORMAT_VERSION
+    ):
+        # The writer gate's one-way version flip rides every authority
+        # transition; no other version delta is in scope.
+        before.pop("bimri_version", None)
+        current.pop("bimri_version", None)
     allowed_top = set()
     if operation in {
         "sync", "close-authority-run", "resolve",
@@ -5532,11 +7280,20 @@ def authority_transition_state_issues(marker, state):
         })
     elif operation == "recover-manual-hot-edit":
         allowed_top.add("conflict_count")
+    elif operation == "save":
+        # A save run never enters active_runs or session_runs (D3.2): only
+        # the head, residency, counters, the run's date and the close time
+        # may move; active_runs and session_runs stay byte-equal.
+        allowed_top.update({
+            "head_revision", "head_hash", "conflict_count", "pattern_count",
+            "cold_current", "last_revision_reason", "run_count", "run_dates",
+            "last_closed_at",
+        })
     for field in allowed_top:
         before.pop(field, None)
         current.pop(field, None)
     run_id = marker.get("run_id")
-    if operation in {"sync", "close-authority-run"} and run_id:
+    if operation in {"sync", "close-authority-run", "abandon-run"} and run_id:
         before_active = before.get("active_runs", {})
         current_active = current.get("active_runs", {})
         if operation == "sync":
@@ -5574,7 +7331,7 @@ def authority_transition_allowed_manifest_paths(paths, state, marker):
     allowed = set()
     proposal_ids = authority_transition_proposal_ids(paths, marker)
     for proposal_id in proposal_ids:
-        if marker["operation"] == "propose":
+        if marker["operation"] in {"propose", "save"}:
             allowed.add(f".bimri/proposals/{proposal_id}.json")
         dpath = decision_path(paths, proposal_id)
         if dpath.is_file() and not path_is_redirected(dpath):
@@ -5598,6 +7355,25 @@ def authority_transition_allowed_manifest_paths(paths, state, marker):
     conflict_id = marker.get("scope", {}).get("conflict_id")
     if isinstance(conflict_id, str) and CONFLICT_RE.fullmatch(conflict_id):
         allowed.add(f".bimri/resolutions/{conflict_id}.json")
+    if marker["operation"] == "save":
+        # A save may create exactly its declared records (an orphan revision
+        # or decision of a crashed attempt included); an archive month is
+        # still explained only by its own [BY:Q] rows.
+        allowed.update(
+            path for path in marker.get("scope", {}).get("declared_paths", [])
+            if scoped_protected_path_is_valid(path)
+            and not path.startswith((".bimri/archive/", ".bimri/settlements/"))
+        )
+    for relative in marker["scope"].get("declared_paths", ()):
+        if not relative.startswith(".bimri/settlements/"):
+            continue
+        pid = PurePosixPath(relative).stem
+        if not PROPOSAL_RE.fullmatch(pid) or scoped_protected_file_hash(paths, relative) == "absent":
+            continue
+        record = read_settlement(paths, state, pid)
+        if (record["settled_by"] in proposal_ids or
+                (marker["operation"] == "dismiss-held" and record == marker["scope"]["dismissal"])):
+            allowed.add(relative)
     if marker["operation"] == "recover-manual-hot-edit":
         hot_hash = marker.get("scope", {}).get("hot_hash")
         if isinstance(hot_hash, str) and HASH_RE.fullmatch(hot_hash):
@@ -5611,8 +7387,11 @@ def authority_transition_allowed_manifest_paths(paths, state, marker):
     return allowed
 
 
-def archive_paths_explained_by_transition(paths, marker):
+def archive_paths_explained_by_transition(paths, marker, months=None):
     """Archive months whose only change is appends stamped by the scoped op.
+
+    months= bounds the proof to the named YYYY-MM months (a scoped
+    transition's declared archive months); None examines every month.
 
     Proof, not exemption: the current bytes must reduce to the prior
     witnessed hash by stripping whole trailing rows, and every stripped row
@@ -5640,7 +7419,13 @@ def archive_paths_explained_by_transition(paths, marker):
         f"[BY:{scoped}]".encode("utf-8") for scoped in sorted(scoped_ids)
     )
     try:
-        children = sorted(paths.archive.glob("*.md"))
+        if months is None:
+            children = sorted(paths.archive.glob("*.md"))
+        else:
+            children = [
+                paths.archive / f"{month}.md" for month in sorted(set(months))
+                if re.fullmatch(r"\d{4}-\d{2}", month)
+            ]
     except OSError:
         return explained
     for path in children:
@@ -5677,8 +7462,15 @@ def archive_paths_explained_by_transition(paths, marker):
 
 
 def authority_transition_completion_issues(
-    paths, state, marker, manifest, run_facts
+    paths, state, marker, manifest, run_facts, scoped=None
 ):
+    """Completion proof of an interrupted authority transition.
+
+    scoped (a declared v5.2 transition with its prior evidence) bounds the
+    semantic replay, the open-conflict validation and the unsettled check to
+    the transition's own records; None replays the whole graph.
+    """
+    only = scoped["ids"] if scoped is not None else None
     completion = marker.get("scope", {}).get("completion")
     if completion is not None:
         try:
@@ -5723,12 +7515,16 @@ def authority_transition_completion_issues(
                         "completed authority proposal differs from frozen intent: "
                         + proposal_id
                     )
-            conflicts, conflict_issues = scan_open_conflicts(paths, state)
+            conflicts, conflict_issues = scan_open_conflicts(
+                paths,
+                state,
+                only=None if only is None else only["conflict"],
+            )
             del conflicts
             semantic_issues = authority_storage_issues(
-                paths, state, allow_recoverable_applying=True
+                paths, state, allow_recoverable_applying=True, only=only
             )
-            if authority_has_unsettled_records(paths):
+            if transition_records_unsettled(paths, scoped):
                 semantic_issues.append(
                     "interrupted authority transition still has applying or failed records"
                 )
@@ -5743,7 +7539,11 @@ def authority_transition_completion_issues(
     # as a routine engine effect. A month is transition-explained only when
     # its change is byte-provably the prior content plus appended rows
     # stamped by this operation's own scope; anything else stays drift.
-    allowed |= archive_paths_explained_by_transition(paths, marker)
+    allowed |= archive_paths_explained_by_transition(
+        paths,
+        marker,
+        months=None if only is None else only["archive_months"],
+    )
     mismatch = audit_checkpoint_mismatch_issues(
         paths,
         state,
@@ -5767,12 +7567,14 @@ def authority_transition_completion_issues(
         ))
     ]
     state_issues = authority_transition_state_issues(marker, state)
-    conflicts, conflict_issues = scan_open_conflicts(paths, state)
+    conflicts, conflict_issues = scan_open_conflicts(
+        paths, state, only=None if only is None else only["conflict"]
+    )
     del conflicts
     semantic_issues = authority_storage_issues(
-        paths, state, allow_recoverable_applying=True
+        paths, state, allow_recoverable_applying=True, only=only
     )
-    unsettled = authority_has_unsettled_records(paths)
+    unsettled = transition_records_unsettled(paths, scoped)
     if unsettled:
         semantic_issues.append(
             "interrupted authority transition still has applying or failed records"
@@ -5815,6 +7617,538 @@ def preserve_corrupt_audit_transition(paths):
         }
     except (OSError, UnicodeError):
         return None
+
+
+def scoped_transition_record_ids(paths, state, marker, f0=None):
+    """Record ids a declared (v5.2) authority transition can have touched."""
+    scope = marker.get("scope", {})
+    proposals = set(scope.get("proposal_ids", []))
+    decisions = set(proposals)
+    conflicts = set()
+    archive_months = set()
+    for relative in scope.get("declared_paths", []):
+        parts = PurePosixPath(relative).parts
+        if len(parts) != 3:
+            continue
+        root, name = parts[1], parts[2]
+        stem = name[:-5] if name.endswith(".json") else None
+        if root in {"proposals", "decisions"} and stem and PROPOSAL_RE.fullmatch(
+            stem
+        ):
+            proposals.add(stem)
+            decisions.add(stem)
+        elif root in {"conflicts", "resolutions"} and stem and CONFLICT_RE.fullmatch(
+            stem
+        ):
+            conflicts.add(stem)
+        elif root == "archive" and name.endswith(".md") and re.fullmatch(
+            r"\d{4}-\d{2}", name[:-3]
+        ):
+            archive_months.add(name[:-3])
+    conflict_id = scope.get("conflict_id")
+    if isinstance(conflict_id, str) and CONFLICT_RE.fullmatch(conflict_id):
+        conflicts.add(conflict_id)
+    for proposal_id in sorted(decisions):
+        data, _raw = _audit_facts_json(decision_path(paths, proposal_id))
+        if data is None:
+            continue
+        for field in ("conflict_id", "resolution_id"):
+            value = data.get(field)
+            if isinstance(value, str) and CONFLICT_RE.fullmatch(value):
+                conflicts.add(value)
+    keys = set()
+    for proposal_id in sorted(proposals):
+        data, _raw = _audit_facts_json(proposal_path(paths, proposal_id))
+        if data is not None and isinstance(data.get("key"), str):
+            keys.add(data["key"])
+    for row in (f0 or {}).get("open_conflicts", []):
+        if row.get("key") in keys:
+            conflicts.add(row["conflict_id"])
+    runs = {proposal_id.split("-Q", 1)[0] for proposal_id in proposals}
+    if marker.get("run_id"):
+        runs.add(marker["run_id"])
+    before = marker.get("pre_write_state", {}).get("conflict_count", 0)
+    if isinstance(before, bool) or not isinstance(before, int) or before < 0:
+        before = 0
+    return {
+        "proposal": proposals,
+        "decision": decisions,
+        "conflict": conflicts,
+        "resolution": set(conflicts),
+        "run": runs,
+        "conflict_numbers": (before, max(before, state["conflict_count"])),
+        "archive_months": archive_months,
+        "settlement": {PurePosixPath(p).stem for p in scope.get("declared_paths", ())
+                       if p.startswith(".bimri/settlements/")},
+    }
+
+
+def transition_records_unsettled(paths, scoped=None):
+    """Full unsettled scan, or the scoped records' live outcomes plus F0's."""
+    if scoped is None:
+        return authority_has_unsettled_records(paths)
+    if audit_facts_unsettled(scoped["f0"]):
+        return True
+    ids = scoped["ids"]
+    for directory, field, values, record_ids in (
+        (paths.decisions, "outcome", {"applying"}, ids["decision"]),
+        (paths.resolutions, "status", {"applying", "failed"}, ids["resolution"]),
+    ):
+        for record_id in sorted(record_ids):
+            path = directory / f"{record_id}.json"
+            if not (path.exists() or path.is_symlink()):
+                continue
+            if path_is_redirected(path) or not path.is_file():
+                return True
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                return True
+            if isinstance(data, dict) and data.get(field) in values:
+                return True
+    return False
+
+
+def scoped_rehash_candidates(state, marker, observed=(), dependencies=True):
+    """Protected paths a declared transition may have changed or relied on."""
+    scope = marker["scope"]
+    candidates = set(scope.get("declared_paths", []))
+    if dependencies:
+        candidates |= set(scope.get("dependency_hashes", {}))
+    candidates |= {
+        relative for relative in observed
+        if scoped_protected_path_is_valid(relative)
+    }
+    prior_head = marker["prior_witness"]["head_revision"]
+    for number in range(prior_head + 1, state["head_revision"] + 1):
+        candidates.add(_scoped_revision_path(number))
+    return candidates
+
+
+def rehash_scoped_manifest(paths, m0, candidates):
+    """M0 with exactly the candidate paths rehashed from live bytes."""
+    rows = {row["path"]: row["sha256"] for row in m0}
+    for relative in sorted(candidates):
+        live = scoped_protected_file_hash(paths, relative)
+        if live == "absent":
+            rows.pop(relative, None)
+        else:
+            rows[relative] = live
+    return [{"path": path, "sha256": rows[path]} for path in sorted(rows)]
+
+
+def scoped_recovery_context(paths, state, marker):
+    """Prior M0/F0 and record ids of a declared transition, else None.
+
+    A marker without declared paths (every v5.1.x marker) or whose prior
+    facts evidence is unavailable keeps the full replay.
+    """
+    scope = marker.get("scope", {})
+    if "declared_paths" not in scope or "dependency_hashes" not in scope:
+        return None
+    prior = marker["prior_witness"]
+    if audit_witness_schema(prior) != AUDIT_WITNESS_SCHEMA:
+        return None
+    try:
+        m0 = load_audit_manifest_evidence(paths, prior)
+        f0 = load_audit_facts_evidence(paths, prior)
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        return None
+    return {
+        "m0": m0,
+        "f0": f0,
+        "ids": scoped_transition_record_ids(paths, state, marker, f0),
+    }
+
+
+def load_scoped_checkpoint(paths, marker):
+    """Rebuild a scoped transition's prior evidence from its durable marker."""
+    if marker is None or marker.get("kind") != "authority":
+        raise BimriError("no authority transition is live.")
+    scope = marker["scope"]
+    if "declared_paths" not in scope or "dependency_hashes" not in scope:
+        raise BimriError("the authority transition carries no declared scope.")
+    prior = marker["prior_witness"]
+    if audit_witness_schema(prior) != AUDIT_WITNESS_SCHEMA:
+        raise BimriError(
+            PRIOR_EVIDENCE_INVALID_PREFIX
+            + ": a scoped transition needs a schema-2 prior checkpoint"
+        )
+    try:
+        m0 = load_audit_manifest_evidence(paths, prior)
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError) as exc:
+        raise BimriError(
+            PRIOR_EVIDENCE_INVALID_PREFIX + f": {exc}; the transition marker "
+            "and prior checkpoint remain in place. Restore the "
+            ".bimri/audit-manifests evidence from backup."
+        ) from exc
+    f0 = load_audit_facts_evidence(paths, prior)
+    return {
+        "m0": m0,
+        "m0_by_path": {row["path"]: row["sha256"] for row in m0},
+        "f0": f0,
+        "declared_paths": list(scope["declared_paths"]),
+        "dependency_hashes": dict(scope["dependency_hashes"]),
+    }
+
+
+def scoped_publication_inventory(paths, state, marker, m0, observed=()):
+    """M1 = M0 with each declared or observed path rehashed, adopted only
+    when this transition provably wrote it.
+
+    Every row outside the candidate set is carried forward verbatim, never
+    rehashed or blessed. An unproven change, or a deletion, refuses.
+    """
+    scope = marker["scope"]
+    operation = marker["operation"]
+    observed = {
+        relative for relative in observed
+        if scoped_protected_path_is_valid(relative)
+    }
+    candidates = scoped_rehash_candidates(
+        state, marker, observed=observed, dependencies=False
+    )
+    months = scoped_transition_record_ids(
+        paths, state, marker
+    )["archive_months"]
+    allowed = authority_transition_allowed_manifest_paths(paths, state, marker)
+    allowed |= archive_paths_explained_by_transition(
+        paths, marker, months=months
+    )
+    allowed |= {
+        f".bimri/proposals/{proposal_id}.json"
+        for proposal_id, digest in scope.get("proposal_hashes", {}).items()
+        if scoped_protected_file_hash(
+            paths, f".bimri/proposals/{proposal_id}.json"
+        ) == digest
+    }
+    rows = {row["path"]: row["sha256"] for row in m0}
+    for relative in sorted(candidates):
+        try:
+            live = scoped_protected_file_hash(paths, relative)
+        except BimriError as exc:
+            raise BimriError(
+                f"scoped {operation} found an unproven change to {relative}: "
+                f"{exc}; the transition marker remains; run doctor"
+            ) from exc
+        live_value = None if live == "absent" else live
+        prior_value = rows.get(relative)
+        if live_value == prior_value:
+            continue
+        if (
+            live_value is None
+            or (relative not in observed and relative not in allowed)
+        ):
+            raise BimriError(
+                f"scoped {operation} found an unproven change to {relative}; "
+                "the transition marker remains; run doctor"
+            )
+        rows[relative] = live_value
+    return [{"path": path, "sha256": rows[path]} for path in sorted(rows)]
+
+
+def scoped_facts_delta(paths, state, marker, f0=None):
+    """The facts a declared transition changed, read from durable records.
+
+    Never an in-process accumulator: a publication resumed by another
+    process derives the same delta from the same bytes.
+    """
+    if f0 is None:
+        f0 = load_audit_facts_evidence(paths, marker["prior_witness"])
+    ids = scoped_transition_record_ids(paths, state, marker, f0)
+    run_rows = audit_witness_run_facts_for_runs(paths, state, ids["run"])
+    proposal_marks = {}
+    for row in run_rows:
+        _note_audit_proposal_watermark(proposal_marks, row["proposal_id"])
+    outcomes = {}
+    writers = {}
+    pattern_numbers = [state["pattern_count"]]
+    for proposal_id in sorted(ids["proposal"] | ids["decision"]):
+        proposal, _raw = _audit_facts_json(proposal_path(paths, proposal_id))
+        if proposal is not None:
+            pattern_id = proposal.get("pattern_id")
+            if isinstance(pattern_id, str) and re.fullmatch(r"P\d+", pattern_id):
+                pattern_numbers.append(int(pattern_id[1:]))
+        decision, _raw = _audit_facts_json(decision_path(paths, proposal_id))
+        if any(
+            candidate.exists() or candidate.is_symlink()
+            for candidate in (
+                proposal_path(paths, proposal_id),
+                decision_path(paths, proposal_id),
+            )
+        ):
+            # As the full build: only an existing record raises the
+            # watermark, never a declared id the write did not create.
+            _note_audit_proposal_watermark(proposal_marks, proposal_id)
+        outcome = decision.get("outcome") if decision is not None else None
+        outcomes[proposal_id] = outcome
+        revision = decision.get("revision") if decision is not None else None
+        key = proposal.get("key") if proposal is not None else None
+        if (
+            outcome == "accepted"
+            and isinstance(key, str)
+            and KEY_RE.fullmatch(key)
+            and isinstance(revision, int)
+            and not isinstance(revision, bool)
+            and 0 <= revision <= 999999
+        ):
+            current = writers.get(key)
+            if current is None or (revision, proposal_id) > (
+                current["revision"], current["proposal_id"]
+            ):
+                writers[key] = {
+                    "proposal_id": proposal_id,
+                    "revision": revision,
+                    "run_id": proposal_id.split("-Q", 1)[0],
+                }
+    statuses = {}
+    applying_rows = []
+    conflict_numbers = [state["conflict_count"]]
+    for conflict_id in sorted(ids["conflict"]):
+        conflict_file = paths.conflicts / f"{conflict_id}.json"
+        conflict, raw = _audit_facts_json(conflict_file)
+        if conflict_file.exists() or conflict_file.is_symlink():
+            # Only a conflict that exists raises the watermark (as the full
+            # build counts files): a declared id the write never allocated
+            # must not skip a number.
+            conflict_numbers.append(int(conflict_id[1:]))
+        resolution, resolution_raw = _audit_facts_json(
+            paths.resolutions / f"{conflict_id}.json"
+        )
+        for blob in (raw, resolution_raw):
+            if blob is not None:
+                for match in AUDIT_FACTS_PROPOSAL_REFERENCE_RE.finditer(blob):
+                    _note_audit_proposal_watermark(
+                        proposal_marks, match.group(0).decode("ascii")
+                    )
+        status = resolution.get("status") if resolution is not None else None
+        statuses[conflict_id] = status
+        if status == "applying" and conflict is not None:
+            choice = resolution.get("choice")
+            candidates = resolution.get("proposal_ids")
+            intended = resolution.get("intended_revision_after")
+            key = conflict.get("key")
+            if (
+                isinstance(choice, str)
+                and PROPOSAL_RE.fullmatch(choice)
+                and isinstance(candidates, list)
+                and choice in candidates
+                and isinstance(intended, int)
+                and not isinstance(intended, bool)
+                and 0 <= intended <= 999999
+                and isinstance(key, str)
+                and KEY_RE.fullmatch(key)
+            ):
+                applying_rows.append({
+                    "conflict_id": conflict_id,
+                    "key": key,
+                    "choice": choice,
+                    "intended_revision_after": intended,
+                })
+    open_items, _conflict_issues = scan_open_conflicts(
+        paths, state, only=ids["conflict"]
+    )
+    open_rows = [
+        {
+            "conflict_id": item["conflict_id"],
+            "key": item["key"],
+            "type": item["type"],
+        }
+        for item in open_items
+    ]
+    return {
+        "runs": sorted(ids["run"]),
+        "run_facts": run_rows,
+        "proposals": sorted(ids["proposal"] | ids["decision"]),
+        "outcomes": outcomes,
+        "conflicts": sorted(ids["conflict"]),
+        "statuses": statuses,
+        "open_conflicts": open_rows,
+        "applying_resolutions": applying_rows,
+        "writers": writers,
+        "settled": {
+            pid: read_settlement(paths, state, pid)["settled_by"]
+            for pid in ids.get("settlement", ()) if settlement_path(paths, pid).exists()
+        },
+        "watermarks": {
+            "proposal": proposal_marks,
+            "pattern": max(pattern_numbers + [0]),
+            "conflict": max(conflict_numbers + [0]),
+            "run": max(
+                [state["run_count"]]
+                + [int(run_id[1:]) for run_id in ids["run"]]
+                + [int(run_id[1:]) for run_id in proposal_marks]
+            ),
+        },
+    }
+
+
+def apply_audit_facts_delta(f0, delta):
+    """F1 = F0 with the scoped records' facts replaced by their live facts."""
+    delta = dict(delta or {})
+    for field, default in (
+        ("runs", []), ("run_facts", []), ("proposals", []), ("outcomes", {}),
+        ("conflicts", []), ("statuses", {}), ("open_conflicts", []),
+        ("applying_resolutions", []), ("writers", {}), ("settled", {}),
+    ):
+        delta.setdefault(field, default)
+    marks = dict(delta.get("watermarks") or {})
+    marks.setdefault("proposal", {})
+    for field in ("pattern", "conflict", "run"):
+        marks.setdefault(field, 0)
+    delta["watermarks"] = marks
+    scoped_proposals = set(delta["proposals"])
+    scoped_conflicts = set(delta["conflicts"])
+    outcomes = delta["outcomes"]
+    statuses = delta["statuses"]
+    unsettled = f0["unsettled"]
+    settled = dict(f0["settled"])
+    settled.update(delta.get("settled", {}))
+    held = (set(f0["held"]) - scoped_proposals) | {
+        proposal_id for proposal_id, outcome in outcomes.items()
+        if outcome == "held"
+    }
+    writers = copy.deepcopy(f0["writers_by_key"])
+    for key, writer in delta["writers"].items():
+        current = writers.get(key)
+        if current is None or (writer["revision"], writer["proposal_id"]) > (
+            current["revision"], current["proposal_id"]
+        ):
+            writers[key] = dict(writer)
+    proposal_marks = dict(f0["watermarks"]["proposal"])
+    for run_id, number in delta["watermarks"]["proposal"].items():
+        proposal_marks[run_id] = max(proposal_marks.get(run_id, 0), number)
+    return {
+        "run_facts": merge_scoped_run_facts(
+            f0["run_facts"], delta["runs"], delta["run_facts"]
+        ),
+        "unsettled": {
+            "applying_decisions": sorted(
+                (set(unsettled["applying_decisions"]) - scoped_proposals)
+                | {
+                    proposal_id for proposal_id, outcome in outcomes.items()
+                    if outcome == "applying"
+                }
+            ),
+            "applying_resolutions": sorted(
+                (set(unsettled["applying_resolutions"]) - scoped_conflicts)
+                | {
+                    conflict_id for conflict_id, status in statuses.items()
+                    if status == "applying"
+                }
+            ),
+            "failed_resolutions": sorted(
+                (set(unsettled["failed_resolutions"]) - scoped_conflicts)
+                | {
+                    conflict_id for conflict_id, status in statuses.items()
+                    if status == "failed"
+                }
+            ),
+        },
+        "applying_resolutions": sorted(
+            [
+                dict(row) for row in f0["applying_resolutions"]
+                if row["conflict_id"] not in scoped_conflicts
+            ] + [dict(row) for row in delta["applying_resolutions"]],
+            key=lambda row: row["conflict_id"],
+        ),
+        "open_conflicts": sorted(
+            [
+                dict(row) for row in f0["open_conflicts"]
+                if row["conflict_id"] not in scoped_conflicts
+            ] + [dict(row) for row in delta["open_conflicts"]],
+            key=lambda row: row["conflict_id"],
+        ),
+        "held": sorted(held - set(settled)),
+        "settled": settled,
+        "writers_by_key": writers,
+        "watermarks": {
+            "proposal": dict(sorted(proposal_marks.items())),
+            "pattern": max(
+                f0["watermarks"]["pattern"], delta["watermarks"]["pattern"]
+            ),
+            "conflict": max(
+                f0["watermarks"]["conflict"], delta["watermarks"]["conflict"]
+            ),
+            "run": max(f0["watermarks"]["run"], delta["watermarks"]["run"]),
+        },
+    }
+
+
+def publish_scoped_checkpoint(paths, state, m0, f0, facts_delta=None):
+    """Publish the successor checkpoint of a declared authority transition.
+
+    P1 refuses any observed protected write outside the declared paths (and
+    any run-log write but the transition's own); P2 derives M1 from M0 plus
+    the declared/observed paths this transition provably wrote; P3 derives
+    F1 from F0 plus the scoped facts read from durable records. Then the
+    completion is sealed into the marker and F1, M1, the alias and W1 are
+    published before the marker clears (B13-B15). Any refusal leaves the
+    marker and W0 in place for recovery.
+    """
+    marker = load_audit_transition(paths)
+    if (
+        marker is None
+        or marker["kind"] != "authority"
+        or "declared_paths" not in marker["scope"]
+    ):
+        raise BimriError(
+            "scoped publication requires a live authority transition with a "
+            "declared scope."
+        )
+    scope = marker["scope"]
+    operation = marker["operation"]
+    declared = set(scope["declared_paths"])
+    observed = set(paths.scoped_write_set or ())
+    own_log = scope.get("run_log") or (
+        f".bimri/log/{marker['run_id']}.md" if marker.get("run_id") else None
+    )
+    undeclared = set()
+    for relative in observed:
+        parts = PurePosixPath(relative).parts
+        if len(parts) >= 2 and parts[0] == ".bimri":
+            if parts[1] in AUDIT_WITNESS_ROOT_NAMES and relative not in declared:
+                undeclared.add(relative)
+            elif parts[1] == "log" and relative != own_log:
+                undeclared.add(relative)
+    if undeclared:
+        raise BimriError(
+            f"scoped {operation} wrote an undeclared protected path: "
+            f"{sorted(undeclared)[0]}; the transition marker remains; run doctor"
+        )
+    rows = scoped_publication_inventory(
+        paths, state, marker, m0, observed=observed
+    )
+    # An absent or empty delta means "derive it here": the delta is always a
+    # function of the durable scoped records, never of in-process events.
+    delta = (
+        facts_delta
+        if facts_delta
+        else scoped_facts_delta(paths, state, marker, f0=f0)
+    )
+    f1 = apply_audit_facts_delta(f0, delta)
+    if audit_facts_unsettled(f1):
+        # W0 stays retained, unreadable through the epoch, as the recovery
+        # baseline; the next reconcile finishes the operation.
+        paths.validated_audit_witness = None
+        return False
+    prior = marker["prior_witness"]
+    published = write_audit_witness(
+        paths,
+        state,
+        manifest=rows,
+        run_facts=f1["run_facts"],
+        facts=f1,
+        witness_fields={
+            "audited_at": prior["audited_at"],
+            "audit_origin": "scoped",
+            "scoped_publications": prior["scoped_publications"] + 1,
+        },
+    )
+    if not published:
+        return False
+    complete_authority_checkpoint_transition(paths)
+    return True
 
 
 def reconcile_audit_transition(paths, state):
@@ -5862,7 +8196,7 @@ def reconcile_audit_transition(paths, state):
         # is the original marker retired. A failure here just repeats the
         # (deduplicated) preservation on the next load.
         with contextlib.suppress(OSError):
-            paths.audit_transition.unlink()
+            remove_protected_file(paths.audit_transition)
             fsync_directory(paths.audit_transition.parent)
         discard_audit_witness(paths)
         return state
@@ -5920,12 +8254,20 @@ def reconcile_audit_transition(paths, state):
         prune_audit_manifest_generations(paths)
         return state
 
+    if marker["operation"] == "dismiss-held" and marker["scope"].get("completion") is None:
+        return finish_dismiss_held(paths, state, marker)
+    if marker["operation"] == "abandon-run" and marker["scope"].get("completion") is None:
+        return finish_abandon_run(paths, state, marker)
+
     # If W1 reached disk and only marker cleanup was interrupted, its complete
     # state binding is enough to finish the transaction without graph replay.
     live = load_sealed_audit_witness(paths)
     if live is not None and sealed_witness_matches_state(live, state):
         try:
             load_audit_manifest_evidence(paths, live)
+            # A W1 whose facts generation never landed is an unfinished
+            # publication, not a completed one.
+            load_audit_facts_evidence(paths, live)
         except (BimriError, OSError, UnicodeError, ValueError, TypeError):
             pass
         else:
@@ -5934,23 +8276,85 @@ def reconcile_audit_transition(paths, state):
             prune_audit_manifest_generations(paths)
             return state
 
+    if (
+        marker["operation"] == "save"
+        and marker.get("scope", {}).get("completion") is None
+    ):
+        # An unsealed save marker belongs to its own resume ladder
+        # (finish_pending_save, D3.4.4); a graph replay here would read its
+        # half-written run as drift and retire the marker under it.
+        return state
+
     manifest = None
     run_facts = None
     reasons = []
+    scoped = None
     try:
-        manifest = audit_witness_manifest(paths)
-        run_facts = audit_witness_run_facts(paths, state)
+        # A declared (v5.2) transition rehashes only its declared and
+        # dependency paths plus the revisions its head moved through, over
+        # the prior manifest; its run facts re-read only its own runs. A
+        # v5.1.x marker, or one whose prior facts are unavailable, replays
+        # the whole inventory.
+        scoped = scoped_recovery_context(paths, state, marker)
+        if scoped is not None:
+            manifest = rehash_scoped_manifest(
+                paths, scoped["m0"], scoped_rehash_candidates(state, marker)
+            )
+            run_facts = merge_scoped_run_facts(
+                scoped["f0"]["run_facts"],
+                scoped["ids"]["run"],
+                audit_witness_run_facts_for_runs(
+                    paths, state, scoped["ids"]["run"]
+                ),
+            )
+        else:
+            manifest = audit_witness_manifest(paths)
+            run_facts = audit_witness_run_facts(paths, state)
     except (BimriError, OSError, UnicodeError, ValueError, TypeError) as exc:
         reasons.append(f"interrupted authority transition audit failed: {exc}")
     if manifest is not None and run_facts is not None:
         reasons.extend(authority_transition_completion_issues(
-            paths, state, marker, manifest, run_facts
+            paths, state, marker, manifest, run_facts, scoped=scoped
         ))
     if not reasons:
         # The full graph and exact scoped state/inventory delta prove either
         # the pre-mutation cutpoint or a completely accepted engine effect.
+        republish_facts = None
+        completion = marker.get("scope", {}).get("completion")
+        if (
+            scoped is not None
+            and completion is not None
+            and audit_witness_schema(completion["witness"])
+            == AUDIT_WITNESS_SCHEMA
+        ):
+            with contextlib.suppress(
+                BimriError, OSError, UnicodeError, ValueError, TypeError
+            ):
+                republish_facts = load_audit_facts_evidence(
+                    paths, completion["witness"]
+                )
+            if (
+                republish_facts is None
+                and completion["witness"].get("audit_origin") == "scoped"
+            ):
+                # Crash between the completion seal (B13) and the facts
+                # generation (B14a): F1 is a function of F0 and the durable
+                # scoped records, so it is rebuilt byte for byte.
+                with contextlib.suppress(
+                    BimriError, OSError, UnicodeError, ValueError, TypeError
+                ):
+                    republish_facts = apply_audit_facts_delta(
+                        scoped["f0"],
+                        scoped_facts_delta(
+                            paths, state, marker, f0=scoped["f0"]
+                        ),
+                    )
         if write_audit_witness(
-            paths, state, manifest=manifest, run_facts=run_facts
+            paths,
+            state,
+            manifest=manifest,
+            run_facts=run_facts,
+            facts=republish_facts,
         ):
             clear_audit_transition(paths)
             prune_audit_manifest_generations(paths)
@@ -5992,7 +8396,14 @@ def reconcile_audit_transition(paths, state):
             prior_m = load_audit_manifest_evidence(paths, prior)
             allowed_recovery = authority_transition_allowed_manifest_paths(
                 paths, state, marker
-            ) | archive_paths_explained_by_transition(paths, marker)
+            ) | archive_paths_explained_by_transition(
+                paths,
+                marker,
+                months=(
+                    None if scoped is None
+                    else scoped["ids"]["archive_months"]
+                ),
+            )
             drift_delta = audit_checkpoint_drift_delta(
                 prior_m, manifest, allowed_recovery
             )
@@ -6081,10 +8492,35 @@ def invalidate_audit_witness_before_authority_write(paths):
     if path.exists():
         if not path.is_file():
             raise BimriError("audit witness is not a regular file.")
-        path.unlink()
+        remove_protected_file(path)
         fsync_directory(path.parent)
     if path.exists() or path.is_symlink():
         raise BimriError("audit witness invalidation did not complete.")
+
+
+def advance_writer_gate_before_authority_effect(paths, state):
+    """Move a v5.1.0 state to v5.2.0 before an authority write's first effect.
+
+    The one-way writer gate (D0.2) normally rides the epoch write inside
+    begin_authority_checkpoint_transition. Some authority writes take no
+    new checkpoint transition: degraded proposal staging, a write while
+    unsettled records withhold the checkpoint, a write after an invalidated
+    checkpoint, and a retry under a retained transition marker (for example
+    one a v5.1.2 failed resolution left). They flip in their own durable
+    state write here, after the witness is invalidated and before any
+    authority byte changes, so a v5.1.2 engine never opens a store that a
+    v5.2.0 authority write has touched.
+    """
+    if state is None:
+        raise BimriError(
+            "an authority write requires the loaded state before its first "
+            "effect."
+        )
+    if state.get("bimri_version") != PRIOR_STATE_FORMAT_VERSION:
+        return False
+    state["bimri_version"] = STATE_FORMAT_VERSION
+    save_state(paths, state)
+    return True
 
 
 def authority_has_recoverable_applying(paths):
@@ -6105,22 +8541,36 @@ def authority_has_recoverable_applying(paths):
     return False
 
 
-def authority_has_unsettled_records(paths):
-    """Return true while authority needs recovery or completion, not caching."""
+def unfinished_authority_reason(paths):
+    """Name the recorded operation that prevents publishing a checkpoint."""
     for directory, field, values in (
         (paths.decisions, "outcome", {"applying"}),
         (paths.resolutions, "status", {"applying", "failed"}),
     ):
         for path in sorted(directory.glob("*.json")):
             if path_is_redirected(path) or not path.is_file():
-                return True
+                return f"{path.name} is not a regular authority record; run doctor"
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, UnicodeError, json.JSONDecodeError):
-                return True
+                return f"{path.name} cannot be read; run doctor"
             if isinstance(data, dict) and data.get(field) in values:
-                return True
-    return False
+                if directory == paths.decisions and PROPOSAL_RE.fullmatch(path.stem):
+                    return legacy_applying_advice(path.stem)
+                return f"unfinished resolution {path.stem}; inspect review before retrying its recorded choice"
+    return None
+
+
+def legacy_applying_advice(proposal_id):
+    run_id = proposal_id.split("-", 1)[0]
+    return (
+        f"unfinished applying decision {proposal_id}; the owner of {run_id} "
+        f"can finish its staged proposals with sync --run {run_id}"
+    )
+
+
+def authority_has_unsettled_records(paths):
+    return unfinished_authority_reason(paths) is not None
 
 
 def load_audit_blocked_record(paths):
@@ -6134,7 +8584,9 @@ def load_audit_blocked_record(paths):
         "blocked_schema", "created_at", "reasons", "prior_witness",
         "prior_witness_hash", "prior_manifest", "marker_hash",
     }
-    if set(record) != expected:
+    # From v5.2.0 a schema-2 prior checkpoint also carries its facts
+    # generation inline; the v5.1.x field set stays readable.
+    if set(record) not in (expected, expected | {"prior_facts"}):
         raise BimriError("audit blocked marker fields are invalid.")
     if record.get("blocked_schema") != AUDIT_BLOCKED_SCHEMA:
         raise BimriError("audit blocked marker schema is invalid.")
@@ -6149,7 +8601,11 @@ def load_audit_blocked_record(paths):
     prior_hash = record.get("prior_witness_hash")
     prior_witness = record.get("prior_witness")
     if prior_witness is None:
-        if prior_hash is not None or record.get("prior_manifest") is not None:
+        if (
+            prior_hash is not None
+            or record.get("prior_manifest") is not None
+            or record.get("prior_facts") is not None
+        ):
             raise BimriError("audit blocked prior witness hash is orphaned.")
     else:
         validated = validate_sealed_audit_witness_record(
@@ -6165,6 +8621,20 @@ def load_audit_blocked_record(paths):
             load_audit_manifest_evidence(
                 paths, validated, manifest_override=prior_manifest
             )
+        prior_facts = record.get("prior_facts")
+        if prior_facts is not None:
+            if audit_witness_schema(validated) != AUDIT_WITNESS_SCHEMA:
+                raise BimriError(
+                    "audit blocked prior facts belong to no schema-2 checkpoint."
+                )
+            try:
+                validate_audit_facts_record(
+                    copy.deepcopy(prior_facts), validated
+                )
+            except BimriError as exc:
+                raise BimriError(
+                    f"audit blocked prior facts are invalid: {exc}"
+                ) from exc
     if record.get("marker_hash") != audit_record_seal(
         record, "marker_hash"
     ):
@@ -6201,23 +8671,49 @@ def load_audit_blocked_prior_manifest(paths):
     return record.get("prior_manifest") if record is not None else None
 
 
-def record_audit_blocked(paths, witness, reasons, prior_manifest=None):
+def load_audit_blocked_prior_facts(paths):
+    try:
+        record = load_audit_blocked_record(paths)
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        return None
+    return record.get("prior_facts") if record is not None else None
+
+
+def record_audit_blocked(
+    paths, witness, reasons, prior_manifest=None, prior_facts=None
+):
     reasons = list(dict.fromkeys(str(reason) for reason in reasons if reason))
-    if witness is not None and prior_manifest is None:
+    existing = None
+    if witness is not None and (prior_manifest is None or prior_facts is None):
         try:
             existing = load_audit_blocked_record(paths)
         except (BimriError, OSError, UnicodeError, ValueError, TypeError):
             existing = None
         if (
             existing is not None
-            and existing.get("prior_witness_hash") == witness.get("witness_hash")
+            and existing.get("prior_witness_hash") != witness.get("witness_hash")
         ):
+            existing = None
+    if witness is not None and prior_manifest is None:
+        if existing is not None:
             prior_manifest = existing.get("prior_manifest")
         if prior_manifest is None:
             try:
                 prior_manifest = load_audit_manifest_evidence(paths, witness)
             except (BimriError, OSError, UnicodeError, ValueError, TypeError):
                 prior_manifest = None
+    if (
+        witness is not None
+        and prior_facts is None
+        and audit_witness_schema(witness) == AUDIT_WITNESS_SCHEMA
+    ):
+        if existing is not None:
+            prior_facts = existing.get("prior_facts")
+        if prior_facts is None:
+            try:
+                prior_facts = load_audit_facts_evidence(paths, witness)
+            except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+                prior_facts = None
     record = {
         "blocked_schema": AUDIT_BLOCKED_SCHEMA,
         "created_at": now_iso(),
@@ -6228,6 +8724,10 @@ def record_audit_blocked(paths, witness, reasons, prior_manifest=None):
         ),
         "prior_manifest": prior_manifest,
     }
+    if prior_facts is not None:
+        # Carried inline so a restore can compare facts even after several
+        # publications pruned the generation (a v5.1.x prior has none).
+        record["prior_facts"] = prior_facts
     record["marker_hash"] = audit_record_seal(record, "marker_hash")
     if path_is_redirected(paths.audit_blocked):
         raise BimriError("audit blocked marker destination is redirected.")
@@ -6241,7 +8741,7 @@ def clear_audit_blocked(paths):
     if path.exists():
         if not path.is_file():
             raise BimriError("audit blocked marker is not a regular file.")
-        path.unlink()
+        remove_protected_file(path)
         fsync_directory(path.parent)
 
 
@@ -6254,6 +8754,7 @@ def audit_checkpoint_mismatch_issues(
     allowed_manifest_paths=None,
     prior_manifest_override=None,
     allow_audit_epoch_advance=False,
+    prior_facts_override=None,
 ):
     if witness is None:
         return []
@@ -6268,6 +8769,20 @@ def audit_checkpoint_mismatch_issues(
             ".bimri/audit-manifests evidence from backup, or remove "
             ".bimri/audit-witness.json to rebuild trust from the full audit"
         ]
+    if audit_witness_schema(witness) == AUDIT_WITNESS_SCHEMA:
+        # A schema-2 checkpoint's facts generation is as load-bearing as its
+        # manifest: missing or invalid facts are damaged evidence, never a
+        # reason to rebaseline blind.
+        try:
+            load_audit_facts_evidence(
+                paths, witness, facts_override=prior_facts_override
+            )
+        except (BimriError, OSError, UnicodeError) as exc:
+            return [
+                f"{exc}; restore the .bimri/audit-manifests evidence from "
+                "backup, or remove .bimri/audit-witness.json to rebuild "
+                "trust from the full audit"
+            ]
     if prior_manifest != manifest:
         allowed_manifest_paths = set(allowed_manifest_paths or ())
         prior_by_path = {
@@ -6347,12 +8862,29 @@ def audit_checkpoint_mismatch_issues(
 
 
 def refresh_audit_witness_after_trusted_write(paths, state):
-    """Publish a new verdict only after a pre-audited authority mutation."""
+    """Publish a new verdict only after a pre-audited authority mutation.
+
+    A declared v5.2 transition publishes its successor checkpoint scoped
+    (D4.4): from the prior inventory plus the paths it provably wrote, with
+    facts derived from the durable scoped records. Anything else rebuilds
+    the full inventory as before.
+    """
     if not paths.authority_write_mode:
         return False
     try:
         if not paths.authority_write_audit_healthy:
             return False
+        try:
+            marker = load_audit_transition(paths)
+        except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+            marker = None
+        if scoped_publication_applies(marker):
+            checkpoint = paths.scoped_checkpoint
+            if not isinstance(checkpoint, dict):
+                checkpoint = load_scoped_checkpoint(paths, marker)
+            return publish_scoped_checkpoint(
+                paths, state, checkpoint["m0"], checkpoint["f0"]
+            )
         if authority_has_unsettled_records(paths):
             # W0 is retained as crash/recovery evidence. The advanced state
             # epoch plus live transition makes it unreadable; deleting it
@@ -6368,6 +8900,7 @@ def refresh_audit_witness_after_trusted_write(paths, state):
         paths.authority_write_audit_healthy = False
         paths.full_audit_manifest = None
         paths.full_audit_run_facts = None
+        end_scoped_write_recording(paths)
 
 
 def condemn_audit_checkpoint(paths, state):
@@ -6399,7 +8932,130 @@ def condemn_audit_checkpoint(paths, state):
     return True
 
 
-def governance_snapshot(
+def audit_verdict_issue_text(issue):
+    """One sealed, single-line issue string of at most 500 characters."""
+    text = " ".join(str(issue).split())
+    text = "".join(ch for ch in text if ord(ch) >= 32)
+    return (text or "unspecified audit issue")[:500]
+
+
+def validate_audit_verdict(record):
+    """Validate the derived audit verdict exactly; raise on any defect."""
+    if not isinstance(record, dict) or set(record) != AUDIT_VERDICT_FIELDS:
+        raise BimriError("audit verdict fields are invalid.")
+    if record.get("verdict_schema") != AUDIT_VERDICT_SCHEMA:
+        raise BimriError("audit verdict schema is invalid.")
+    parse_timestamp(record.get("created_at"), "audit verdict timestamp")
+    source = record.get("source")
+    status = record.get("status")
+    if source not in {"live", "copy"} or status not in {"passed", "failed"}:
+        raise BimriError("audit verdict source or status is invalid.")
+    validate_revision_number(
+        record.get("head_revision"), "audit verdict head revision"
+    )
+    for field in ("head_hash", "manifest_hash"):
+        value = record.get(field)
+        if value is not None and (
+            not isinstance(value, str) or not HASH_RE.fullmatch(value)
+        ):
+            raise BimriError(f"audit verdict {field} is invalid.")
+    epoch = record.get("audit_epoch")
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+        raise BimriError("audit verdict epoch is invalid.")
+    issues = record.get("issues")
+    count = record.get("issue_count")
+    if (
+        not isinstance(issues, list)
+        or len(issues) > 20
+        or isinstance(count, bool)
+        or not isinstance(count, int)
+        or count < len(issues)
+        or (status == "passed") != (count == 0)
+    ):
+        raise BimriError("audit verdict issues are invalid.")
+    for issue in issues:
+        clean_scalar(issue, "audit verdict issue", 500)
+    capture = record.get("copy_capture_ms")
+    if source == "live":
+        if capture is not None:
+            raise BimriError("a live audit verdict has no copy capture time.")
+    elif isinstance(capture, bool) or not isinstance(capture, int) or capture < 0:
+        raise BimriError("a copy audit verdict needs its capture time.")
+    if record.get("verdict_hash") != audit_record_seal(record, "verdict_hash"):
+        raise BimriError("audit verdict seal is invalid.")
+    return record
+
+
+def write_audit_verdict(
+    paths,
+    source,
+    status,
+    issues,
+    copy_capture_ms=None,
+    state=None,
+    head_revision=None,
+    head_hash=None,
+    audit_epoch=None,
+    manifest_hash=None,
+):
+    """Seal and publish the result of one full audit (derived, never gating).
+
+    The verdict is outside the witnessed inventory and never authority; a
+    failure to write it never changes the audit's outcome.
+    """
+    try:
+        if state is not None:
+            head_revision = state.get("head_revision")
+            head_hash = state.get("head_hash")
+            audit_epoch = state_audit_epoch(state)
+        issues = [audit_verdict_issue_text(issue) for issue in (issues or [])]
+        record = {
+            "verdict_schema": AUDIT_VERDICT_SCHEMA,
+            "created_at": now_iso(),
+            "source": source,
+            "status": status,
+            "head_revision": head_revision,
+            "head_hash": head_hash,
+            "audit_epoch": audit_epoch,
+            "manifest_hash": manifest_hash,
+            "issue_count": len(issues),
+            "issues": issues[:20],
+            "copy_capture_ms": copy_capture_ms,
+        }
+        record["verdict_hash"] = audit_record_seal(record, "verdict_hash")
+        validate_audit_verdict(record)
+        if path_is_redirected(paths.audit_verdict) or (
+            paths.audit_verdict.exists() and not paths.audit_verdict.is_file()
+        ):
+            return None
+        atomic_write_json(paths.audit_verdict, record)
+        return record
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        return None
+
+
+def load_audit_verdict(paths):
+    """Return the sealed audit verdict, or None when missing or unsafe."""
+    path = paths.audit_verdict
+    if path_is_redirected(path) or not path.is_file():
+        return None
+    try:
+        return validate_audit_verdict(read_json_strict(path, "audit verdict"))
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        return None
+
+
+def governance_snapshot(paths, state, *args, **kwargs):
+    """The authority audit (see _governance_snapshot). A full audit never
+    consults the checkpoint it re-proves: checkpoint facts are off inside."""
+    paths.full_audit_depth += 1
+    try:
+        return _governance_snapshot(paths, state, *args, **kwargs)
+    finally:
+        paths.full_audit_depth -= 1
+
+
+def _governance_snapshot(
     paths,
     state,
     allow_recoverable_applying=False,
@@ -6425,7 +9081,15 @@ def governance_snapshot(
     if blocked_issues and not audit_blocked:
         return [], blocked_issues
     if paths.authority_write_mode:
+        scoped = scoped_open_conflicts(paths, state)
+        if scoped is not None:
+            return scoped
         return scan_open_conflicts(paths, state)
+    if write_witness and load_live_save_marker(paths) is not None:
+        # A live save marker belongs to its own ladder: an audit beside it
+        # reports, and never publishes over it, seals it or condemns.
+        write_witness = False
+        condemn_on_failure = False
     if use_witness:
         if paths.validated_audit_witness is not None:
             return [], []
@@ -6436,20 +9100,24 @@ def governance_snapshot(
     live_prior_witness = load_sealed_audit_witness(paths, allow_prior_policy=True)
     blocked_prior_witness = load_audit_blocked_prior_witness(paths)
     blocked_prior_manifest = load_audit_blocked_prior_manifest(paths)
+    blocked_prior_facts = load_audit_blocked_prior_facts(paths)
+    prior_facts_override = None
     if prior_witness_override is not None:
         prior_witness = prior_witness_override
         if (
-            prior_manifest_override is None
-            and blocked_prior_witness is not None
+            blocked_prior_witness is not None
             and blocked_prior_witness.get("witness_hash")
             == prior_witness.get("witness_hash")
         ):
-            prior_manifest_override = blocked_prior_manifest
+            if prior_manifest_override is None:
+                prior_manifest_override = blocked_prior_manifest
+            prior_facts_override = blocked_prior_facts
     elif live_prior_witness is not None:
         prior_witness = live_prior_witness
     else:
         prior_witness = blocked_prior_witness
         prior_manifest_override = blocked_prior_manifest
+        prior_facts_override = blocked_prior_facts
     manifest = None
     run_facts = None
     inventory_issues = []
@@ -6473,6 +9141,7 @@ def governance_snapshot(
             allowed_manifest_paths=allowed_manifest_paths,
             prior_manifest_override=prior_manifest_override,
             allow_audit_epoch_advance=allow_audit_epoch_advance,
+            prior_facts_override=prior_facts_override,
         )
     if not strict_prior_comparison:
         # Checkpoint divergence is a cache miss, never an issue: the full
@@ -6584,6 +9253,20 @@ def governance_snapshot(
                 if transition is not None and transition["kind"] == "authority":
                     clear_audit_transition(paths)
                 prune_audit_manifest_generations(paths)
+    if write_witness:
+        # The derived result of this live full audit, pass or fail. Callers
+        # that must write nothing (read-only doctor, the code-only updater)
+        # pass write_witness=False and leave no verdict.
+        write_audit_verdict(
+            paths,
+            "live",
+            "failed" if issues else "passed",
+            issues,
+            state=state,
+            manifest_hash=(
+                audit_witness_digest(manifest) if manifest is not None else None
+            ),
+        )
     return conflicts, issues
 
 
@@ -6617,8 +9300,20 @@ def begin_authority_write(
     operation="authority-write",
     run_id=None,
     scope=None,
+    require_transition=False,
+    extra_reasons=(),
+    extra_dependencies=(),
 ):
-    """Verify prior evidence, then durably invalidate before mutation."""
+    """Verify prior evidence, then durably invalidate before mutation.
+
+    require_transition (save) refuses, before anything is invalidated, a
+    write that would otherwise proceed without its own transition marker.
+    extra_reasons are a checkpoint-scoped write's dependency misses (D4.2):
+    they lead the one drift receipt this full path writes, beside the
+    complete per-path delta. extra_dependencies join a legacy operation's
+    frozen dependency set.
+    """
+    extra_reasons = list(extra_reasons or ())
     if paths.diagnostic_read_cache is not None:
         raise BimriError("authority writes cannot use a diagnostic read scope.")
     blocked_issues = load_audit_blocked_issues(paths)
@@ -6631,21 +9326,35 @@ def begin_authority_write(
     if paths.authority_write_mode and existing_transition is not None:
         if existing_transition["kind"] != "authority":
             raise BimriError("cannot resume authority through a lifecycle marker.")
+        advance_writer_gate_before_authority_effect(paths, state)
         return [], []
+    if (
+        existing_transition is not None
+        and existing_transition["kind"] == "authority"
+        and existing_transition["operation"] == "save"
+    ):
+        # Another writer never audits, receipts or publishes around a live
+        # save: it is finished by its own ladder or repaired by the owner.
+        raise_pending_save_error(paths)
+        raise BimriError(unfinished_operation_line(paths))
     prior_witness = load_sealed_audit_witness(paths)
     if prior_witness is not None:
         manifest, run_facts, mismatch = verify_intact_audit_evidence(
             paths, state, prior_witness
         )
-        if not mismatch:
+        if not mismatch and not extra_reasons:
             paths.full_audit_manifest = manifest
             paths.full_audit_run_facts = run_facts
             begin_authority_checkpoint_transition(
-                paths, state, operation, run_id=run_id, scope=scope
+                paths, state, operation, run_id=run_id, scope=scope,
+                extra_dependencies=extra_dependencies,
             )
             paths.authority_write_mode = True
             paths.authority_write_audit_healthy = True
             return [], []
+        mismatch = extra_reasons + [
+            issue for issue in mismatch if issue not in extra_reasons
+        ]
         # Divergence from the prior verdict is a cache miss, never a latch.
         # Preserve it as drift evidence, then rebuild trust below with the
         # complete semantic authority audit. The stale witness file stays on
@@ -6686,10 +9395,21 @@ def begin_authority_write(
         write_witness=False,
         condemn_on_failure=True,
     )
-    if issues and not allow_degraded:
+    evidence_issues = [
+        issue for issue in issues
+        if issue.startswith(PRIOR_EVIDENCE_INVALID_PREFIX)
+    ]
+    if issues and (not allow_degraded or evidence_issues):
+        # A sealed checkpoint whose manifest or facts evidence is missing is
+        # damaged evidence: even degraded proposal staging refuses rather
+        # than invalidate that checkpoint and let a later audit adopt the
+        # new bytes blind (BIMRI-PROTOCOL 12).
+        ordered = evidence_issues + [
+            issue for issue in issues if issue not in evidence_issues
+        ]
         raise BimriError(
             "authority recovery is required; shared-memory writes are paused: "
-            + " | ".join(issues[:3])
+            + " | ".join(ordered[:3])
         )
     if not issues:
         if write_audit_witness(
@@ -6700,20 +9420,354 @@ def begin_authority_write(
             run_facts=paths.full_audit_run_facts,
         ):
             begin_authority_checkpoint_transition(
-                paths, state, operation, run_id=run_id, scope=scope
+                paths, state, operation, run_id=run_id, scope=scope,
+                extra_dependencies=extra_dependencies,
+            )
+        elif require_transition:
+            raise BimriError(
+                unfinished_authority_reason(paths)
+                or "a writable checkpoint is unavailable; run doctor"
             )
         else:
             # Unsettled records legitimately refuse a fresh checkpoint even
             # though the audit passed. Invalidate durably and proceed; the
-            # post-write refresh publishes once the store settles.
+            # post-write refresh publishes once the store settles. No
+            # transition carries the writer gate here, so it flips on its own.
             invalidate_audit_witness_before_authority_write(paths)
+            advance_writer_gate_before_authority_effect(paths, state)
     else:
         # Degraded proposal staging has no healthy verdict to preserve. It is
-        # already recovery-gated and cannot publish a new checkpoint.
+        # already recovery-gated and cannot publish a new checkpoint, but its
+        # proposal carries a v5.2.0 receipt, so the writer gate still flips.
         invalidate_audit_witness_before_authority_write(paths)
+        advance_writer_gate_before_authority_effect(paths, state)
     paths.authority_write_mode = True
     paths.authority_write_audit_healthy = not issues
     return conflicts, issues
+
+
+def checkpoint_facts(paths, state=None):
+    """The facts generation a write may read in place of history scans.
+
+    Inside a checkpoint-scoped transition: the prior checkpoint's facts F0
+    (paths.scoped_checkpoint). Outside any transition, under the caller's
+    lock: the facts of the valid current-policy checkpoint bound to the
+    loaded state (no marker, no blocked record). None otherwise, and always
+    while a full audit runs (it re-proves the store from the files): the
+    caller then keeps today's scans (D2.2, D4.1).
+    """
+    if paths.full_audit_depth:
+        return None
+    scoped = paths.scoped_checkpoint
+    if isinstance(scoped, dict) and scoped.get("f0") is not None:
+        return scoped["f0"]
+    if paths.authority_write_mode or state is None:
+        return None
+    if paths.audit_transition.exists() or paths.audit_transition.is_symlink():
+        return None
+    try:
+        if load_audit_blocked_issues(paths):
+            return None
+        witness = paths.validated_audit_witness
+        if witness is None or not sealed_witness_matches_state(
+            witness, state, include_write_state=True
+        ):
+            witness = load_valid_audit_witness(paths, state)
+        if (
+            witness is None
+            or not audit_witness_uses_current_policy(witness)
+            or not sealed_witness_matches_state(
+                witness, state, include_write_state=True
+            )
+        ):
+            return None
+        cached = paths.checkpoint_facts_cache
+        if cached is not None and cached[0] == witness["facts_hash"]:
+            return cached[1]
+        facts = load_audit_facts_evidence(paths, witness)
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        return None
+    paths.checkpoint_facts_cache = (witness["facts_hash"], facts)
+    return facts
+
+
+def scoped_dependency_miss_reason(relative, prior, live):
+    return (
+        f"scoped dependency changed: {relative} (checkpoint {prior}, "
+        f"live {live})"
+    )
+
+
+def begin_scoped_authority_write(
+    paths,
+    state,
+    operation,
+    run_id=None,
+    scope=None,
+    dependencies=(),
+    allow_degraded=False,
+    require_transition=False,
+):
+    """D4.1/D4.2: open an authority transition validated against the
+    checkpoint instead of the whole history (S1-S11, DESIGN section 04 4.2).
+
+    Preconditions: a valid current-policy checkpoint bound to the state
+    (write state included), its manifest M0 and facts F0, a valid accepted
+    head, no unsettled record, no marker and no blocked record. Then every
+    dependency path (the operation's frozen dependency set, the caller's
+    dependencies and every declared path) is hashed live and compared with
+    M0; absent in both is a match. Any failed precondition or miss takes
+    begin_authority_write: one drift receipt led by the scoped misses, the
+    complete semantic audit (condemning on failure) and a fresh checkpoint.
+    Either way a declared transition publishes scoped (D4.4).
+    """
+    # S1
+    if paths.diagnostic_read_cache is not None:
+        raise BimriError("authority writes cannot use a diagnostic read scope.")
+    blocked_issues = load_audit_blocked_issues(paths)
+    if blocked_issues:
+        raise BimriError(
+            "authority recovery is required; shared-memory writes are paused: "
+            + " | ".join(blocked_issues[:3])
+        )
+    dependencies = sorted(set(dependencies or ()))
+    full_reason = None
+    misses = []
+    frozen = None
+    m0 = None
+    m0_by_path = None
+    f0 = None
+    witness = None
+    # S2: a live marker (a resumed write, a retained retry, a foreign or
+    # save marker) keeps begin_authority_write's own rules.
+    if paths.audit_transition.exists() or paths.audit_transition.is_symlink():
+        full_reason = "an authority transition marker is live"
+    if full_reason is None:
+        # S3/S4
+        witness = paths.validated_audit_witness
+        if witness is None or not sealed_witness_matches_state(
+            witness, state, include_write_state=True
+        ):
+            witness = load_valid_audit_witness(paths, state)
+        if (
+            witness is None
+            or not audit_witness_uses_current_policy(witness)
+            or not sealed_witness_matches_state(
+                witness, state, include_write_state=True
+            )
+        ):
+            full_reason = "no valid current checkpoint"
+    if full_reason is None:
+        # S5/S6/S7
+        try:
+            m0 = load_audit_manifest_evidence(paths, witness)
+            f0 = load_audit_facts_evidence(paths, witness)
+            validate_checkpoint_head(paths, state)
+        except (BimriError, OSError, UnicodeError, ValueError, TypeError) as exc:
+            full_reason = f"checkpoint evidence is unavailable: {exc}"
+        else:
+            if audit_facts_unsettled(f0):
+                full_reason = "the checkpoint names unsettled records"
+    if full_reason is None:
+        # S8/S9: the frozen scope declares what the write may create or
+        # replace and the immutable records it reads; each is compared
+        # with M0 from live bytes, never adopted.
+        try:
+            frozen = frozen_authority_transition_scope(
+                paths,
+                operation,
+                run_id,
+                scope,
+                state=state,
+                prior_facts=f0,
+                extra_dependencies=dependencies,
+            )
+        except BimriError as exc:
+            full_reason = f"the transition scope could not be frozen: {exc}"
+    if full_reason is None and "declared_paths" not in frozen:
+        full_reason = "the operation declares no scope"
+    if full_reason is None:
+        m0_by_path = {row["path"]: row["sha256"] for row in m0}
+        recorded = dict(frozen["dependency_hashes"])
+        declared = set(frozen["declared_paths"])
+        wanted = sorted(set(recorded) | set(dependencies) | declared)
+        live_hashes = {}
+        for relative in wanted:
+            try:
+                live = scoped_protected_file_hash(paths, relative)
+            except BimriError:
+                live = "unsafe"
+            prior = m0_by_path.get(relative, "absent")
+            if live != prior or recorded.get(relative, live) != live:
+                misses.append(
+                    scoped_dependency_miss_reason(relative, prior, live)
+                )
+            live_hashes[relative] = live
+        frozen["dependency_hashes"] = {
+            relative: live_hashes[relative]
+            for relative in sorted(set(recorded) | set(dependencies))
+        }
+    if full_reason is not None or misses:
+        conflicts, issues = begin_authority_write(
+            paths,
+            state,
+            allow_degraded=allow_degraded,
+            operation=operation,
+            run_id=run_id,
+            scope=scope,
+            require_transition=require_transition,
+            extra_reasons=misses,
+            extra_dependencies=dependencies,
+        )
+        adopt_scoped_checkpoint_after_full_begin(paths, operation)
+        return conflicts, issues
+    # S10
+    paths.validated_audit_witness = witness
+    begin_authority_checkpoint_transition(
+        paths, state, operation, run_id=run_id, scope=frozen,
+        proven_prior=(witness, f0),
+    )
+    # S11
+    paths.scoped_write_set = set()
+    paths.scoped_checkpoint = {
+        "m0": m0,
+        "m0_by_path": m0_by_path,
+        "f0": f0,
+        "declared_paths": list(frozen["declared_paths"]),
+        "dependency_hashes": dict(frozen["dependency_hashes"]),
+    }
+    paths.full_audit_manifest = None
+    paths.full_audit_run_facts = None
+    paths.authority_write_mode = True
+    paths.authority_write_audit_healthy = True
+    return [], []
+
+
+def adopt_scoped_checkpoint_after_full_begin(paths, operation):
+    """D4.2: a scoped call that fell through to the full audit still
+    publishes scoped, from the fresh checkpoint its transition names."""
+    if not paths.authority_write_mode:
+        return
+    try:
+        marker = load_audit_transition(paths)
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        return
+    if (
+        marker is None
+        or marker["kind"] != "authority"
+        or marker["operation"] != operation
+        or not scoped_publication_applies(marker)
+    ):
+        return
+    try:
+        checkpoint = load_scoped_checkpoint(paths, marker)
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        return
+    if not isinstance(paths.scoped_write_set, set):
+        paths.scoped_write_set = set()
+    paths.scoped_checkpoint = checkpoint
+
+
+def scoped_publication_applies(marker):
+    """A declared v5.2 authority transition over a schema-2 prior publishes
+    its successor checkpoint scoped (D4.4); any other keeps the full path."""
+    if marker is None or marker.get("kind") != "authority":
+        return False
+    scope = marker.get("scope") or {}
+    if "declared_paths" not in scope or "dependency_hashes" not in scope:
+        return False
+    return (
+        audit_witness_schema(marker.get("prior_witness"))
+        == AUDIT_WITNESS_SCHEMA
+    )
+
+
+def resolution_dependencies_match_checkpoint(paths, conflict_id):
+    """resolve's scoped gate (D4.2): the conflict, its resolution and every
+    candidate proposal and decision hash to the valid checkpoint's
+    inventory. Any difference (or an unreadable conflict) sends resolve
+    through the full verification, drift receipt and audit, which condemns
+    a damaged store as 5.1.2 did."""
+    witness = paths.validated_audit_witness
+    if witness is None or not CONFLICT_RE.fullmatch(conflict_id or ""):
+        return False
+    try:
+        m0 = load_audit_manifest_evidence(paths, witness)
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        return False
+    m0_by_path = {row["path"]: row["sha256"] for row in m0}
+    wanted = [
+        f".bimri/conflicts/{conflict_id}.json",
+        f".bimri/resolutions/{conflict_id}.json",
+    ]
+    conflict, _raw = _audit_facts_json(conflict_path(paths, conflict_id))
+    if conflict is None:
+        return False
+    candidates = conflict.get("proposal_ids")
+    if not isinstance(candidates, list):
+        return False
+    for proposal_id in candidates:
+        if not isinstance(proposal_id, str) or not PROPOSAL_RE.fullmatch(
+            proposal_id
+        ):
+            return False
+        wanted.append(f".bimri/proposals/{proposal_id}.json")
+        wanted.append(f".bimri/decisions/{proposal_id}.json")
+    for relative in wanted:
+        try:
+            live = scoped_protected_file_hash(paths, relative)
+        except BimriError:
+            return False
+        if live != m0_by_path.get(relative, "absent"):
+            return False
+    return True
+
+
+def scoped_checkpoint_open_conflicts(paths, state):
+    """The valid checkpoint's open conflicts, loaded by id (no scan)."""
+    facts = checkpoint_facts(paths, state)
+    if facts is None:
+        return None
+    items, issues = scan_open_conflicts(
+        paths, state,
+        only={row["conflict_id"] for row in facts["open_conflicts"]},
+    )
+    if issues:
+        raise BimriError(
+            "authority recovery is required; shared-memory writes are paused: "
+            + " | ".join(issues[:3])
+        )
+    return items
+
+
+def scoped_open_conflicts(paths, state):
+    """The open conflicts a scoped write can see without a conflicts scan
+    (DESIGN section 04 L3): the checkpoint's open conflicts plus every
+    conflict this transition declared or allocated, loaded by id."""
+    scoped = paths.scoped_checkpoint
+    if not isinstance(scoped, dict) or scoped.get("f0") is None:
+        return None
+    ids = {row["conflict_id"] for row in scoped["f0"]["open_conflicts"]}
+    for relative in scoped.get("declared_paths", ()):
+        parts = PurePosixPath(relative).parts
+        if len(parts) == 3 and parts[1] in {"conflicts", "resolutions"}:
+            stem = parts[2][:-5] if parts[2].endswith(".json") else ""
+            if CONFLICT_RE.fullmatch(stem):
+                ids.add(stem)
+    try:
+        marker = load_audit_transition(paths)
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        marker = None
+    before = None
+    if marker is not None:
+        before = marker.get("pre_write_state", {}).get("conflict_count")
+        conflict_id = marker.get("scope", {}).get("conflict_id")
+        if isinstance(conflict_id, str) and CONFLICT_RE.fullmatch(conflict_id):
+            ids.add(conflict_id)
+    if isinstance(before, int) and not isinstance(before, bool):
+        for number in range(before + 1, state["conflict_count"] + 1):
+            ids.add(f"C{number:06d}")
+    return scan_open_conflicts(paths, state, only=ids)
 
 
 def require_governance_healthy(paths, state):
@@ -6744,13 +9798,25 @@ def require_full_governance_healthy(paths, state):
 def require_governance_for_resolution_retry(
     paths, state, conflict_id
 ):
-    """Permit only the failed target resolution through its repair command."""
+    """Permit only the failed target resolution through its repair command.
+
+    With no transition marker and a valid checkpoint (facts in hand) the
+    gate is the scoped write's own dependency check (D4.2): nothing is
+    audited here and resolve opens a checkpoint-scoped write.
+    """
+    paths.resolution_gate_scoped = False
     blocked_issues = load_audit_blocked_issues(paths)
     if blocked_issues:
         raise BimriError(
             "authority recovery is required; shared-memory writes are paused: "
             + " | ".join(blocked_issues[:3])
         )
+    if (
+        checkpoint_facts(paths, state) is not None
+        and resolution_dependencies_match_checkpoint(paths, conflict_id)
+    ):
+        paths.resolution_gate_scoped = True
+        return scoped_checkpoint_open_conflicts(paths, state)
     transition = load_audit_transition(paths)
     if (
         transition is not None
@@ -6881,20 +9947,38 @@ def require_governance_for_resolution_retry(
 
 
 def enter_authority_write_after_audit(
-    paths, state=None, operation="authority-recovery", scope=None
+    paths,
+    state=None,
+    operation="authority-recovery",
+    scope=None,
+    writer_gate=True,
 ):
-    """Durably mark a mutation after its full audit and semantic preflight."""
+    """Durably mark a mutation after its full audit and semantic preflight.
+
+    writer_gate=False is reserved for load-time recovery of an intent that
+    is already recorded; every other authority write flips a v5.1.0 state
+    to v5.2.0 before its first effect (D0.2).
+    """
+    if state is None:
+        raise BimriError(
+            "an authority write requires the loaded state before its first "
+            "effect."
+        )
     existing = load_audit_transition(paths)
-    if existing is None and state is not None:
+    if existing is None:
         prior = paths.validated_audit_witness or load_sealed_audit_witness(paths)
         if prior is not None and sealed_witness_matches_state(prior, state):
             begin_authority_checkpoint_transition(
-                paths, state, operation, scope=scope
+                paths, state, operation, scope=scope,
+                writer_gate=writer_gate,
             )
         else:
             invalidate_audit_witness_before_authority_write(paths)
-    elif existing is None:
-        invalidate_audit_witness_before_authority_write(paths)
+    # The checkpoint transition already flipped the state version. An
+    # invalidated checkpoint, or a retry under a retained marker (W0 kept as
+    # its recovery baseline), flips here before the first effect (D0.2).
+    if writer_gate:
+        advance_writer_gate_before_authority_effect(paths, state)
     paths.authority_write_mode = True
     paths.authority_write_audit_healthy = True
 
@@ -6904,11 +9988,17 @@ def open_conflicts(paths, state):
 
 
 def allocate_conflict_id(paths, state):
-    existing = [
-        int(path.stem[1:])
-        for path in paths.conflicts.glob("C*.json")
-        if CONFLICT_RE.fullmatch(path.stem)
-    ]
+    facts = checkpoint_facts(paths, state)
+    if facts is not None:
+        # The checkpoint's conflict watermark (D2.2) stands in for the
+        # conflicts glob; the exists loop below still skips any squatter.
+        existing = [facts["watermarks"]["conflict"]]
+    else:
+        existing = [
+            int(path.stem[1:])
+            for path in paths.conflicts.glob("C*.json")
+            if CONFLICT_RE.fullmatch(path.stem)
+        ]
     number = max([state["conflict_count"]] + existing + [0]) + 1
     if number > 999999:
         raise BimriError("BIMRI has exhausted its six-digit conflict ID space.")
@@ -7389,16 +10479,95 @@ def next_pattern_id(paths, state, entries):
     for entry in entries:
         if entry["tier"] == 3 and re.fullmatch(r"P\d+", entry["id"]):
             numbers.append(int(entry["id"][1:]))
+    # v5.2.0: a cooled pattern still owns its P id. A legacy or v4 pattern
+    # has no proposal file and leaves pattern_count at 0, so once it cools
+    # its cold_current record is the only place that id is still live.
+    for record in state.get("cold_current", {}).values():
+        if not isinstance(record, dict) or record.get("tier") != 3:
+            continue
+        entry_id = record.get("entry_id")
+        if isinstance(entry_id, str) and PATTERN_ID_RE.fullmatch(entry_id):
+            numbers.append(int(entry_id[1:]))
     for path in paths.proposals.glob("R*-Q*.json"):
         proposal = read_json_strict(path, path.name)
         pattern_id = proposal.get("pattern_id")
         if isinstance(pattern_id, str) and re.fullmatch(r"P\d+", pattern_id):
             numbers.append(int(pattern_id[1:]))
     number = max(numbers + [0]) + 1
-    # Allocation is derived from immutable proposal files and the hot view;
-    # state.pattern_count advances only when an accepted apply commits it,
-    # so a propose never writes undeclared authority-influencing state.
+    # Allocation is derived from immutable proposal files, the hot view and
+    # the cold-current records; state.pattern_count advances only when an
+    # accepted apply commits it, so a propose never writes undeclared
+    # authority-influencing state.
     return f"P{number:04d}"
+
+
+def next_pattern_id_from_watermarks(state, entries, facts):
+    """next_pattern_id with the checkpoint's pattern watermark in place of
+    the proposal glob (D2.2): every proposal, head and cold pattern id the
+    last full audit saw, advanced by every scoped write since."""
+    numbers = [state["pattern_count"], facts["watermarks"]["pattern"]]
+    for entry in entries:
+        if entry["tier"] == 3 and re.fullmatch(r"P\d+", entry["id"]):
+            numbers.append(int(entry["id"][1:]))
+    for record in state.get("cold_current", {}).values():
+        if not isinstance(record, dict) or record.get("tier") != 3:
+            continue
+        entry_id = record.get("entry_id")
+        if isinstance(entry_id, str) and PATTERN_ID_RE.fullmatch(entry_id):
+            numbers.append(int(entry_id[1:]))
+    number = max(numbers + [0]) + 1
+    return f"P{number:04d}"
+
+
+def allocate_pattern_id(paths, state, entries):
+    """The next pattern id: from the checkpoint's watermark when one is in
+    hand, otherwise from the files (a write without a valid checkpoint)."""
+    facts = checkpoint_facts(paths, state)
+    if facts is None:
+        return next_pattern_id(paths, state, entries)
+    return next_pattern_id_from_watermarks(state, entries, facts)
+
+
+def next_proposal_id_from_watermarks(paths, run_id, facts):
+    """next_proposal_id with the checkpoint's per-run proposal watermark in
+    place of the conflicts/resolutions byte scan; the run's own files and
+    log markers are still read (one run's prefix)."""
+    numbers = [facts["watermarks"]["proposal"].get(run_id, 0)]
+    filename_pattern = re.compile(
+        rf"{re.escape(run_id)}-Q(\d{{3}})\.json"
+    )
+    for directory in (paths.proposals, paths.decisions):
+        for path in directory.glob(f"{run_id}-Q*.json"):
+            match = filename_pattern.fullmatch(path.name)
+            if match:
+                numbers.append(int(match.group(1)))
+    log = run_log_path(paths, run_id)
+    if log.is_symlink() or not log.is_file():
+        raise BimriError(f"{run_id} log is missing or unsafe.")
+    try:
+        log_content = log.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as exc:
+        raise BimriError(f"{run_id} log is unreadable: {exc}") from exc
+    for match in LOG_PROPOSAL_RE.finditer(log_content):
+        proposal_id = match.group("proposal_id")
+        if proposal_id.startswith(f"{run_id}-Q"):
+            numbers.append(int(proposal_id.rsplit("Q", 1)[1]))
+    number = max(numbers + [0]) + 1
+    if number > 999:
+        raise BimriError(
+            f"{run_id} has exhausted its 999 proposal IDs; close it and "
+            "start a new run."
+        )
+    return f"{run_id}-Q{number:03d}"
+
+
+def allocate_proposal_id(paths, state, run_id):
+    """Protocol 12's allocation rule from the checkpoint's watermarks when a
+    valid checkpoint is in hand, otherwise from the files."""
+    facts = checkpoint_facts(paths, state)
+    if facts is None:
+        return next_proposal_id(paths, run_id)
+    return next_proposal_id_from_watermarks(paths, run_id, facts)
 
 
 def render_proposed_line(proposal, state):
@@ -7447,6 +10616,8 @@ PROPOSAL_INTENT_FIELDS = (
     "observations",
     "evidence",
     "falsifier",
+    "request_id",
+    "settles",
 )
 
 
@@ -7513,7 +10684,12 @@ def proposal_effect_content(content, state, proposal, current):
 
 
 def pressure_cooling_plan(paths, state, proposal, content):
-    """Deterministically cool safe Tier 2 residents until hot bytes fit."""
+    """Deterministically cool safe Tier 2/3 residents until hot bytes fit.
+
+    Tier 1 is never cooled. An incoming Tier 2/3 generation that scores
+    strictly below the next candidate is accepted into cold memory first
+    (v5.2.0, admission compares before it evicts); ties evict as before.
+    """
     if len(content.encode("utf-8")) <= state["hot_max_bytes"]:
         return content, []
     compacted = normalize_v5_0_hot_metadata(content, compact=True)
@@ -7534,13 +10710,50 @@ def pressure_cooling_plan(paths, state, proposal, content):
     candidates = sorted(
         (
             entry for entry in entries
-            if entry["tier"] == 2 and entry.get("key") != incoming_key
+            if entry["tier"] in COLD_TIERS and entry.get("key") != incoming_key
         ),
         key=lambda entry: retention_order(entry, state),
     )
+    planned_incoming = find_entry(entries, key=incoming_key)
+    incoming_score = (
+        composite(planned_incoming, state)
+        if planned_incoming is not None
+        and planned_incoming["tier"] in COLD_TIERS
+        else None
+    )
     cooled = []
     current_content = content
+    incoming_cooled = False
+
+    def cool_incoming(text):
+        # Accepting the incoming generation as cold-current is safer than
+        # rejecting or losing the intent. It remains the one current value
+        # and is immediately retrievable.
+        lines, current_entries, parse_errors = parse_hot(text)
+        if parse_errors:
+            return text, False
+        incoming = find_entry(current_entries, key=incoming_key)
+        if incoming is None or incoming["tier"] not in COLD_TIERS:
+            return text, False
+        del lines[incoming["line"]]
+        cooled.append(incoming)
+        return render_content(lines), True
+
     for candidate in candidates:
+        if (
+            incoming_score is not None
+            and incoming_score < composite(candidate, state)
+        ):
+            # Compare once: the incoming cools before the first resident
+            # that outscores it, and never twice.
+            incoming_score = None
+            current_content, incoming_cooled = cool_incoming(current_content)
+            if (
+                incoming_cooled
+                and len(current_content.encode("utf-8"))
+                <= state["hot_max_bytes"]
+            ):
+                return current_content, cooled
         lines, current_entries, parse_errors = parse_hot(current_content)
         if parse_errors:
             raise BimriError(
@@ -7548,29 +10761,71 @@ def pressure_cooling_plan(paths, state, proposal, content):
                 + "; ".join(parse_errors)
             )
         live = find_entry(current_entries, key=candidate["key"])
-        if live is None or live["tier"] != 2:
+        if live is None or live["tier"] not in COLD_TIERS:
             continue
         del lines[live["line"]]
         current_content = render_content(lines)
         cooled.append(live)
         if len(current_content.encode("utf-8")) <= state["hot_max_bytes"]:
             return current_content, cooled
-    # If the incoming generation itself is Tier 2, accepting it as
-    # cold-current is safer than rejecting or losing the intent. It remains
-    # the one current value and is immediately retrievable.
-    lines, current_entries, parse_errors = parse_hot(current_content)
-    if not parse_errors:
-        incoming = find_entry(current_entries, key=incoming_key)
-        if incoming is not None and incoming["tier"] == 2:
-            del lines[incoming["line"]]
-            current_content = render_content(lines)
-            cooled.append(incoming)
-            if len(current_content.encode("utf-8")) <= state["hot_max_bytes"]:
-                return current_content, cooled
+    if not incoming_cooled:
+        current_content, incoming_cooled = cool_incoming(current_content)
+        if (
+            incoming_cooled
+            and len(current_content.encode("utf-8")) <= state["hot_max_bytes"]
+        ):
+            return current_content, cooled
     raise PressureCoolingUnavailable(
         "hot memory exceeds its global byte ceiling and no safe Tier 2 "
-        "resident can be cooled; close or shorten a current subject."
+        "or Tier 3 resident can be cooled; close or shorten a current subject."
     )
+
+
+def durable_cooling_plan(paths, state, proposal, content, archive_months):
+    """A save's cooling plan: its durable cooled rows first, then the plan.
+
+    Rows ``[BY:<Q>] [cooled]`` that a crashed attempt already appended in
+    the save's declared month define (a prefix of) the cooled set, so a
+    resume on a later day never cools a different set than the archive
+    records (section 03 10.3). Without such rows this is exactly
+    pressure_cooling_plan.
+    """
+    durable = []
+    for month in archive_months:
+        for record in exact_archive_rows_by(
+            paths, month, proposal["proposal_id"], "cooled"
+        ):
+            raw = record["raw_line"].strip()
+            if raw not in durable:
+                durable.append(raw)
+    if not durable:
+        return pressure_cooling_plan(paths, state, proposal, content)
+    cooled = []
+    current_content = content
+    for raw in durable:
+        lines, entries, errors = parse_hot(current_content)
+        if errors:
+            raise BimriError(
+                "pressure cooling encountered malformed memory: "
+                + "; ".join(errors)
+            )
+        match = next(
+            (entry for entry in entries if entry["raw"] == raw), None
+        )
+        if match is None:
+            raise BimriError(
+                f"resumed {proposal['proposal_id']} cannot reproduce a "
+                "durable cooled row: that resident is no longer current."
+            )
+        del lines[match["line"]]
+        current_content = render_content(lines)
+        cooled.append(match)
+    if len(current_content.encode("utf-8")) <= state["hot_max_bytes"]:
+        return current_content, cooled
+    current_content, more = pressure_cooling_plan(
+        paths, state, proposal, current_content
+    )
+    return current_content, cooled + more
 
 
 def _same_tier2_authority(left, right):
@@ -7617,6 +10872,54 @@ def accepted_key_writer_after(
     return max(candidates, key=lambda item: (item[0], item[1]["proposal_id"]))
 
 
+def key_writer_after(
+    paths, state, proposal, operation=None, max_revision=None
+):
+    """accepted_key_writer_after proven from the checkpoint's newest writer
+    per key (facts.writers_by_key) instead of the decisions glob.
+
+    No accepted writer after the base is definitive from the facts. When the
+    newest writer is not itself the proof (another operation or base, or
+    beyond max_revision), the full search keeps 5.1.2's answer.
+    """
+    facts = checkpoint_facts(paths, state)
+    if facts is None:
+        return accepted_key_writer_after(
+            paths, state, proposal, operation=operation,
+            max_revision=max_revision,
+        )
+    if max_revision is None:
+        max_revision = state["head_revision"]
+    row = facts["writers_by_key"].get(proposal["key"])
+    if row is None or row["revision"] <= proposal["base_revision"]:
+        return None
+    if row["revision"] <= max_revision:
+        try:
+            dpath = decision_path(paths, row["proposal_id"])
+            if dpath.is_symlink() or not dpath.is_file():
+                raise BimriError("writer decision is missing or unsafe.")
+            decision = validate_decision(
+                read_json_strict(dpath, dpath.name), row["proposal_id"]
+            )
+            if (
+                decision["outcome"] == "accepted"
+                and decision["revision"] == row["revision"]
+            ):
+                writer = authority_proposal(paths, state, row["proposal_id"])
+                if (
+                    writer["key"] == proposal["key"]
+                    and (operation is None or writer["operation"] == operation)
+                    and writer["base_hash"] == proposal["base_hash"]
+                ):
+                    validate_decision_effect(paths, state, decision)
+                    return row["revision"], writer, decision
+        except (BimriError, OSError):
+            pass
+    return accepted_key_writer_after(
+        paths, state, proposal, operation=operation, max_revision=max_revision
+    )
+
+
 def exact_effect_reflected_at_head(paths, state, proposal, current):
     if proposal["operation"] == "set":
         return proposal_equivalent(proposal, current)
@@ -7638,7 +10941,7 @@ def exact_effect_reflected_at_head(paths, state, proposal, current):
             return False
         if current.get("last") == proposal["run_id"]:
             return True
-        return accepted_key_writer_after(
+        return key_writer_after(
             paths, state, proposal, operation="touch"
         ) is not None
     return False
@@ -7693,40 +10996,75 @@ def uncommitted_owner_resolution(paths, state, key):
     for path in sorted(paths.resolutions.glob("C*.json")):
         if path.is_symlink() or not path.is_file() or not CONFLICT_RE.fullmatch(path.stem):
             continue
-        resolution = validate_resolution_record(
-            read_json_strict(path, path.name), expected_conflict_id=path.stem
-        )
-        if (
-            resolution["status"] != "applying"
-            or resolution["choice"] not in resolution["proposal_ids"]
-            or "intended_revision_after" not in resolution
-        ):
-            continue
-        cpath = conflict_path(paths, path.stem)
-        if cpath.is_symlink() or not cpath.is_file():
-            raise BimriError("applying owner resolution conflict is missing or unsafe.")
-        conflict = validate_conflict_record(
-            paths,
-            read_json_strict(cpath, cpath.name),
-            expected_conflict_id=path.stem,
-        )
-        if conflict["key"] != key:
-            continue
-        proposal = human_confirmed_proposal(
-            authority_proposal(paths, state, resolution["choice"]),
-            preserve_source=(
-                resolution["bimri_version"]
-                in {V5_0_2_VERSION, MEMORY_FORMAT_VERSION}
-            ),
-        )
-        intended = resolution["intended_revision_after"]
-        if intended <= state["head_revision"]:
-            if resolution_candidate_reflected_at_revision(
-                paths, state, conflict, resolution, proposal, intended
-            ):
-                continue
-        return resolution["conflict_id"]
+        conflict_id = _owner_resolution_uncommitted(paths, state, key, path)
+        if conflict_id is not None:
+            return conflict_id
     return None
+
+
+def _owner_resolution_uncommitted(paths, state, key, path):
+    """One resolution file: its conflict id when it is an applying owner
+    resolution for key whose effect is not committed, else None."""
+    resolution = validate_resolution_record(
+        read_json_strict(path, path.name), expected_conflict_id=path.stem
+    )
+    if (
+        resolution["status"] != "applying"
+        or resolution["choice"] not in resolution["proposal_ids"]
+        or "intended_revision_after" not in resolution
+    ):
+        return None
+    cpath = conflict_path(paths, path.stem)
+    if cpath.is_symlink() or not cpath.is_file():
+        raise BimriError("applying owner resolution conflict is missing or unsafe.")
+    conflict = validate_conflict_record(
+        paths,
+        read_json_strict(cpath, cpath.name),
+        expected_conflict_id=path.stem,
+    )
+    if conflict["key"] != key:
+        return None
+    proposal = human_confirmed_proposal(
+        authority_proposal(paths, state, resolution["choice"]),
+        preserve_source=(
+            resolution["bimri_version"]
+            in {V5_0_2_VERSION, MEMORY_FORMAT_VERSION}
+        ),
+    )
+    intended = resolution["intended_revision_after"]
+    if intended <= state["head_revision"]:
+        if resolution_candidate_reflected_at_revision(
+            paths, state, conflict, resolution, proposal, intended
+        ):
+            return None
+    return resolution["conflict_id"]
+
+
+def checkpoint_owner_resolution(paths, state, key, facts):
+    """uncommitted_owner_resolution over the checkpoint's applying owner
+    resolutions (facts.applying_resolutions), never a resolutions glob."""
+    for row in facts["applying_resolutions"]:
+        if row["key"] != key:
+            continue
+        path = resolution_file_path(paths, row["conflict_id"])
+        if path.is_symlink() or not path.is_file():
+            raise BimriError(
+                "applying owner resolution is missing or unsafe: "
+                + row["conflict_id"]
+            )
+        conflict_id = _owner_resolution_uncommitted(paths, state, key, path)
+        if conflict_id is not None:
+            return conflict_id
+    return None
+
+
+def owner_resolution_in_progress(paths, state, key):
+    """D2.2: the checkpoint's facts replace the resolutions scan when a
+    valid checkpoint (or a scoped transition's prior one) is in hand."""
+    facts = checkpoint_facts(paths, state)
+    if facts is None:
+        return uncommitted_owner_resolution(paths, state, key)
+    return checkpoint_owner_resolution(paths, state, key, facts)
 
 
 def preflight_proposal(paths, state, run_meta, proposal):
@@ -7736,7 +11074,26 @@ def preflight_proposal(paths, state, run_meta, proposal):
     )
     if duplicate:
         return duplicate, None
+    head_content, head_hash, head_entries = load_preflight_head(paths, state)
+    live = find_current_entry(head_entries, state, proposal["key"])
+    live_hash = line_hash(live["raw"]) if live else "absent"
+    if proposal["base_hash"] != live_hash:
+        if proposal["operation"] == "set" and proposal_equivalent(proposal, live):
+            raise BimriError(
+                f"{proposal['key']} already has the requested value; sync "
+                f"{proposal['run_id']} before proposing again."
+            )
+        raise BimriError(
+            f"{proposal['key']} changed after this run observed it; sync "
+            f"{proposal['run_id']} before proposing against that key."
+        )
+    return None, bind_preflight_proposal(
+        paths, state, proposal, live, live_hash, head_content, head_hash
+    )
 
+
+def load_preflight_head(paths, state):
+    """The accepted head's text, hash and entries, checked against state."""
     head_path = revision_path(paths, state["head_revision"])
     if head_path.is_symlink() or not head_path.is_file():
         raise BimriError("accepted head revision is missing or unsafe.")
@@ -7756,19 +11113,18 @@ def preflight_proposal(paths, state, run_meta, proposal):
             "accepted head must be repaired before proposing: "
             + "; ".join(head_errors)
         )
-    live = find_current_entry(head_entries, state, proposal["key"])
-    live_hash = line_hash(live["raw"]) if live else "absent"
-    if proposal["base_hash"] != live_hash:
-        if proposal["operation"] == "set" and proposal_equivalent(proposal, live):
-            raise BimriError(
-                f"{proposal['key']} already has the requested value; sync "
-                f"{proposal['run_id']} before proposing again."
-            )
-        raise BimriError(
-            f"{proposal['key']} changed after this run observed it; sync "
-            f"{proposal['run_id']} before proposing against that key."
-        )
+    return head_content, head_hash, head_entries
 
+
+def bind_preflight_proposal(
+    paths, state, proposal, live, live_hash, head_content, head_hash
+):
+    """Policy, hold ladder, head binding and dry run of one proposal.
+
+    Shared by the legacy lane (after its base-hash test) and save (after
+    its observation binding table). Returns the bound proposal with its
+    hold_reason; raises before any durable write on a refusal.
+    """
     if proposal["source"] == "system":
         raise BimriError(
             "public proposals cannot use system provenance; use user, agent, "
@@ -7812,7 +11168,7 @@ def preflight_proposal(paths, state, run_meta, proposal):
         and not direct_user_confirmed
     ):
         hold_reason = "confirmed-user-authority-required"
-    if uncommitted_owner_resolution(paths, state, proposal["key"]):
+    if owner_resolution_in_progress(paths, state, proposal["key"]):
         hold_reason = "owner-resolution-in-progress"
 
     proposal["base_revision"] = state["head_revision"]
@@ -7838,7 +11194,7 @@ def preflight_proposal(paths, state, run_meta, proposal):
     validate_proposal_base_snapshot(paths, state, proposal)
 
     if hold_reason is not None:
-        return None, proposal
+        return proposal
 
     proposed_content, _ = proposal_effect_content(
         head_content, state, proposal, live
@@ -7854,20 +11210,19 @@ def preflight_proposal(paths, state, run_meta, proposal):
         except PressureCoolingUnavailable:
             proposal["hold_reason"] = "capacity-residency-required"
             validate_proposal(proposal, state)
-            return None, proposal
+            return proposal
     _, _, validation_errors, _proposed_counts = validate_hot_content(
         proposed_content, state
     )
-    legacy_reduction = strictly_reduces_overflow(
+    if validation_errors and not strictly_reduces_overflow(
         head_content, proposed_content, state
-    )
-    if validation_errors and not legacy_reduction:
+    ):
         raise BimriError(
             "proposal would create invalid memory: "
             + "; ".join(validation_errors)
         )
 
-    return None, proposal
+    return proposal
 
 
 def validate_proposal(
@@ -8026,6 +11381,24 @@ def validate_proposal(
     first_run = proposal.get("first_run")
     if first_run is not None:
         validate_fixed_id(first_run, re.compile(r"^R\d+$"), "proposal first run ID")
+    # v5.2 optional fields (D2.9, D2.5); a v5.1.x proposal carries neither.
+    request_id = proposal.get("request_id")
+    if request_id is not None and (
+        not isinstance(request_id, str)
+        or not REQUEST_ID_RE.fullmatch(request_id)
+    ):
+        raise BimriError("proposal request ID is invalid.")
+    if "settles" in proposal:
+        settles = proposal["settles"]
+        if (
+            not isinstance(settles, list)
+            or settles != sorted(set(settles))
+            or any(
+                not isinstance(item, str) or not PROPOSAL_RE.fullmatch(item)
+                for item in settles
+            )
+        ):
+            raise BimriError("proposal settled candidates are invalid.")
     receipt = proposal.get("preflight_receipt")
     if receipt is not None:
         if not isinstance(receipt, dict):
@@ -8039,6 +11412,7 @@ def validate_proposal(
             raise BimriError("proposal preflight receipt fields are invalid.")
         accepted_receipt_engines = {
             ENGINE_VERSION,
+            V5_1_2_ENGINE_VERSION,
             V5_1_1_ENGINE_VERSION,
             V5_1_0_ENGINE_VERSION,
         }
@@ -8081,7 +11455,7 @@ def validate_decision(decision, proposal_id):
     if decision.get("proposal_id") != proposal_id:
         raise BimriError("decision proposal ID mismatch.")
     if decision.get("outcome") not in {
-        "applying", "accepted", "noop", "contested", "held"
+        "applying", "accepted", "noop", "contested", "held", "abandoned"
     }:
         raise BimriError("decision outcome is invalid.")
     parse_timestamp(decision.get("recorded_at"), "decision timestamp")
@@ -8196,6 +11570,24 @@ def validate_decision(decision, proposal_id):
     if outcome == "held":
         if decision.get("reason") not in HOLD_REASONS:
             raise BimriError("held decision reason is invalid.")
+    if outcome == "abandoned":
+        # D2.6: an owner-word close without effect. Final, effect-free and
+        # never machine-asserted.
+        if decision.get("authority") != "human-asserted":
+            raise BimriError("abandoned decision must be human-asserted.")
+        clean_scalar(decision.get("summary"), "abandoned decision summary", 1000)
+        if decision.get("engine_release") not in {
+            ENGINE_VERSION,
+            V5_1_2_ENGINE_VERSION,
+            V5_1_1_ENGINE_VERSION,
+            V5_1_0_ENGINE_VERSION,
+        }:
+            raise BimriError("abandoned decision engine release is invalid.")
+        for field in ("reason", "conflict_id", "base_hash", "revision_before"):
+            if field in decision:
+                raise BimriError(
+                    f"abandoned decision cannot carry {field}."
+                )
     if "resolution_id" in decision:
         validate_fixed_id(
             decision.get("resolution_id"),
@@ -8211,7 +11603,7 @@ def validate_decision(decision, proposal_id):
             80,
         )
     if "initial_outcome" in decision and decision["initial_outcome"] not in {
-        "applying", "accepted", "noop", "contested", "held"
+        "applying", "accepted", "noop", "contested", "held", "abandoned"
     }:
         raise BimriError("decision initial outcome is invalid.")
     return decision
@@ -8356,7 +11748,10 @@ def committed_proposal_effect_at_head(paths, state, proposal, revision):
     return True
 
 
-def validate_proposal_base_snapshot(paths, state, proposal):
+def validate_proposal_base_snapshot(paths, state, proposal, month_scope=None):
+    """month_scope (D4.3): the YYYY-MM months that may hold a cold base's
+    cooled row; None derives the one checkpointed month on a scoped path
+    and searches every month otherwise."""
     entries = authority_revision_entries(
         paths,
         state,
@@ -8365,15 +11760,9 @@ def validate_proposal_base_snapshot(paths, state, proposal):
     )
     base_storage = proposal.get("base_storage", "hot")
     if base_storage == "cold":
-        records = [
-            record for record in archive_records(paths)
-            if (
-                record["proposal_id"]
-                == proposal.get("base_archive_proposal_id")
-                and record["reason"] == "cooled"
-                and line_hash(record["raw_line"]) == proposal["base_hash"]
-            )
-        ]
+        if month_scope is None:
+            month_scope = cold_base_month_scope(paths, state, proposal)
+        records = cold_base_records(paths, proposal, months=month_scope)
         if len(records) != 1:
             raise BimriError(
                 "proposal cold base does not identify one immutable cooled record."
@@ -8610,7 +11999,7 @@ def resolution_close_effect_at_revision(
             return False
         if entry.get("key") == proposal["key"]:
             closed.append(record)
-        elif record["reason"] != "cooled" or entry["tier"] != 2:
+        elif record["reason"] != "cooled" or entry["tier"] not in COLD_TIERS:
             return False
         # Other-key cooling can preserve earlier failed attempts. It never
         # supplies proof of this removal; normal cold authority checks apply.
@@ -8776,6 +12165,16 @@ def validate_resolution_effect(paths, state, conflict, resolution):
 def validate_decision_effect(paths, state, decision):
     outcome = decision["outcome"]
     proposal_id = decision["proposal_id"]
+    if outcome == "abandoned":
+        # D2.6: final and effect-free; the owner's cancellation may stand
+        # over a proposal the owner quarantined first (D1.10).
+        authority_revision_entries(
+            paths,
+            state,
+            decision["revision"],
+            f"abandoned decision {proposal_id}",
+        )
+        return decision
     proposal = authority_proposal(paths, state, proposal_id)
     decision_revision = (
         decision["revision_before"]
@@ -9034,7 +12433,7 @@ def validate_decision_effect(paths, state, decision):
         and proposal["operation"] == "touch"
         and _same_tier2_authority(proposal_base_entry(paths, proposal), current)
     ):
-        reflected = accepted_key_writer_after(
+        reflected = key_writer_after(
             paths,
             state,
             proposal,
@@ -9131,15 +12530,11 @@ def validate_conflict_candidate_decisions(
 
 def proposal_base_entry(paths, proposal):
     if proposal.get("base_storage") == "cold":
-        records = [
-            record for record in archive_records(paths)
-            if (
-                record["proposal_id"]
-                == proposal.get("base_archive_proposal_id")
-                and record["reason"] == "cooled"
-                and line_hash(record["raw_line"]) == proposal["base_hash"]
-            )
-        ]
+        records = cold_base_records(
+            paths,
+            proposal,
+            months=cold_base_month_scope(paths, None, proposal),
+        )
         if len(records) != 1:
             raise BimriError(
                 "proposal cold base does not identify one immutable cooled record."
@@ -9163,7 +12558,17 @@ def proposal_base_entry(paths, proposal):
     )
 
 
-def parse_archive_record(line):
+ARCHIVE_FOREIGN_ENTRY_ERROR = "archived line is not a valid memory entry."
+
+
+def parse_archive_record(line, strict=False):
+    """Parse one archive receipt and the memory entry it carries.
+
+    The entry is parsed non-strictly by default (``entry`` is None and
+    ``entry_error`` names the defect) so crash recovery over a foreign row
+    still reaches its drift receipt; strict callers (recall, index, doctor,
+    warm search) raise so the defect is named with its month and line.
+    """
     match = ARCHIVE_RECORD_RE.fullmatch(line)
     if not match:
         raise BimriError("archive record is malformed.")
@@ -9181,6 +12586,14 @@ def parse_archive_record(line):
     data["raw_line"] = clean_scalar(
         data["raw_line"], "archived line", MAX_SERIALIZED_ENTRY_CHARS
     )
+    try:
+        data["entry"] = parse_entry_line(data["raw_line"])
+        data["entry_error"] = None
+    except BimriError:
+        data["entry"] = None
+        data["entry_error"] = ARCHIVE_FOREIGN_ENTRY_ERROR
+    if strict and data["entry_error"]:
+        raise BimriError(data["entry_error"])
     return data
 
 
@@ -9221,38 +12634,126 @@ def validate_cold_archive_snapshot(
     return exact[0]
 
 
-@diagnostic_cached(lambda: None, clone=copy_flat_records)
-def archive_records(paths):
+def parse_archive_month(target, strict=False, content=None):
+    """Parse one archive month's receipts, naming any defect by month:line."""
+    if target.is_symlink():
+        raise BimriError(
+            f"archive file cannot be a symbolic link: {target.name}"
+        )
+    try:
+        if content is None:
+            content = target.read_text(encoding="utf-8")
+        lines = content.splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise BimriError(
+            f"archive file is unreadable: {target.name}: {exc}"
+        ) from exc
+    records = []
+    for number, line in enumerate(lines, 1):
+        if not line.startswith("[ARCHIVED:"):
+            continue
+        try:
+            record = parse_archive_record(line, strict=strict)
+        except BimriError as exc:
+            raise BimriError(
+                f"archive authority/recovery corruption in "
+                f"{target.name}:{number}: {exc}"
+            ) from exc
+        record["path"] = target
+        record["line_number"] = number
+        records.append(record)
+    return records
+
+
+@diagnostic_cached(lambda strict=False: bool(strict), clone=copy_flat_records)
+def archive_records(paths, strict=False):
     records = []
     for target in sorted(paths.archive.glob("*.md")):
+        records.extend(parse_archive_month(target, strict=strict))
+    return records
+
+
+def archive_records_in(paths, months, strict=False):
+    """archive_records bounded to the named YYYY-MM months (no glob)."""
+    records = []
+    for month in sorted(set(months)):
+        if not re.fullmatch(r"\d{4}-\d{2}", month):
+            raise BimriError(f"archive month is invalid: {month}")
+        target = paths.archive / f"{month}.md"
         if target.is_symlink():
             raise BimriError(
                 f"archive file cannot be a symbolic link: {target.name}"
             )
-        try:
-            lines = target.read_text(encoding="utf-8").splitlines()
-        except (OSError, UnicodeError) as exc:
-            raise BimriError(
-                f"archive file is unreadable: {target.name}: {exc}"
-            ) from exc
-        for number, line in enumerate(lines, 1):
-            if not line.startswith("[ARCHIVED:"):
-                continue
-            try:
-                record = parse_archive_record(line)
-            except BimriError as exc:
-                raise BimriError(
-                    f"archive authority/recovery corruption in "
-                    f"{target.name}:{number}: {exc}"
-                ) from exc
-            record["path"] = target
-            record["line_number"] = number
-            records.append(record)
+        if not target.exists():
+            continue
+        records.extend(parse_archive_month(target, strict=strict))
     return records
 
 
-def validate_cold_archive_bindings(paths, state):
-    """Bind every mutable cold-current pointer to one immutable cooled record."""
+def cold_base_month_scope(paths, state, proposal):
+    """D4.3: the one archive month holding a cold base's cooled row on a
+    checkpoint-scoped path, else None (search every month, as a full audit
+    or a write without a valid checkpoint does).
+
+    The month comes from the checkpointed cold-current binding of the key
+    (state.cold_current, bound by the checkpoint's state hash) or from a
+    proof already made under this lock, so a subject rehydrated by the
+    same write keeps its proven month.
+    """
+    if proposal.get("base_storage") != "cold":
+        return None
+    if checkpoint_facts(paths, state) is None:
+        return None
+    ident = (proposal.get("base_archive_proposal_id"), proposal.get("base_hash"))
+    known = (paths.cold_base_months or {}).get(ident)
+    if known is not None:
+        return [known]
+    if state is not None:
+        record = state.get("cold_current", {}).get(proposal.get("key"))
+        if (
+            isinstance(record, dict)
+            and record.get("archived_by") == ident[0]
+            and isinstance(record.get("raw_line"), str)
+            and line_hash(record["raw_line"]) == ident[1]
+            and isinstance(record.get("archived_on"), str)
+        ):
+            return [record["archived_on"][:7]]
+    return None
+
+
+def cold_base_records(paths, proposal, months=None):
+    """The cooled archive rows a cold base names: every month, or months."""
+    source = (
+        archive_records(paths)
+        if months is None
+        else archive_records_in(paths, months)
+    )
+    records = [
+        record for record in source
+        if (
+            record["proposal_id"] == proposal.get("base_archive_proposal_id")
+            and record["reason"] == "cooled"
+            and line_hash(record["raw_line"]) == proposal["base_hash"]
+        )
+    ]
+    if len(records) == 1 and months is not None:
+        if paths.cold_base_months is None:
+            paths.cold_base_months = {}
+        paths.cold_base_months[
+            (proposal.get("base_archive_proposal_id"), proposal["base_hash"])
+        ] = records[0]["path"].stem
+    return records
+
+
+def validate_cold_archive_bindings(paths, state, checkpoint_months=None):
+    """Bind every mutable cold-current pointer to one immutable cooled record.
+
+    checkpoint_months ({YYYY-MM: sha256} from a scoped write's prior
+    manifest, D4.3): a month whose live bytes hash to the checkpoint's is
+    hashed, not parsed. The checkpoint certified its bindings and the
+    scoped write's state started from the checkpointed cold map, so only a
+    month the write changed (or that drifted) is re-bound.
+    """
     grouped = {}
     for key, cold in state.get("cold_current", {}).items():
         grouped.setdefault(cold["archived_on"][:7], []).append((key, cold))
@@ -9262,10 +12763,14 @@ def validate_cold_archive_bindings(paths, state):
             raise BimriError(
                 f"cold-current archive month {month} is missing or unsafe."
             )
-        records = []
-        for number, line in enumerate(
-            target.read_text(encoding="utf-8").splitlines(), 1
+        raw = target.read_bytes()
+        if (
+            checkpoint_months
+            and checkpoint_months.get(month) == sha256_bytes(raw)
         ):
+            continue
+        records = []
+        for number, line in enumerate(raw.decode("utf-8").splitlines(), 1):
             if not line.startswith("[ARCHIVED:"):
                 continue
             try:
@@ -9291,8 +12796,14 @@ def validate_cold_archive_bindings(paths, state):
     return True
 
 
-def validate_current_residency(paths, state, hot_entries=None):
-    """Validate one unambiguous current generation across hot and cold."""
+def validate_current_residency(
+    paths, state, hot_entries=None, checkpoint_months=None
+):
+    """Validate one unambiguous current generation across hot and cold.
+
+    checkpoint_months is a scoped write's month-hash bypass (D4.3, see
+    validate_cold_archive_bindings); None re-binds every cold month.
+    """
     head_bytes = None
     if hot_entries is None:
         head = revision_path(paths, state["head_revision"])
@@ -9310,7 +12821,12 @@ def validate_current_residency(paths, state, hot_entries=None):
             raise BimriError(
                 "accepted head memory grammar is invalid: " + "; ".join(errors)
             )
-    validate_cold_archive_bindings(paths, state)
+    if checkpoint_months is None:
+        validate_cold_archive_bindings(paths, state)
+    else:
+        validate_cold_archive_bindings(
+            paths, state, checkpoint_months=checkpoint_months
+        )
     hot_keys = {entry.get("key") for entry in hot_entries if entry.get("key")}
     overlap = sorted(hot_keys.intersection(state.get("cold_current", {})))
     if overlap:
@@ -9401,7 +12917,10 @@ def load_exact_checkpoint_state(paths, key):
         raw = json.loads(state_bytes.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
-    if not isinstance(raw, dict) or raw.get("bimri_version") != MEMORY_FORMAT_VERSION:
+    if (
+        not isinstance(raw, dict)
+        or raw.get("bimri_version") not in READABLE_STATE_VERSIONS
+    ):
         return None
     try:
         require_complete_v5_state(raw)
@@ -9461,7 +12980,58 @@ def exact_archive_effect(paths, raw_line, reason="closed", proposal_id=None):
     return exact
 
 
-def append_archive(paths, proposal_id, raw_line, reason):
+def exact_archive_effect_in(
+    paths, months, raw_line, reason="closed", proposal_id=None
+):
+    """exact_archive_effect bounded to the named YYYY-MM months."""
+    raw_line = clean_scalar(
+        raw_line, "archived line", MAX_SERIALIZED_ENTRY_CHARS
+    )
+    reason = clean_scalar(reason, "archive reason", 100)
+    exact = []
+    for month in sorted(set(months)):
+        if not re.fullmatch(r"\d{4}-\d{2}", month):
+            raise BimriError(f"archive month is invalid: {month}")
+        target = paths.archive / f"{month}.md"
+        if target.is_symlink():
+            raise BimriError(
+                f"archive file cannot be a symbolic link: {target.name}"
+            )
+        if not target.exists():
+            continue
+        try:
+            lines = target.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError) as exc:
+            raise BimriError(
+                f"archive file is unreadable: {target.name}: {exc}"
+            ) from exc
+        for number, line in enumerate(lines, 1):
+            if not line.startswith("[ARCHIVED:"):
+                continue
+            try:
+                record = parse_archive_record(line)
+            except BimriError as exc:
+                raise BimriError(
+                    f"archive authority/recovery corruption in "
+                    f"{target.name}:{number}: {exc}"
+                ) from exc
+            if record["reason"] == reason and record["raw_line"] == raw_line:
+                if proposal_id is None or record["proposal_id"] == proposal_id:
+                    record["path"] = target
+                    record["line_number"] = number
+                    exact.append(record)
+    return exact
+
+
+def append_archive(
+    paths, proposal_id, raw_line, reason, archive_date=None, months=None
+):
+    """Append one archive row, idempotent per (proposal, raw line, reason).
+
+    archive_date stamps the row (a save passes its ticket's started_on, so a
+    resume on a later day still writes into the declared month); months
+    bounds the idempotency lookup to those YYYY-MM months.
+    """
     proposal_id = validate_fixed_id(
         proposal_id, PROPOSAL_RE, "archive proposal ID"
     )
@@ -9469,14 +13039,19 @@ def append_archive(paths, proposal_id, raw_line, reason):
         raw_line, "archived line", MAX_SERIALIZED_ENTRY_CHARS
     )
     reason = clean_scalar(reason, "archive reason", 100)
-    existing = exact_archive_effect(
-        paths, raw_line, reason=reason, proposal_id=proposal_id
-    )
+    if months is not None:
+        existing = exact_archive_effect_in(
+            paths, months, raw_line, reason=reason, proposal_id=proposal_id
+        )
+    else:
+        existing = exact_archive_effect(
+            paths, raw_line, reason=reason, proposal_id=proposal_id
+        )
     if len(existing) > 1:
         raise BimriError("archive contains duplicate exact proposal effects.")
     if existing:
         return existing[0]["date"]
-    archive_date = today()
+    archive_date = archive_date or today()
     target = paths.archive / f"{archive_date[:7]}.md"
     if target.is_symlink():
         raise BimriError("monthly archive file cannot be a symbolic link.")
@@ -9488,14 +13063,72 @@ def append_archive(paths, proposal_id, raw_line, reason):
     return archive_date
 
 
+def exact_archive_rows_by(paths, month, proposal_id, reason):
+    """Archive rows of one month stamped by one proposal with one reason."""
+    target = paths.archive / f"{month}.md"
+    if target.is_symlink():
+        raise BimriError(
+            f"archive file cannot be a symbolic link: {target.name}"
+        )
+    if not target.exists():
+        return []
+    rows = []
+    for line in target.read_text(encoding="utf-8").splitlines():
+        if not line.startswith("[ARCHIVED:"):
+            continue
+        record = parse_archive_record(line)
+        if record["proposal_id"] == proposal_id and record["reason"] == reason:
+            rows.append(record)
+    return rows
+
+
+def legacy_scoped_archive_months(paths, state, proposal):
+    """Months a legacy apply under a scoped checkpoint may already hold this
+    proposal's rows in: today's plus its cold-base month (D4.3). None
+    outside a scoped transition (every month is searched)."""
+    if scoped_checkpoint_months(paths) is None:
+        return None
+    months = {today()[:7]}
+    months.update(cold_base_month_scope(paths, state, proposal) or ())
+    return sorted(months)
+
+
 def apply_proposal(
-    paths, state, proposal, force=False, human_confirmed=False
+    paths, state, proposal, force=False, human_confirmed=False,
+    archive_date=None, archive_months=None, planned_revision=None,
 ):
+    """Apply one proposal at the head.
+
+    archive_date/archive_months/planned_revision are a save's frozen plan
+    (D3.2, section 03 L12 and 10.3): archive rows carry the ticket's start
+    date and are looked up only in the declared month, and the revision
+    written is exactly the declared one. Legacy callers pass none of them.
+    """
     validate_proposal(
         proposal,
         state,
         allow_confirmed_origin=human_confirmed,
     )
+
+    def archive(raw_line, reason):
+        # A legacy caller keeps the four-argument call (crash seams wrap it)
+        # unless it runs under a scoped checkpoint, where the idempotency
+        # lookup is bounded to today's month plus any cold-base month
+        # (D4.3); only a save passes its frozen stamp date and declared
+        # months.
+        if archive_months is None:
+            months = legacy_scoped_archive_months(paths, state, proposal)
+            if months is None and archive_date is None:
+                return append_archive(paths, proposal["proposal_id"], raw_line, reason)
+            return append_archive(
+                paths, proposal["proposal_id"], raw_line, reason,
+                archive_date=archive_date, months=months,
+            )
+        return append_archive(
+            paths, proposal["proposal_id"], raw_line, reason,
+            archive_date=archive_date, months=archive_months,
+        )
+
     proposal_decision_path = decision_path(paths, proposal["proposal_id"])
     existing_decision = None
     if proposal_decision_path.exists() and not force:
@@ -9510,6 +13143,26 @@ def apply_proposal(
             result["_generation_changed"] = False
             result["_replayed"] = True
             return result
+    if archive_date is None:
+        marker = load_audit_transition(paths)
+        if (marker is not None and marker["operation"] in {"sync", "close-authority-run", "resolve"}
+                and proposal["proposal_id"] in marker["scope"].get("proposal_ids", ())):
+            scope = marker["scope"]
+            months = sorted(PurePosixPath(path).stem for path in scope.get("declared_paths", ())
+                            if path.startswith(".bimri/archive/"))
+            if months:
+                # The archive uses the local calendar. The transition timestamp
+                # is UTC and may have a different date even on the original host.
+                archive_date = scope.get("started_on")
+                if archive_date is None:
+                    instant = parse_timestamp(marker["created_at"], "transition time")
+                    dates = (instant.astimezone().date(), instant.date(),
+                             instant.date() - dt.timedelta(days=1), instant.date() + dt.timedelta(days=1))
+                    archive_date = next((day.isoformat() for day in dates if day.isoformat()[:7] in months), None)
+                if archive_date is None or archive_date[:7] not in months:
+                    raise BimriError("legacy transition has no matching archive date; run doctor.")
+                if existing_decision is not None or archive_date != today():
+                    archive_months = months
     content = revision_path(paths, state["head_revision"]).read_text(encoding="utf-8")
     lines, entries, parse_errors, _ = validate_hot_content(
         content, state, allow_legacy_overflow=True
@@ -9525,7 +13178,7 @@ def apply_proposal(
     if (
         runtime_hold_reason is None
         and not force
-        and uncommitted_owner_resolution(paths, state, proposal["key"])
+        and owner_resolution_in_progress(paths, state, proposal["key"])
     ):
         runtime_hold_reason = "owner-resolution-in-progress"
     if runtime_hold_reason is not None:
@@ -9548,9 +13201,7 @@ def apply_proposal(
         if proposal["operation"] == "close":
             base_entry = proposal_base_entry(paths, proposal)
             if base_entry:
-                append_archive(
-                    paths, proposal["proposal_id"], base_entry["raw"], "closed"
-                )
+                archive(base_entry["raw"], "closed")
         decision = write_decision(
             paths, proposal["proposal_id"], "accepted",
             replace_applying=True, revision=state["head_revision"],
@@ -9608,7 +13259,7 @@ def apply_proposal(
                     "versioned preflight receipt; sync and restage it instead of "
                     "creating an owner conflict."
                 )
-            writer_evidence = accepted_key_writer_after(paths, state, proposal)
+            writer_evidence = key_writer_after(paths, state, proposal)
             if writer_evidence is None:
                 raise BimriError(
                     "the later keyed writer cannot be proven from accepted "
@@ -9649,9 +13300,17 @@ def apply_proposal(
     cooled_entries = []
     if not legacy_reduction:
         try:
-            new_content, cooled_entries = pressure_cooling_plan(
-                paths, state, proposal, new_content
-            )
+            if archive_months is not None:
+                # A resumed save takes its cooled set from the rows its
+                # crashed attempt made durable (section 03 10.3); the plan
+                # only continues past them when they do not yet fit.
+                new_content, cooled_entries = durable_cooling_plan(
+                    paths, state, proposal, new_content, archive_months
+                )
+            else:
+                new_content, cooled_entries = pressure_cooling_plan(
+                    paths, state, proposal, new_content
+                )
         except PressureCoolingUnavailable:
             if force:
                 raise
@@ -9684,7 +13343,9 @@ def apply_proposal(
         result["_already_satisfied"] = True
         return result
     _, _, validation_errors, _ = validate_hot_content(new_content, state)
-    legacy_reduction = strictly_reduces_overflow(content, new_content, state)
+    legacy_reduction = bool(validation_errors) and strictly_reduces_overflow(
+        content, new_content, state
+    )
     if validation_errors and not legacy_reduction and not force:
         raise BimriError(
             "proposal cannot be applied safely: " + "; ".join(validation_errors)
@@ -9700,27 +13361,21 @@ def apply_proposal(
             **decision_base_evidence(current),
         )
     if archived_raw:
-        append_archive(
-            paths,
-            proposal["proposal_id"],
+        archive(
             archived_raw,
             "closed" if proposal["operation"] == "close" else "replaced",
         )
     elif proposal["operation"] == "set" and current is not None:
-        append_archive(
-            paths, proposal["proposal_id"], current["raw"], "replaced"
-        )
+        archive(current["raw"], "replaced")
     cooled_archive_dates = []
     for cooled in cooled_entries:
-        archive_date = append_archive(
-            paths, proposal["proposal_id"], cooled["raw"], "cooled"
-        )
-        cooled_archive_dates.append((cooled, archive_date))
+        cooled_date = archive(cooled["raw"], "cooled")
+        cooled_archive_dates.append((cooled, cooled_date))
     if current_was_cold:
         state["cold_current"].pop(proposal["key"], None)
-    for cooled, archive_date in cooled_archive_dates:
+    for cooled, cooled_date in cooled_archive_dates:
         state["cold_current"][cooled["key"]] = make_cold_record(
-            cooled, proposal["proposal_id"], archive_date
+            cooled, proposal["proposal_id"], cooled_date
         )
     if proposal["tier"] == 3 and proposal["operation"] == "set":
         # The pattern counter moves inside the declared authority write
@@ -9732,19 +13387,30 @@ def apply_proposal(
     revision = commit_revision(
         paths, state, new_content, f"accepted {proposal['proposal_id']}",
         allow_legacy_overflow=legacy_reduction,
+        planned_number=planned_revision,
+    )
+    # v5.2.0: the incoming generation itself may be accepted straight into
+    # cold memory under byte pressure; callers say so after the result line.
+    self_cooled = any(
+        cooled.get("key") == proposal["key"] for cooled in cooled_entries
     )
     if force:
-        return {
+        result = {
             "bimri_version": MEMORY_FORMAT_VERSION,
             "proposal_id": proposal["proposal_id"],
             "outcome": "accepted",
             "recorded_at": now_iso(),
             "revision": revision,
         }
-    return write_decision(
-        paths, proposal["proposal_id"], "accepted",
-        replace_applying=True, revision=revision,
-    )
+    else:
+        result = write_decision(
+            paths, proposal["proposal_id"], "accepted",
+            replace_applying=True, revision=revision,
+        )
+    if self_cooled:
+        result = dict(result)
+        result["_self_cooled_key"] = proposal["key"]
+    return result
 
 
 def process_run_proposals(paths, state, run_id):
@@ -9771,7 +13437,9 @@ def process_run_proposals(paths, state, run_id):
                 f"[BASE:{proposal['base_hash']}] {proposal['text']}",
             )
             referenced.add(proposal["proposal_id"])
-        results.append(apply_proposal(paths, state, proposal))
+        result = apply_proposal(paths, state, proposal)
+        settle_from_proposal(paths, state, proposal, result)
+        results.append(result)
     return results
 
 
@@ -9784,6 +13452,14 @@ def run_has_authority_proposals(paths, run_id, log_content):
 
 
 def build_index(paths, state):
+    text, count = build_index_text(paths, state)
+    atomic_write_text(paths.index, text)
+    return count
+
+
+def build_index_text(paths, state):
+    """Render index.tsv without writing it (doctor's copy path renders it on
+    the copy and writes it live only when the store did not move)."""
     content = revision_path(paths, state["head_revision"]).read_text(encoding="utf-8")
     _, entries, errors = parse_hot(content)
     if errors:
@@ -9820,7 +13496,7 @@ def build_index(paths, state):
     }
     indexed_history = {}
     reason_rank = {"cooled": 0, "replaced": 1, "closed": 2}
-    for record in archive_records(paths):
+    for record in archive_records(paths, strict=True):
         if (
             record["proposal_id"], record["raw_line"], record["reason"]
         ) in current_cold_effects:
@@ -9833,7 +13509,7 @@ def build_index(paths, state):
         ):
             indexed_history[record["raw_line"]] = record
     for record in indexed_history.values():
-        entry = parse_entry_line(record["raw_line"])
+        entry = record["entry"]
         rows.append([
             entry["id"], entry.get("key", ""), "archive",
             entry.get("trust", ""), entry.get("source", ""),
@@ -9850,21 +13526,12 @@ def build_index(paths, state):
     safe_rows.sort(key=lambda row: (row[0], row[2], row[6]))
     header = "id\tkey\tloc\ttrust\tsource\tstatus\tfile\theadline\n"
     text = header + "\n".join("\t".join(row) for row in safe_rows)
-    atomic_write_text(paths.index, text.rstrip() + "\n")
-    return len(safe_rows)
+    return text.rstrip() + "\n", len(safe_rows)
 
 
 def print_authority_recovery(issues):
-    if not issues:
-        return
-    print("AUTHORITY RECOVERY NEEDED — shared-memory writes are paused:")
-    for issue in issues[:5]:
-        print(f"  - {issue}")
-    print(
-        "  Run `doctor` for the full audit. With the owner's explicit "
-        "approval, use `quarantine-authority` to preserve a damaged record "
-        "before restoring a validated replacement."
-    )
+    for line in authority_recovery_lines(issues):
+        print(line)
 
 
 LEGACY_REVIEW_TYPES = {
@@ -10228,6 +13895,24 @@ def new_held_notices(results):
     return notices
 
 
+def self_cooled_notice(key):
+    return (
+        f"BIMRI NOTICE: {key} accepted into cold memory (hot view full); "
+        "get and search still find it."
+    )
+
+
+def new_self_cooled_notices(results):
+    """One notice per accepted generation that went straight to cold memory."""
+    notices = []
+    for result in results:
+        key = result.get("_self_cooled_key")
+        if result.get("_replayed") or not key:
+            continue
+        notices.append(self_cooled_notice(key))
+    return notices
+
+
 def new_conflict_notices(paths, state, results):
     generations = []
     for result in results:
@@ -10302,15 +13987,291 @@ def orphan_candidates(state, current_run_id=None, now=None):
 
 
 def render_orphan_candidates(stale, limit=ORPHAN_BRIEF_LIMIT):
-    """One bounded brief line; ``status`` carries every active run."""
+    """One bounded brief line; ``status --runs`` lists every active run."""
     if len(stale) <= limit:
         return "ORPHAN CANDIDATES (never auto-closed): " + ", ".join(stale)
     return (
         f"ORPHAN CANDIDATES (never auto-closed): {len(stale)} runs inactive "
         f"over {ORPHAN_INACTIVITY_SECONDS // 3600}h; newest "
         + ", ".join(stale[-limit:])
-        + "; full list: status"
+        + "; full list: status --runs"
     )
+
+
+ENGINE_COMMAND_FALLBACK = ("python", "bimri-engine.py")
+ENGINE_COMMAND_PREFIX_MAX = 8
+JOURNAL_NEEDS_LEGACY_RUN = (
+    "journal needs an active legacy run (start --open-run); a save journals "
+    "its --rationale."
+)
+READ_BRIEF_HEAD_MISMATCH = "accepted head does not match state.json; run doctor"
+READ_BRIEF_VIEW_NOTICE = (
+    "BIMRI NOTICE: bimri.md differs from the accepted head; the next save or "
+    "doctor preserves the edit and restores the view."
+)
+
+
+def engine_command_prefix(paths):
+    """The host's engine command, read from runtime.local.json; never raises.
+
+    ``local_runtime_binding`` records ``argv_prefix`` as [python, engine].
+    A regular, non-redirected file that parses as a JSON object whose
+    ``argv_prefix`` is a list of 1-8 non-empty single-line strings gives
+    those strings; anything else gives ``python bimri-engine.py`` (section
+    06 1.4). Nothing else in the engine reads the binding.
+    """
+    path = paths.bdir / "runtime.local.json"
+    try:
+        if path_is_redirected(paths.bdir) or path_is_redirected(path):
+            return list(ENGINE_COMMAND_FALLBACK)
+        if not path.is_file():
+            return list(ENGINE_COMMAND_FALLBACK)
+        record = json.loads(path.read_bytes().decode("utf-8"))
+    except (OSError, UnicodeError, ValueError, TypeError, RecursionError):
+        return list(ENGINE_COMMAND_FALLBACK)
+    prefix = record.get("argv_prefix") if isinstance(record, dict) else None
+    if (
+        not isinstance(prefix, list)
+        or not 1 <= len(prefix) <= ENGINE_COMMAND_PREFIX_MAX
+        or not all(
+            isinstance(element, str)
+            and element
+            and not any(ord(ch) < 32 or ord(ch) == 127 for ch in element)
+            for element in prefix
+        )
+    ):
+        return list(ENGINE_COMMAND_FALLBACK)
+    return list(prefix)
+
+
+def quote_command_element(element):
+    """Double-quote an element with whitespace or ``"`` (inner ``"`` doubled)
+    so the rendered line pastes into cmd, PowerShell and POSIX sh."""
+    if element and not any(ch.isspace() or ch == '"' for ch in element):
+        return element
+    return '"' + element.replace('"', '""') + '"'
+
+
+def render_engine_command(paths, *args):
+    """``<python> bimri-engine.py <args>`` for this host (section 06 1.4)."""
+    return " ".join(
+        quote_command_element(element)
+        for element in engine_command_prefix(paths) + [str(arg) for arg in args]
+    )
+
+
+def read_brief_view_check(paths, state):
+    """Check the head and the generated view without healing (section 06 1.2).
+
+    One read each of the head revision and ``bimri.md``. A missing,
+    redirected or unreadable head is an error, as the warm checkpoint load
+    already makes it. A head whose bytes differ from ``state.json`` (only
+    reachable on a cold load) is returned as a recovery line. A missing view
+    is rewritten from the head; a view that differs is left for the next
+    writer or ``doctor`` (the manual-edit recovery is an authority write),
+    with a notice on stderr. Return the recovery issue and, if needed, the
+    verified revision path the agent should read instead of the hot view.
+    """
+    head = revision_path(paths, state["head_revision"])
+    if path_is_redirected(head) or not head.is_file():
+        raise BimriError("accepted head is missing or unsafe.")
+    try:
+        head_bytes = head.read_bytes()
+        expected = head_bytes.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise BimriError(f"accepted head is unreadable: {exc}") from exc
+    if sha256_bytes(head_bytes) != state["head_hash"]:
+        return READ_BRIEF_HEAD_MISMATCH, None
+    if not paths.hot.is_symlink() and not paths.hot.exists():
+        if write_generated_view(paths, expected, warn_only=True):
+            return None, None
+        return None, head.relative_to(paths.root).as_posix()
+    try:
+        current = None if path_is_redirected(paths.hot) else paths.hot.read_bytes()
+    except OSError:
+        current = None
+    if current != head_bytes:
+        print(READ_BRIEF_VIEW_NOTICE, file=sys.stderr)
+        return None, head.relative_to(paths.root).as_posix()
+    return None, None
+
+
+def open_save_ticket_admissions(paths):
+    """[(request_id, created_at or None)] for every ticket in saves/open.
+
+    One listing of a normally empty directory and one small read per
+    ticket; an unreadable ticket is listed with None (section 06 1.1).
+    """
+    admissions = []
+    for request_id in list_save_ticket_names(paths, "open"):
+        admitted = None
+        path = save_ticket_path(paths, request_id, "open")
+        if not path_is_redirected(path) and path.is_file():
+            try:
+                record = read_json_strict(path, "save ticket")
+            except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+                record = None
+            if isinstance(record, dict):
+                admitted = record.get("created_at")
+        if not isinstance(admitted, str) or not admitted or any(
+            character.isspace() for character in admitted
+        ):
+            admitted = None
+        admissions.append((request_id, admitted))
+    return admissions
+
+
+def brief_cold_line(paths, state):
+    count = len(state.get("cold_current", {}))
+    if not count:
+        return "Cold current: 0 subjects."
+    return (
+        f"Cold current: {count} subjects. List them: "
+        + render_engine_command(paths, "cold")
+    )
+
+
+def brief_save_line(paths):
+    return "Save with: " + render_engine_command(
+        paths, "save", "--request", "<id>", "--observed", "<token>",
+        "--key", "<key>", "...",
+    )
+
+
+def brief_observed_token(state):
+    return f"V{state['head_revision']:06d}:head:{state['head_hash']}"
+
+
+def checkpoint_line_word(checkpoint_line):
+    if checkpoint_line == CHECKPOINT_PRIOR_POLICY_LINE:
+        return "prior policy"
+    if checkpoint_line == CHECKPOINT_UNPROVEN_LINE:
+        return "unproven"
+    return None
+
+
+def authority_recovery_lines(issues):
+    """The lines ``print_authority_recovery`` prints, as a list."""
+    if not issues:
+        return []
+    lines = ["AUTHORITY RECOVERY NEEDED — shared-memory writes are paused:"]
+    lines.extend(f"  - {issue}" for issue in issues[:5])
+    lines.append(
+        "  Run `doctor` for the full audit. With the owner's explicit "
+        "approval, use `quarantine-authority` to preserve a damaged record "
+        "before restoring a validated replacement."
+    )
+    return lines
+
+
+def render_brief(
+    paths,
+    state,
+    run_id,
+    reused=False,
+    conflicts=None,
+    authority_issues=None,
+    actor=None,
+    output="tsv",
+    checkpoint_line=None,
+    accepted_memory_path=None,
+):
+    """Return the brief as a list of stdout lines (one renderer, two lanes).
+
+    ``run_id`` None is the read brief (D6.1, section 06 1.1): header word
+    ``read``, the head token, the checkpoint line on a cold read, the cold
+    line, any unfinished-save lines and ``Save with:``; it never audits.
+    A run id is the legacy brief of ``start --open-run``: today's lines with
+    ``Observed:`` after the revision line and ``Cold current:`` before the
+    run handle (D1.1). ``output="json"`` gives the read brief's one object.
+    """
+    content = revision_path(paths, state["head_revision"]).read_text(encoding="utf-8")
+    _, _, errors, counts = validate_hot_content(content, state, allow_legacy_overflow=True)
+    read_lane = run_id is None
+    if read_lane:
+        actor = clean_actor(actor or "agent")
+        authority_issues = list(authority_issues or [])
+        if authority_issues:
+            checkpoint_line = None
+    if read_lane and output == "json":
+        stale = orphan_candidates(state, None)
+        admissions = open_save_ticket_admissions(paths)
+        unfinished = None
+        if admissions:
+            request_id, admitted = sorted(
+                admissions,
+                key=lambda item: (item[1] is None, item[1] or "", item[0]),
+            )[0]
+            unfinished = {"request_id": request_id, "admitted_at": admitted}
+        payload = {
+            "brief": "read",
+            "date": today(),
+            "actor": actor,
+            "head_revision": state["head_revision"],
+            "head_hash": state["head_hash"],
+            "token": brief_observed_token(state),
+            "tokens_estimate": len(content) // 4,
+            "tiers": {
+                "1": [counts[1], state["tier1_max"]],
+                "2": [counts[2], state["tier2_max"]],
+                "3": [counts[3], state["tier3_max"]],
+            },
+            "authority_issues": authority_issues,
+            "orphan_candidates": stale,
+            "validation_errors": list(errors),
+            "cold_count": len(state.get("cold_current", {})),
+            "cold_command": render_engine_command(paths, "cold"),
+            "unfinished_save": unfinished,
+            "checkpoint": checkpoint_line_word(checkpoint_line),
+        }
+        if accepted_memory_path:
+            payload["accepted_memory_path"] = accepted_memory_path
+        return [json.dumps(payload, ensure_ascii=False, sort_keys=True)]
+    lines = []
+    if read_lane:
+        lines.append(f"=== BIMRI BRIEF read | {today()} | {actor} ===")
+    else:
+        lines.append(
+            f"=== BIMRI BRIEF {run_id} | {today()} | "
+            f"{state['active_runs'][run_id]['actor']} ==="
+        )
+    lines.append(
+        f"Memory revision V{state['head_revision']:06d} | "
+        f"~{len(content) // 4} tokens | "
+        f"T1 {counts[1]} (soft target {state['tier1_max']}) | "
+        f"T2 {counts[2]} (soft target {state['tier2_max']}) | "
+        f"T3 {counts[3]} (soft target {state['tier3_max']})"
+    )
+    lines.append(f"Observed: {brief_observed_token(state)}")
+    if read_lane:
+        if accepted_memory_path:
+            lines.append("Read accepted memory from: " + accepted_memory_path)
+        if checkpoint_line is not None:
+            lines.append(checkpoint_line)
+    else:
+        if reused:
+            lines.append("Resumed existing run handle for this harness session.")
+        if conflicts is None or authority_issues is None:
+            conflicts, authority_issues = governance_snapshot(paths, state)
+    lines.extend(authority_recovery_lines(authority_issues))
+    stale = orphan_candidates(state, run_id)
+    if stale:
+        lines.append(render_orphan_candidates(stale))
+    if errors:
+        lines.append("VALIDATION NEEDED:")
+        for error in errors[:10]:
+            lines.append(f"  - {error}")
+    lines.append(brief_cold_line(paths, state))
+    lines.extend(unfinished_save_lines(paths))
+    if read_lane:
+        lines.append(brief_save_line(paths))
+    else:
+        lines.append(
+            f"Run handle: {run_id}. Journal and propose through bimri-engine.py; "
+            f"close explicitly with --run {run_id}."
+        )
+    lines.append("=== END BRIEF ===")
+    return lines
 
 
 def print_brief(
@@ -10320,41 +14281,93 @@ def print_brief(
     reused=False,
     conflicts=None,
     authority_issues=None,
+    actor=None,
+    output="tsv",
+    checkpoint_line=None,
 ):
-    content = revision_path(paths, state["head_revision"]).read_text(encoding="utf-8")
-    _, _, errors, counts = validate_hot_content(content, state, allow_legacy_overflow=True)
-    print(
-        f"=== BIMRI BRIEF {run_id} | {today()} | "
-        f"{state['active_runs'][run_id]['actor']} ==="
-    )
-    print(
-        f"Memory revision V{state['head_revision']:06d} | "
-        f"~{len(content) // 4} tokens | "
-        f"T1 {counts[1]} (soft target {state['tier1_max']}) | "
-        f"T2 {counts[2]} (soft target {state['tier2_max']}) | "
-        f"T3 {counts[3]} (soft target {state['tier3_max']})"
-    )
-    if reused:
-        print("Resumed existing run handle for this harness session.")
-    if conflicts is None or authority_issues is None:
-        conflicts, authority_issues = governance_snapshot(paths, state)
-    print_authority_recovery(authority_issues)
-    stale = orphan_candidates(state, run_id)
-    if stale:
-        print(render_orphan_candidates(stale))
-    if errors:
-        print("VALIDATION NEEDED:")
-        for error in errors[:10]:
-            print(f"  - {error}")
-    print(
-        f"Run handle: {run_id}. Journal and propose through bimri-engine.py; "
-        f"close explicitly with --run {run_id}."
-    )
-    print("=== END BRIEF ===")
+    for line in render_brief(
+        paths,
+        state,
+        run_id,
+        reused=reused,
+        conflicts=conflicts,
+        authority_issues=authority_issues,
+        actor=actor,
+        output=output,
+        checkpoint_line=checkpoint_line,
+    ):
+        print(line)
 
 
-def cmd_start(paths, actor, session=None):
+def read_brief_lines(paths, actor, output="tsv"):
+    """The read brief of ``start`` and ``hook-start`` (D1.1, D1.14, D6.1).
+
+    Under the lock: ``load_or_initialize`` without the cold-store audit (a
+    fresh folder is still initialized, legacy formats still migrate and a
+    live save marker is still finished, D3.4.1), the view checked but never
+    healed, and the brief rendered from state, the head, the checkpoint
+    files and the ``saves/open`` listing. Nothing is allocated, mapped or
+    published; on an unedited store nothing is written. A store without a
+    valid checkpoint reports only what is recorded (a blocked record, a
+    condemnation, a marker left by load) or the ``run doctor`` line; it
+    never runs the full audit, which belongs to ``doctor`` and the next
+    writer (section 06 1.2).
+    """
+    # A public 5.1.2 store already has a lock, but none of the 5.2 writer
+    # directories. Only bootstrap (or a missing lock) needs the layout lock.
+    existing = paths.state.is_file() and paths.lock.is_file()
+    lock = existing_store_lock if existing else engine_lock
+    with lock(paths):
+        state = load_or_initialize(
+            paths, audit_when_cold=False, defer_write_dirs=existing,
+        )
+        view_issue, accepted_memory_path = read_brief_view_check(paths, state)
+        warm = (
+            load_valid_audit_witness(paths, state) is not None
+            and not load_audit_blocked_issues(paths)
+        )
+        if warm:
+            # A valid checkpoint certifies the protected tree; the warm
+            # governance answer is empty without any disk walk.
+            conflicts, issues = [], []
+            checkpoint_line = None
+        else:
+            conflicts = []
+            issues = recorded_recovery_issues(paths, state)
+            if view_issue is not None:
+                issues.append(view_issue)
+            checkpoint_line = (
+                None if issues else checkpoint_condition_line(paths, state)
+            )
+        return render_brief(
+            paths,
+            state,
+            None,
+            conflicts=conflicts,
+            authority_issues=issues,
+            actor=actor,
+            output=output,
+            checkpoint_line=checkpoint_line,
+            accepted_memory_path=accepted_memory_path,
+        )
+
+
+def cmd_start(paths, actor, session=None, open_run=False, output="tsv"):
+    """``start``: the read brief by default, a legacy run with ``open_run``.
+
+    The default opens nothing (D1.1): no run, no session mapping, no state
+    write on a warm store; ``session`` is accepted and ignored. The brief is
+    gathered under the lock and printed after it is released. ``open_run``
+    is the v5.1.2 start (allocation, session resume, lifecycle checkpoint)
+    with the two brief lines of D6.1, and returns the run id.
+    """
     actor = clean_actor(actor)
+    if not open_run:
+        for line in read_brief_lines(paths, actor, output=output):
+            print(line)
+        return None
+    if output != "tsv":
+        raise BimriError("--json is only available on the read brief.")
     with engine_lock(paths):
         state = load_or_initialize(paths)
         sync_generated_view(paths, state)
@@ -10372,6 +14385,9 @@ def cmd_start(paths, actor, session=None):
                     authority_issues=authority_issues,
                 )
                 return existing
+        # D3.5: a legacy start never allocates beside an unfinished
+        # authority operation (it would squat a planned save run id).
+        refuse_lifecycle_write_under_authority_marker(paths)
         existing_numbers = []
         if paths.validated_audit_witness is None:
             existing_numbers = [
@@ -10389,17 +14405,7 @@ def cmd_start(paths, actor, session=None):
                 continue
             break
         started_at = now_iso()
-        log_text = (
-            f"# Run {run_id} | {started_at} | actor:{actor} | "
-            f"base:V{state['head_revision']:06d}\n\n"
-            "## Journal\n\n"
-            "<!-- Use the host-only argv_prefix recorded in "
-            ".bimri/runtime.local.json with "
-            f"`journal --run {run_id} --text \"...\"` "
-            "for durable detail. -->\n\n"
-            "## Proposals\n\n"
-            "## Outcome\n\n"
-        )
+        log_text = initial_legacy_log(run_id, started_at, actor, state["head_revision"])
         post_state = copy.deepcopy(state)
         post_state["run_count"] = number
         post_state["run_dates"][run_id] = today()
@@ -10461,6 +14467,11 @@ def cmd_journal(paths, run_id, text, importance=3):
         raise BimriError("importance must be 1 through 5.")
     with engine_lock(paths):
         state = load_or_initialize(paths)
+        refuse_lifecycle_write_under_authority_marker(paths)
+        validate_fixed_id(run_id, RUN_RE, "run ID")
+        if run_id not in state["active_runs"]:
+            # D1.13: the default lane has no run to journal into.
+            raise BimriError(JOURNAL_NEEDS_LEGACY_RUN)
         log = require_active_run(paths, state, run_id)
         entry_id = next_entry_id(paths, run_id)
         line = f"[ID:{entry_id}] [I:{importance}] {text}"
@@ -10493,6 +14504,39 @@ def cmd_journal(paths, run_id, text, importance=3):
     return entry_id
 
 
+def legacy_preflight_dependencies(base_entry):
+    """The cold month a legacy proposal's cold base was proven in (D4.3)."""
+    if (
+        base_entry
+        and base_entry.get("storage") == "cold"
+        and isinstance(base_entry.get("archive_date"), str)
+        and re.fullmatch(r"\d{4}-\d{2}-\d{2}", base_entry["archive_date"])
+    ):
+        return [f".bimri/archive/{base_entry['archive_date'][:7]}.md"]
+    return []
+
+
+def run_cold_base_dependencies(paths, state, run_id):
+    """Cold-base months of one run's staged proposals (legacy sync/close,
+    section 04 4.3): one run's prefix, read before the transition."""
+    dependencies = set()
+    for path in sorted(paths.proposals.glob(f"{run_id}-Q*.json")):
+        if not PROPOSAL_RE.fullmatch(path.stem):
+            continue
+        data, _raw = _audit_facts_json(path)
+        if data is None or data.get("base_storage") != "cold":
+            continue
+        record = state.get("cold_current", {}).get(data.get("key"))
+        if (
+            isinstance(record, dict)
+            and record.get("archived_by") == data.get("base_archive_proposal_id")
+            and isinstance(record.get("archived_on"), str)
+            and re.fullmatch(r"\d{4}-\d{2}-\d{2}", record["archived_on"])
+        ):
+            dependencies.add(f".bimri/archive/{record['archived_on'][:7]}.md")
+    return sorted(dependencies)
+
+
 def cmd_propose(paths, args):
     run_id = validate_fixed_id(args.run, RUN_RE, "run ID")
     operation = args.operation
@@ -10516,6 +14560,7 @@ def cmd_propose(paths, args):
         validate_fixed_id(args.target, MEMORY_ID_RE, "target ID")
     with engine_lock(paths):
         state = load_or_initialize(paths)
+        refuse_lifecycle_write_under_authority_marker(paths)
         sync_generated_view(paths, state)
         log = require_active_run(paths, state, run_id)
         run_meta = state["active_runs"][run_id]
@@ -10568,7 +14613,7 @@ def cmd_propose(paths, args):
         if operation == "touch" and base_entry["tier"] != 2:
             raise BimriError("only Tier 2 entries can be touched.")
 
-        proposal_id = next_proposal_id(paths, run_id)
+        proposal_id = allocate_proposal_id(paths, state, run_id)
         entry_id = next_entry_id(paths, run_id)
         tier = args.tier or (base_entry["tier"] if base_entry else None)
         if tier not in {1, 2, 3}:
@@ -10655,7 +14700,7 @@ def cmd_propose(paths, args):
             pattern_id = (
                 base_entry["id"]
                 if base_entry and base_entry["tier"] == 3
-                else next_pattern_id(paths, state, base_entries)
+                else allocate_pattern_id(paths, state, base_entries)
             )
         else:
             evidence = []
@@ -10709,6 +14754,10 @@ def cmd_propose(paths, args):
                 else run_id
             ),
         }
+        settles = parse_settles_argument(getattr(args, "settles", None))
+        if settles:
+            proposal["settles"] = settles
+            check_settlement_targets(paths, state, proposal)
         existing_id, proposal = preflight_proposal(
             paths, state, run_meta, proposal
         )
@@ -10719,12 +14768,13 @@ def cmd_propose(paths, args):
         # Preflight validates the complete current-head binding, exact effect,
         # authority policy, and deterministic residency before any durable write.
         if proposal is not None:
-            begin_authority_write(
+            begin_scoped_authority_write(
                 paths,
                 state,
-                allow_degraded=True,
-                operation="propose",
+                "propose",
                 run_id=run_id,
+                dependencies=legacy_preflight_dependencies(base_entry),
+                allow_degraded=True,
                 scope={
                     "proposal_ids": [proposal_id],
                     "proposal_hashes": {
@@ -10788,12 +14838,13 @@ def cmd_sync(paths, run_id):
         state = load_or_initialize(paths)
         sync_generated_view(paths, state)
         require_active_run(paths, state, run_id)
-        begin_authority_write(
+        begin_scoped_authority_write(
             paths,
             state,
-            operation="sync",
+            "sync",
             run_id=run_id,
             scope={"run_id": run_id},
+            dependencies=run_cold_base_dependencies(paths, state, run_id),
         )
         results = process_run_proposals(paths, state, run_id)
         state["active_runs"][run_id]["base_revision"] = state["head_revision"]
@@ -10814,11 +14865,38 @@ def cmd_sync(paths, run_id):
         f"new concurrent conflicts {counts['new-conflict']}, "
         f"agent-action failures {counts['agent-action']}."
     )
+    for notice in new_self_cooled_notices(results):
+        print(notice)
     return results
 
 
+def run_owns_undecided_work(paths, run_id):
+    """True when one of the run's own proposals has no final decision.
+
+    Lists only ``proposals/<run>-Q*.json`` (the one-run prefix
+    ``process_run_proposals`` already globs) and reads each proposal's
+    decision by exact path. No decision, an ``applying`` decision or one
+    that cannot be read all count as undecided (section 01 5.2).
+    """
+    for path in sorted(paths.proposals.glob(f"{run_id}-Q*.json")):
+        proposal_id = path.name[: -len(".json")]
+        if not PROPOSAL_RE.fullmatch(proposal_id):
+            continue
+        dpath = decision_path(paths, proposal_id)
+        if path_is_redirected(dpath) or not dpath.is_file():
+            return True
+        try:
+            outcome = read_json_strict(dpath, dpath.name).get("outcome")
+        except (BimriError, OSError, UnicodeError, ValueError, TypeError, AttributeError):
+            return True
+        if not isinstance(outcome, str) or outcome == "applying":
+            return True
+    return False
+
+
 def cmd_close(paths, run_id=None, actor=None, session=None,
-              outcome="partial", summary=None, allow_unmapped=False):
+              outcome="partial", summary=None, allow_unmapped=False,
+              from_hook=False):
     if outcome not in OUTCOMES:
         raise BimriError("outcome must be success, partial, overflow or fail.")
     summary = clean_scalar(
@@ -10827,7 +14905,8 @@ def cmd_close(paths, run_id=None, actor=None, session=None,
     )
     with engine_lock(paths):
         state = load_or_initialize(paths)
-        sync_generated_view(paths, state)
+        if load_live_save_marker(paths) is None:
+            sync_generated_view(paths, state)
         rid = resolve_run_from_args(
             state,
             run_id,
@@ -10837,7 +14916,13 @@ def cmd_close(paths, run_id=None, actor=None, session=None,
         )
         if rid is None:
             return None
+        refuse_lifecycle_write_under_authority_marker(paths)
         log = require_active_run(paths, state, rid)
+        if from_hook and run_owns_undecided_work(paths, rid):
+            # A SessionEnd hook never applies (or contests) staged work it
+            # cannot show anyone: the run stays active and mapped for the
+            # owner's word (recover-run), silently (section 01 5.2).
+            return None
         text = log.read_text(encoding="utf-8")
         _conflicts, authority_issues = governance_snapshot(paths, state)
         if authority_issues:
@@ -10849,12 +14934,13 @@ def cmd_close(paths, run_id=None, actor=None, session=None,
             paths, rid, text
         )
         if authority_close:
-            begin_authority_write(
+            begin_scoped_authority_write(
                 paths,
                 state,
-                operation="close-authority-run",
+                "close-authority-run",
                 run_id=rid,
                 scope={"run_id": rid},
+                dependencies=run_cold_base_dependencies(paths, state, rid),
             )
             results = process_run_proposals(paths, state, rid)
         else:
@@ -10930,16 +15016,3492 @@ def cmd_close(paths, run_id=None, actor=None, session=None,
         f"BIMRI: run {rid} closed."
         + (" Memory: " + "; ".join(detail) + "." if detail else "")
     )
+    for notice in new_self_cooled_notices(results):
+        print(notice)
     return rid
 
 
-def cmd_recover_run(paths, run_id, outcome, summary):
-    return cmd_close(
-        paths,
-        run_id=validate_fixed_id(run_id, RUN_RE, "run ID"),
-        outcome=outcome,
-        summary=clean_scalar(summary, "recovery summary", 1000),
+def initial_legacy_log(run_id, started_at, actor, base_revision):
+    return (
+        f"# Run {run_id} | {started_at} | actor:{actor} | base:V{base_revision:06d}\n\n"
+        "## Journal\n\n<!-- Use the host-only argv_prefix recorded in "
+        f".bimri/runtime.local.json with `journal --run {run_id} --text \"...\"` "
+        "for durable detail. -->\n\n## Proposals\n\n## Outcome\n\n"
     )
+
+
+def settlement_path(paths, held_id):
+    validate_fixed_id(held_id, PROPOSAL_RE, "held proposal ID")
+    return paths.settlements / (held_id + ".json")
+
+
+def held_candidate(paths, state, held_id):
+    file = decision_path(paths, held_id)
+    if path_is_redirected(file) or not file.is_file():
+        raise BimriError(f"{held_id} has no safe held decision.")
+    decision = validate_decision(read_json_strict(file, file.name), held_id)
+    if decision["outcome"] != "held":
+        raise BimriError(f"{held_id} is not a held candidate.")
+    return authority_proposal(paths, state, held_id), decision
+
+
+def verify_settling_proposal(proposal, candidate, held):
+    if proposal["key"] != candidate["key"]:
+        raise BimriError(f"candidate {candidate['proposal_id']} belongs to a different key.")
+    if proposal["operation"] not in {"set", "close"}:
+        raise BimriError("only a set or close can settle a held proposal.")
+    if (held.get("reason") in {"confirmed-user-authority-required", "tier1-human-authority-required"}
+            and (proposal.get("source"), proposal.get("trust")) != ("user", "confirmed")):
+        raise BimriError("settling this held decision requires confirmed owner authority.")
+
+
+def check_settlement_targets(paths, state, proposal):
+    for pid in proposal.get("settles", []):
+        candidate, held = held_candidate(paths, state, pid)
+        verify_settling_proposal(proposal, candidate, held)
+        file = settlement_path(paths, pid)
+        if file.exists() or path_is_redirected(file):
+            raise BimriError(f"candidate {pid} is already settled or its record is unsafe.")
+
+
+def read_settlement(paths, state, pid):
+    file = settlement_path(paths, pid)
+    data = read_json_strict(file, file.name)
+    fields = {"settlement_schema", "bimri_version", "held_proposal_id", "settled_by",
+              "settling_request_id", "authority", "summary", "recorded_at",
+              "revision", "settlement_hash"}
+    if (not isinstance(data, dict) or set(data) != fields or data["settlement_schema"] != 1
+            or data["held_proposal_id"] != pid or data["bimri_version"] != MEMORY_FORMAT_VERSION
+            or data["settlement_hash"] != audit_record_seal(data, "settlement_hash")):
+        raise BimriError(f"invalid settlement for {pid}; preserve and move aside its damaged file.")
+    candidate, held = held_candidate(paths, state, pid)
+    revision = validate_revision_number(data["revision"], "settlement")
+    if not held["revision"] <= revision <= state["head_revision"]:
+        raise BimriError("settlement revision is outside accepted history.")
+    clean_scalar(data["summary"], "settlement summary", 1000)
+    parse_timestamp(data["recorded_at"], "settlement time")
+    if data["settled_by"] == "owner-dismissed":
+        if data["authority"] != "human-asserted" or data["settling_request_id"] is not None:
+            raise BimriError("invalid authority on owner dismissal.")
+    else:
+        source_id = validate_fixed_id(data["settled_by"], PROPOSAL_RE, "settling proposal ID")
+        source = authority_proposal(paths, state, source_id)
+        decision = validate_decision(read_json_strict(decision_path(paths, source_id), source_id), source_id)
+        if (decision["outcome"] not in {"accepted", "noop"} or decision["revision"] != revision
+                or pid not in source.get("settles", ()) or data["authority"] != "engine"
+                or data["settling_request_id"] != source.get("request_id")):
+            raise BimriError("settlement has no matching accepted proposal.")
+        verify_settling_proposal(source, candidate, held)
+    return data
+
+
+def settlement_record(pid, source, request_id, summary, revision, timestamp):
+    record = {"settlement_schema": 1, "bimri_version": MEMORY_FORMAT_VERSION,
+              "held_proposal_id": pid, "settled_by": source, "settling_request_id": request_id,
+              "authority": "human-asserted" if source == "owner-dismissed" else "engine",
+              "summary": summary, "recorded_at": timestamp, "revision": revision}
+    record["settlement_hash"] = audit_record_seal(record, "settlement_hash")
+    return record
+
+
+def settle_from_proposal(paths, state, proposal, decision, request_id=None):
+    settled = []
+    if decision.get("outcome") not in {"accepted", "noop"}:
+        return settled
+    source = proposal["proposal_id"]
+    for pid in proposal.get("settles", []):
+        file = settlement_path(paths, pid)
+        if not file.exists():
+            candidate, held = held_candidate(paths, state, pid)
+            verify_settling_proposal(proposal, candidate, held)
+            record = settlement_record(
+                pid, source, request_id, f"settled by {source} for {proposal['key']}",
+                decision["revision"], decision["recorded_at"],
+            )
+            ensure_directory_durable(paths.settlements)
+            exclusive_write_text(file, json.dumps(record, indent=2, sort_keys=True) + "\n")
+        if read_settlement(paths, state, pid)["settled_by"] == source:
+            settled.append(pid)
+    return settled
+
+
+def owner_cleanup_scope(paths, state, proposal_ids, declared):
+    """Bind the accepted head and the named immutable inputs before owner cleanup."""
+    dependencies = {_scoped_revision_path(state["head_revision"])}
+    for pid in proposal_ids:
+        dependencies.update({f".bimri/proposals/{pid}.json", f".bimri/decisions/{pid}.json"})
+    return {
+        "declared_paths": sorted(declared),
+        "dependency_hashes": {
+            relative: scoped_protected_file_hash(paths, relative)
+            for relative in sorted(dependencies - set(declared))
+        },
+    }
+
+
+def owner_cleanup_checkpoint(paths, state, marker):
+    checkpoint = load_scoped_checkpoint(paths, marker)
+    if authority_transition_state_issues(marker, state):
+        raise BimriError("the store state changed during owner cleanup; run doctor.")
+    for relative, digest in checkpoint["dependency_hashes"].items():
+        if (checkpoint["m0_by_path"].get(relative, "absent") != digest
+                or scoped_protected_file_hash(paths, relative) != digest):
+            raise BimriError(f"owner cleanup found changed input {relative}; run doctor.")
+    validate_checkpoint_head(paths, state)
+    return checkpoint
+
+
+def check_owner_cleanup_output(paths, checkpoint, path, expected):
+    relative = path.relative_to(paths.root).as_posix()
+    if relative not in checkpoint["declared_paths"] or relative in checkpoint["m0_by_path"]:
+        raise BimriError(f"owner cleanup cannot create {relative} under this checkpoint.")
+    if scoped_protected_file_hash(paths, relative) not in {"absent", sha256_bytes(expected)}:
+        raise BimriError(f"owner cleanup found unexpected contents in {relative}; run doctor.")
+
+
+def publish_owner_cleanup(paths, state, checkpoint):
+    if not publish_scoped_checkpoint(paths, state, checkpoint["m0"], checkpoint["f0"]):
+        raise BimriError("could not publish the completed owner cleanup; retry recovery.")
+    paths.authority_write_mode = paths.authority_write_audit_healthy = False
+    end_scoped_write_recording(paths)
+    return state
+
+
+def finish_dismiss_held(paths, state, marker):
+    record = marker["scope"]["dismissal"]
+    pid = record["held_proposal_id"]
+    file = settlement_path(paths, pid)
+    held_candidate(paths, state, pid)
+    encoded = (json.dumps(record, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    checkpoint = owner_cleanup_checkpoint(paths, state, marker)
+    check_owner_cleanup_output(paths, checkpoint, file, encoded)
+    state["bimri_version"] = STATE_FORMAT_VERSION
+    state["_audit_epoch"] = marker["epoch_after"]
+    save_state(paths, state)
+    ensure_directory_durable(paths.settlements)
+    if not file.exists():
+        exclusive_write_bytes(file, encoded)
+    read_settlement(paths, state, pid)
+    return publish_owner_cleanup(paths, state, checkpoint)
+
+
+def cmd_dismiss_held(paths, pid, summary, human_approved):
+    if not human_approved:
+        raise BimriError("dismiss-held requires --human-approved on the owner's word.")
+    pid = validate_fixed_id(pid, PROPOSAL_RE, "held proposal ID")
+    summary = clean_scalar(summary, "dismissal summary", 1000)
+    with engine_lock(paths):
+        state = load_or_initialize(paths)
+        held_candidate(paths, state, pid)
+        if settlement_path(paths, pid).exists():
+            existing = read_settlement(paths, state, pid)
+            print(f"{pid} already settled by {existing['settled_by']}.")
+            return
+        if load_audit_transition(paths) is not None:
+            raise BimriError("an earlier write is unfinished; run doctor before dismissal.")
+        scope = {"proposal_ids": [pid], "settles": [pid],
+                 "dismissal": settlement_record(pid, "owner-dismissed", None, summary,
+                                               state["head_revision"], now_iso())}
+        scope.update(owner_cleanup_scope(paths, state, [pid], [f".bimri/settlements/{pid}.json"]))
+        begin_scoped_authority_write(paths, state, "dismiss-held", scope=scope, require_transition=True)
+        finish_dismiss_held(paths, state, load_audit_transition(paths))
+    print(f"{pid} dismissed on the owner's word.")
+
+
+def legacy_cleanup_inputs(paths, state, run_id):
+    if run_id not in state["active_runs"]:
+        raise BimriError(f"{run_id} is not an active run.")
+    files = sorted(paths.proposals.glob(f"{run_id}-Q*.json"))
+    log = run_log_path(paths, run_id)
+    if path_is_redirected(log) or (log.exists() and not log.is_file()) or (files and not log.exists()):
+        raise BimriError(f"{run_id} log is missing or unsafe; run doctor.")
+    references = set()
+    if log.exists():
+        references.update(match.group("proposal_id") for match in
+                          LOG_PROPOSAL_RE.finditer(log.read_text(encoding="utf-8")))
+    facts = checkpoint_facts(paths, state) or {}
+    references.update(row["proposal_id"] for row in facts.get("run_facts", ()) if row["run_id"] == run_id)
+    missing = references - {file.stem for file in files}
+    if missing:
+        raise BimriError(f"{run_id} refers to missing proposal {min(missing)}; run doctor.")
+    records = []
+    for file in files:
+        proposal = authority_proposal(paths, state, file.stem)
+        decision_file = decision_path(paths, file.stem)
+        if path_is_redirected(decision_file):
+            raise BimriError(f"unsafe decision for {file.stem}")
+        decision = (
+            validate_decision(read_json_strict(decision_file, file.stem), file.stem)
+            if decision_file.exists() else None
+        )
+        records.append((proposal, decision))
+    return records
+
+
+def abandon_scope(paths, state, run_id, records, outcome, summary):
+    """Freeze the owner's exact decision set and expected run-log append."""
+    log = run_log_path(paths, run_id)
+    if path_is_redirected(log) or (log.exists() and not log.is_file()):
+        raise BimriError(f"{run_id} log is unsafe.")
+    original = log.read_bytes() if log.exists() else None
+    if original is None and records:
+        raise BimriError(f"{run_id} log is missing; run doctor.")
+    meta = state["active_runs"][run_id]
+    append = ""
+    if original is None:
+        append = initial_legacy_log(run_id, meta["started_at"], meta["actor"],
+                                    meta["base_revision"])
+    text = (original or b"").decode("utf-8")
+    if any(line.startswith("[CLOSED:") for line in text.splitlines()):
+        raise BimriError(f"{run_id} already has a close record; run doctor.")
+    referenced = {m.group("proposal_id") for m in LOG_PROPOSAL_RE.finditer(text)}
+    undecided = []
+    for proposal, decision in records:
+        pid = proposal["proposal_id"]
+        if decision is not None and decision["outcome"] == "applying":
+            raise BimriError(f"{pid} is applying; finish the interrupted write first.")
+        if decision is None:
+            undecided.append(pid)
+        if pid not in referenced:
+            append += (f"[PROPOSE:{pid}] [{proposal['operation']}] [K:{proposal['key']}] "
+                       f"[BASE:{proposal['base_hash']}] {proposal['text']}\n")
+    closed_at = now_iso()
+    append += f"[OUTCOME:{outcome}] {summary}\n[CLOSED:{run_id} {closed_at}]\n"
+    return {
+        "proposal_ids": [p["proposal_id"] for p, _ in records],
+        **owner_cleanup_scope(paths, state, [p["proposal_id"] for p, _ in records],
+                              [f".bimri/decisions/{pid}.json" for pid in undecided]),
+        "undecided": undecided, "owner_summary": summary, "close_at": closed_at,
+        "before_log": sha256_bytes(original) if original is not None else "absent",
+        "after_log": sha256_bytes((original or b"") + append.encode("utf-8")),
+        "append_log": append,
+    }
+
+
+def finish_abandon_run(paths, state, marker):
+    """Replay only the effects attested before this legacy cleanup began."""
+    scope = marker["scope"]
+    rid = validate_fixed_id(marker["run_id"], RUN_RE, "cleanup run ID")
+    checkpoint = owner_cleanup_checkpoint(paths, state, marker)
+    decisions = []
+    for pid in scope["undecided"]:
+        if pid not in scope["proposal_ids"] or not pid.startswith(rid + "-"):
+            raise BimriError("legacy cleanup decision is outside its named run.")
+        path = decision_path(paths, pid)
+        record = {
+            "bimri_version": MEMORY_FORMAT_VERSION, "proposal_id": pid,
+            "outcome": "abandoned", "recorded_at": scope["close_at"],
+            "authority": "human-asserted", "summary": scope["owner_summary"],
+            "revision": state["head_revision"], "engine_release": ENGINE_VERSION,
+        }
+        encoded = (json.dumps(record, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        check_owner_cleanup_output(paths, checkpoint, path, encoded)
+        decisions.append((path, encoded))
+    log = run_log_path(paths, rid)
+    if path_is_redirected(log):
+        raise BimriError(f"{rid} log is unsafe.")
+    before = log.read_bytes() if log.exists() else None
+    digest = sha256_bytes(before) if before is not None else "absent"
+    if digest not in (scope["before_log"], scope["after_log"]):
+        raise BimriError(f"{rid} log changed during cleanup; run doctor.")
+    state["bimri_version"] = STATE_FORMAT_VERSION
+    state["_audit_epoch"] = marker["epoch_after"]
+    for path, encoded in decisions:
+        if not path.exists():
+            exclusive_write_bytes(path, encoded)
+    if digest != scope["after_log"]:
+        atomic_write_bytes(log, (before or b"") + scope["append_log"].encode("utf-8"))
+    state["active_runs"].pop(rid, None)
+    state["session_runs"] = {k: v for k, v in state["session_runs"].items() if v != rid}
+    state["last_closed_at"] = scope["close_at"]
+    save_state(paths, state)
+    return publish_owner_cleanup(paths, state, checkpoint)
+
+
+def cmd_recover_run(paths, run_ids, outcome, summary, abandon=False,
+                    all_orphans=False, dry_run=False, human_approved=False):
+    summary = clean_scalar(summary, "recovery summary", 1000)
+    if isinstance(run_ids, str):
+        run_ids = [run_ids]
+    run_ids = list(dict.fromkeys(validate_fixed_id(r, RUN_RE, "run ID")
+                                for r in (run_ids or [])))
+    if bool(run_ids) == bool(all_orphans):
+        raise BimriError("name one or more --run values or use --all-orphans.")
+    if (dry_run or all_orphans) and not abandon:
+        raise BimriError("--dry-run and --all-orphans require --abandon.")
+    if not abandon:
+        for rid in run_ids:
+            cmd_close(paths, run_id=rid, outcome=outcome, summary=summary)
+        return
+    if not dry_run and not human_approved:
+        raise BimriError("--abandon requires --human-approved on the owner's word.")
+    with existing_store_lock(paths):
+        state = load_current_state_read_only(paths, allow_checkpoint=True)
+        selected = orphan_candidates(state) if all_orphans else run_ids
+        for rid in selected:
+            records = legacy_cleanup_inputs(paths, state, rid)
+            if dry_run:
+                for proposal, decision in records:
+                    if decision is None or decision["outcome"] == "applying":
+                        prefix = "APPLYING: " if decision else ""
+                        print(f"{rid}\t{proposal['proposal_id']}\t{proposal['key']}\t"
+                              + prefix + proposal["text"][:120])
+                continue
+            scope = abandon_scope(paths, state, rid, records, outcome, summary)
+            if load_audit_transition(paths) is not None:
+                raise BimriError("an earlier write is unfinished; run doctor before cleanup.")
+            begin_scoped_authority_write(paths, state, "abandon-run", run_id=rid,
+                                         scope=scope, require_transition=True)
+            state = finish_abandon_run(paths, state, load_audit_transition(paths))
+            print(f"BIMRI: run {rid} closed. Memory: abandoned {len(scope['undecided'])}.")
+        if dry_run:
+            print(f"Dry run: {len(selected)} run(s) inspected.")
+
+
+# ---------------------------------------------------------------------------
+# v5.2 save: one memory change as one engine-owned operation (D1.2, D2.1,
+# D2.9, D3.1-D3.5). A durable ticket is admitted before anything is
+# allocated; proposal, decision, effect and close then run under one live
+# `save` transition marker, and every step is create-if-missing or verified,
+# so the next invocation continues an interrupted save at its first missing
+# boundary (D3.4.4).
+# ---------------------------------------------------------------------------
+
+RESERVED_REQUEST_STEMS = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{number}" for number in range(1, 10)}
+    | {f"lpt{number}" for number in range(1, 10)}
+)
+REQUEST_ID_ERROR = "request id must be 1-100 characters of a-z 0-9 . _ -"
+OBSERVED_TOKEN_ERROR = (
+    "observed token must be V######:hot|cold|head:<64hex> or V######:absent"
+)
+SAVE_DECISION_OUTCOMES = {
+    "accepted": "accepted",
+    "noop": "unchanged",
+    "held": "held",
+    "contested": "conflict",
+    "abandoned": "failed",
+}
+UNFINISHED_SAVE_LIMIT = 5
+
+
+class SaveWedged(BimriError):
+    """A live save the ladder cannot continue (D3.4.4 R0c)."""
+
+
+class SaveStoreRefusal(BimriError):
+    """An environmental refusal (L4): the store, not the request, says no."""
+
+
+def clean_request_id(value):
+    """The caller's request identity, lowercased (D2.1)."""
+    if not isinstance(value, str):
+        raise BimriError(REQUEST_ID_ERROR)
+    candidate = value.strip().lower()
+    if not candidate or len(candidate) > 100 or not REQUEST_ID_RE.fullmatch(
+        candidate
+    ):
+        raise BimriError(REQUEST_ID_ERROR)
+    if candidate.split(".", 1)[0] in RESERVED_REQUEST_STEMS:
+        # A Windows device stem would name a device, never a ticket file.
+        raise BimriError("request id is a reserved filename")
+    return candidate
+
+
+def parse_observed_token(value):
+    """Parse one version token (D3.1); a prefix hash is never accepted."""
+    match = (
+        OBSERVED_TOKEN_RE.fullmatch(value) if isinstance(value, str) else None
+    )
+    if match is None:
+        raise BimriError(OBSERVED_TOKEN_ERROR)
+    revision = int(match.group("revision"))
+    if match.group("absent"):
+        return {
+            "token": value, "revision": revision, "storage": "absent",
+            "key_hash": "absent",
+        }
+    return {
+        "token": value,
+        "revision": revision,
+        "storage": match.group("storage"),
+        "key_hash": match.group("hash"),
+    }
+
+
+def render_observed_token(observed):
+    if observed["storage"] == "absent":
+        return f"V{observed['revision']:06d}:absent"
+    return (
+        f"V{observed['revision']:06d}:{observed['storage']}:"
+        f"{observed['key_hash']}"
+    )
+
+
+def subject_token(head_revision, entry):
+    """The version token of one current subject (or its absence)."""
+    if entry is None:
+        return f"V{head_revision:06d}:absent"
+    storage = "cold" if entry.get("storage") == "cold" else "hot"
+    return f"V{head_revision:06d}:{storage}:{line_hash(entry['raw'])}"
+
+
+def current_subject_token(paths, state, key):
+    content = revision_path(paths, state["head_revision"]).read_text(
+        encoding="utf-8"
+    )
+    _, entries, errors = parse_hot(content)
+    if errors:
+        raise BimriError(
+            "cannot read the current subject from malformed memory: "
+            + "; ".join(errors)
+        )
+    return subject_token(
+        state["head_revision"], find_current_entry(entries, state, key)
+    )
+
+
+def parse_settles_argument(value):
+    if value is None:
+        return []
+    found = set()
+    for item in str(value).split(","):
+        item = item.strip()
+        if not item:
+            raise BimriError("--settles requires a proposal ID in each comma-separated position.")
+        found.add(validate_fixed_id(item, PROPOSAL_RE, "settled proposal ID"))
+    return sorted(found)
+
+
+def _optional_intent_text(value, name, cap):
+    if value is None:
+        return None
+    if not isinstance(value, str) or clean_scalar(value, name, cap) != value:
+        raise BimriError(f"save intent {name} is invalid.")
+    return value
+
+
+def validate_save_intent(intent):
+    """The exact nineteen-key intent of D2.1 (the caller's words only)."""
+    if not isinstance(intent, dict) or set(intent) != set(SAVE_INTENT_FIELDS):
+        raise BimriError("save intent fields are invalid.")
+    if intent["operation"] not in OPERATIONS:
+        raise BimriError("save intent operation is invalid.")
+    if not isinstance(intent["new_subject"], bool):
+        raise BimriError("save intent new_subject is invalid.")
+    if intent["new_subject"] and intent["operation"] != "set":
+        raise BimriError("--new-subject is valid only with set.")
+    tier = intent["tier"]
+    if tier is not None and (isinstance(tier, bool) or tier not in (1, 2, 3)):
+        raise BimriError("save intent tier is invalid.")
+    if not isinstance(intent["key"], str) or clean_key(intent["key"]) != intent[
+        "key"
+    ]:
+        raise BimriError("save intent key is invalid.")
+    target = intent["target"]
+    if target is not None and (
+        not isinstance(target, str) or not MEMORY_ID_RE.fullmatch(target)
+    ):
+        raise BimriError("save intent target is invalid.")
+    if intent["kind"] is not None and intent["kind"] not in TIER1_KINDS:
+        raise BimriError("save intent kind is invalid.")
+    importance = intent["importance"]
+    if importance is not None and (
+        isinstance(importance, bool)
+        or not isinstance(importance, int)
+        or importance not in range(1, 6)
+    ):
+        raise BimriError("save intent importance is invalid.")
+    if intent["status"] is not None and intent["status"] not in TIER2_STATUSES:
+        raise BimriError("save intent status is invalid.")
+    if intent["trust"] not in AUTHORABLE_TRUSTS:
+        raise BimriError("save intent trust is invalid.")
+    if intent["source"] not in SAVE_SOURCES:
+        raise BimriError("save intent source is invalid.")
+    if intent["trust"] == "confirmed" and intent["source"] != "user":
+        raise BimriError(
+            "only a direct owner statement (--source user) may be confirmed."
+        )
+    tags = intent["tags"]
+    if not isinstance(tags, list) or clean_tags(tags) != tags:
+        raise BimriError("save intent tags are invalid.")
+    _optional_intent_text(intent["text"], "memory text", 4000)
+    _optional_intent_text(intent["rationale"], "proposal rationale", 4000)
+    _optional_intent_text(intent["evidence"], "evidence", 4000)
+    _optional_intent_text(intent["falsifier"], "falsifier", 500)
+    if (
+        intent["confidence"] is not None
+        and intent["confidence"] not in PATTERN_CONFIDENCE
+    ):
+        raise BimriError("save intent confidence is invalid.")
+    observations = intent["observations"]
+    if observations is not None and (
+        isinstance(observations, bool)
+        or not isinstance(observations, int)
+        or observations < 1
+    ):
+        raise BimriError("--observations must be a positive integer.")
+    settles = intent["settles"]
+    if (
+        not isinstance(settles, list)
+        or settles != sorted(set(settles))
+        or any(
+            not isinstance(item, str) or not PROPOSAL_RE.fullmatch(item)
+            for item in settles
+        )
+    ):
+        raise BimriError("save intent settled candidates are invalid.")
+    parse_observed_token(intent["observed"])
+    return intent
+
+
+def build_save_intent(args, observed):
+    """Intent = the caller's words; an omitted flag is null, never inherited."""
+    if args.target:
+        validate_fixed_id(args.target, MEMORY_ID_RE, "target ID")
+    if args.new_subject and args.operation != "set":
+        raise BimriError("--new-subject is valid only with set.")
+    if args.trust == "confirmed" and args.source != "user":
+        raise BimriError(
+            "only a direct owner statement (--source user) may be confirmed."
+        )
+
+    def text(value, name, cap):
+        return None if value is None else clean_scalar(value, name, cap)
+
+    intent = {
+        "operation": args.operation,
+        "new_subject": bool(args.new_subject),
+        "tier": args.tier,
+        "key": clean_key(args.key),
+        "target": args.target or None,
+        "kind": args.kind,
+        "importance": args.importance,
+        "status": args.status,
+        "trust": args.trust,
+        "source": args.source,
+        "tags": clean_tags(args.tags) if args.tags is not None else [],
+        "text": text(args.text, "memory text", 4000),
+        "rationale": text(args.rationale, "proposal rationale", 4000),
+        "confidence": args.confidence,
+        "observations": args.observations,
+        "evidence": text(args.evidence, "evidence", 4000),
+        "falsifier": text(args.falsifier, "falsifier", 500),
+        "settles": parse_settles_argument(args.settles),
+        "observed": observed["token"],
+    }
+    return validate_save_intent(intent)
+
+
+# ---- the ticket (D2.1) -----------------------------------------------------
+
+
+def save_ticket_path(paths, request_id, directory):
+    base = paths.saves_open if directory == "open" else paths.saves_done
+    return base / f"{request_id}.json"
+
+
+def seal_save_ticket(ticket):
+    sealed = dict(ticket)
+    sealed.pop("ticket_hash", None)
+    sealed["ticket_hash"] = audit_record_seal(sealed, "ticket_hash")
+    return sealed
+
+
+def _validate_ticket_timestamp(value, name):
+    if not isinstance(value, str):
+        raise BimriError(f"save ticket {name} is invalid.")
+    parse_timestamp(value, f"save ticket {name}")
+
+
+def validate_save_result(result):
+    if not isinstance(result, dict) or set(result) != SAVE_RESULT_FIELDS:
+        raise BimriError("save ticket result fields are invalid.")
+    if result["outcome"] not in SAVE_OUTCOMES:
+        raise BimriError("save ticket result outcome is invalid.")
+    if result["decision"] not in SAVE_RESULT_DECISIONS:
+        raise BimriError("save ticket result decision is invalid.")
+    revision = result["revision"]
+    if revision is not None:
+        validate_revision_number(revision, "save ticket result")
+    conflict_id = result["conflict_id"]
+    if conflict_id is not None and (
+        not isinstance(conflict_id, str) or not CONFLICT_RE.fullmatch(conflict_id)
+    ):
+        raise BimriError("save ticket result conflict is invalid.")
+    for field in ("reason", "error"):
+        value = result[field]
+        if value is not None and not isinstance(value, str):
+            raise BimriError(f"save ticket result {field} is invalid.")
+    token = result["token"]
+    if token is not None:
+        parse_observed_token(token)
+    for field in ("settled", "cooled"):
+        value = result[field]
+        if not isinstance(value, list) or any(
+            not isinstance(item, str) for item in value
+        ):
+            raise BimriError(f"save ticket result {field} is invalid.")
+    return result
+
+
+def validate_save_ticket(paths, record, expected_id, directory):
+    """Exact field set, seal and directory/status agreement (D2.1)."""
+    del paths
+    if not isinstance(record, dict) or set(record) != SAVE_TICKET_FIELDS:
+        raise BimriError("save ticket fields are invalid.")
+    if record["ticket_schema"] != SAVE_TICKET_SCHEMA:
+        raise BimriError("save ticket schema is unsupported.")
+    if record["bimri_version"] not in COMPATIBLE_ARTIFACT_VERSIONS:
+        raise BimriError("save ticket BIMRI version is invalid.")
+    if record["engine_release"] not in {
+        ENGINE_VERSION,
+        V5_1_2_ENGINE_VERSION,
+        V5_1_1_ENGINE_VERSION,
+        V5_1_0_ENGINE_VERSION,
+    }:
+        raise BimriError("save ticket engine release is invalid.")
+    request_id = record["request_id"]
+    if request_id != expected_id or clean_request_id(request_id) != request_id:
+        raise BimriError("save ticket request id does not match its file.")
+    if not isinstance(record["actor"], str) or not ACTOR_RE.fullmatch(
+        record["actor"]
+    ):
+        raise BimriError("save ticket actor is invalid.")
+    status = record["status"]
+    if status not in {"admitted", "finished"}:
+        raise BimriError("save ticket status is invalid.")
+    if (directory == "open") != (status == "admitted"):
+        raise BimriError(
+            f"save ticket status {status} does not belong in {directory}/."
+        )
+    _validate_ticket_timestamp(record["created_at"], "created_at")
+    _validate_ticket_timestamp(record["updated_at"], "updated_at")
+    try:
+        if not isinstance(record["started_on"], str):
+            raise ValueError(record["started_on"])
+        dt.date.fromisoformat(record["started_on"])
+    except ValueError as exc:
+        raise BimriError("save ticket start date is invalid.") from exc
+    intent = validate_save_intent(record["intent"])
+    if record["intent_hash"] != audit_witness_digest(intent):
+        raise BimriError("save ticket intent hash does not match its intent.")
+    observed = record["observed"]
+    if not isinstance(observed, dict) or set(observed) != {
+        "token", "revision", "storage", "key_hash",
+    }:
+        raise BimriError("save ticket observation is invalid.")
+    if (
+        parse_observed_token(observed["token"]) != observed
+        or render_observed_token(observed) != observed["token"]
+        or intent["observed"] != observed["token"]
+    ):
+        raise BimriError("save ticket observation is invalid.")
+    planned = [record[field] for field in SAVE_PLAN_FIELDS]
+    if any(value is None for value in planned) and any(
+        value is not None for value in planned
+    ):
+        raise BimriError("save ticket plan is partial.")
+    if record["run_id"] is not None:
+        run_id = validate_fixed_id(record["run_id"], RUN_RE, "save ticket run")
+        if (
+            not isinstance(record["proposal_id"], str)
+            or not PROPOSAL_RE.fullmatch(record["proposal_id"])
+            or not record["proposal_id"].startswith(run_id + "-Q")
+            or not isinstance(record["entry_id"], str)
+            or not ENTRY_RE.fullmatch(record["entry_id"])
+            or not record["entry_id"].startswith(run_id + "-E")
+        ):
+            raise BimriError("save ticket planned ids are invalid.")
+        validate_revision_number(record["revision"], "save ticket planned")
+        months = record["archive_months"]
+        if (
+            not isinstance(months, list)
+            or not months
+            or months != sorted(set(months))
+            or any(
+                not isinstance(month, str)
+                or not re.fullmatch(r"\d{4}-\d{2}", month)
+                for month in months
+            )
+        ):
+            raise BimriError("save ticket archive months are invalid.")
+        _validate_ticket_timestamp(record["planned_at"], "planned_at")
+        for field in ("proposal_sha256", "log_sha256"):
+            if not isinstance(record[field], str) or not HASH_RE.fullmatch(
+                record[field]
+            ):
+                raise BimriError(f"save ticket {field} is invalid.")
+    if (record["result"] is None) != (status == "admitted"):
+        raise BimriError("save ticket result does not match its status.")
+    if record["result"] is not None:
+        validate_save_result(record["result"])
+    if (record["finished_at"] is None) != (status == "admitted"):
+        raise BimriError("save ticket finish time does not match its status.")
+    if record["finished_at"] is not None:
+        _validate_ticket_timestamp(record["finished_at"], "finished_at")
+    if record["ticket_hash"] != audit_record_seal(record, "ticket_hash"):
+        raise BimriError("save ticket seal does not match its content.")
+    return record
+
+
+def read_save_ticket(paths, request_id, directory):
+    """One ticket, None when absent; an unsafe ticket raises (L3)."""
+    path = save_ticket_path(paths, request_id, directory)
+    if not (path.exists() or path.is_symlink()):
+        return None
+    label = f"save ticket {directory}/{request_id}.json"
+    if path_is_redirected(path) or not path.is_file():
+        raise BimriError(f"{label} is unsafe: not a regular file; move it aside")
+    try:
+        record = read_json_strict(path, label)
+        return validate_save_ticket(paths, record, request_id, directory)
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError) as exc:
+        raise BimriError(f"{label} is unsafe: {exc}; move it aside") from exc
+
+
+def write_save_ticket(paths, ticket):
+    """B1: the admitted ticket, exclusive create in open/."""
+    exclusive_write_text(
+        save_ticket_path(paths, ticket["request_id"], "open"),
+        json.dumps(ticket, indent=2, sort_keys=True) + "\n",
+    )
+
+
+def rewrite_save_ticket(paths, ticket):
+    """R1 re-plan: atomic replace of the admitted ticket (no marker yet)."""
+    atomic_write_json(save_ticket_path(paths, ticket["request_id"], "open"), ticket)
+
+
+def save_ticket_is_refusal(ticket):
+    """A finished failed ticket with no decision records that nothing was
+    allocated; the same request may try again (rule 3a, L15)."""
+    result = ticket.get("result") or {}
+    return (
+        ticket.get("status") == "finished"
+        and result.get("outcome") == "failed"
+        and result.get("decision") is None
+    )
+
+
+def make_save_result(outcome, decision=None, revision=None, conflict_id=None,
+                     reason=None, token=None, cooled=None, error=None, settled=None):
+    return validate_save_result({
+        "outcome": outcome,
+        "decision": decision,
+        "revision": revision,
+        "conflict_id": conflict_id,
+        "reason": reason,
+        "token": token,
+        "settled": sorted(settled or []),
+        "cooled": sorted(cooled or []),
+        "error": error,
+    })
+
+
+def finish_save_ticket(paths, ticket, result, null_plan=False):
+    """B12: exclusive done/ ticket, then the open/ ticket goes."""
+    request_id = ticket["request_id"]
+    now = now_iso()
+    finished = dict(ticket)
+    if null_plan:
+        for field in SAVE_PLAN_FIELDS:
+            finished[field] = None
+    finished.update({
+        "status": "finished",
+        "result": result,
+        "finished_at": now,
+        "updated_at": now,
+    })
+    finished = seal_save_ticket(finished)
+    validate_save_ticket(paths, finished, request_id, "done")
+    done = save_ticket_path(paths, request_id, "done")
+    existing = read_save_ticket(paths, request_id, "done")
+    if existing is None:
+        exclusive_write_text(
+            done, json.dumps(finished, indent=2, sort_keys=True) + "\n"
+        )
+    elif existing["intent_hash"] != ticket["intent_hash"]:
+        raise BimriError(
+            f"save ticket done/{request_id}.json records another request."
+        )
+    elif save_ticket_is_refusal(existing) and not (
+        save_ticket_is_refusal(finished)
+        and existing["result"] == finished["result"]
+    ):
+        # The one replace of a done/ ticket: a refusal that allocated
+        # nothing gives way to this attempt's answer.
+        atomic_write_json(done, finished)
+    else:
+        # This attempt's own answer is already durable (crash after B12a).
+        finished = existing
+    opened = save_ticket_path(paths, request_id, "open")
+    if opened.exists() or opened.is_symlink():
+        remove_protected_file(opened)
+        fsync_directory(opened.parent)
+    return finished
+
+
+def finish_save_refusal(paths, ticket, error):
+    """A refusal that allocated nothing: failed, decision null (L10, L15)."""
+    return finish_save_ticket(
+        paths,
+        ticket,
+        make_save_result("failed", error=str(error)[:2000]),
+        null_plan=True,
+    )
+
+
+def previous_month(month_day):
+    first = dt.date.fromisoformat(month_day).replace(day=1)
+    return (first - dt.timedelta(days=1)).isoformat()[:7]
+
+
+SAVE_RECEIPT_COLUMNS = (
+    "request_id", "intent_hash", "outcome", "run_id", "proposal_id",
+    "revision", "finished_at",
+)
+SAVE_RECEIPTS_NAME_RE = re.compile(r"receipts-(\d{4}-\d{2})\.tsv")
+# D2.7: a finished ticket stays a JSON file while it is this many days old
+# or younger by today(); compaction then moves it into its month's receipts.
+SAVE_TICKET_KEEP_DAYS = 7
+SAVE_RECEIPT_DAMAGE_LIMIT = 20
+
+
+def save_receipts_path(paths, month):
+    return paths.saves / f"receipts-{month}.tsv"
+
+
+def render_save_receipt_line(ticket):
+    """D2.7: one receipts line for a finished ticket.
+
+    Eight tab-separated columns: request id, intent hash, outcome, run,
+    proposal, the result's revision (``V######``), finished_at and the
+    line_hash of the first seven. Absent values render as ``-``.
+    """
+    result = ticket["result"]
+    revision = result["revision"]
+    columns = [
+        ticket["request_id"],
+        ticket["intent_hash"],
+        result["outcome"],
+        ticket["run_id"] or "-",
+        ticket["proposal_id"] or "-",
+        f"V{revision:06d}" if revision is not None else "-",
+        ticket["finished_at"],
+    ]
+    body = "\t".join(columns)
+    return body + "\t" + line_hash(body)
+
+
+def parse_save_receipt_line(line):
+    """The receipt fields of one line, or None when the line is damaged."""
+    columns = line.split("\t")
+    if len(columns) != 8 or line_hash("\t".join(columns[:7])) != columns[7]:
+        return None
+    fields = dict(zip(
+        SAVE_RECEIPT_COLUMNS,
+        [None if value == "-" else value for value in columns[:7]],
+    ))
+    request_id = fields["request_id"]
+    if (
+        request_id is None
+        or not REQUEST_ID_RE.fullmatch(request_id)
+        or fields["intent_hash"] is None
+        or not HASH_RE.fullmatch(fields["intent_hash"])
+        or fields["outcome"] not in SAVE_OUTCOMES
+        or fields["finished_at"] is None
+    ):
+        return None
+    revision = fields["revision"]
+    if revision is not None and not re.fullmatch(r"V?\d{1,9}", revision):
+        return None
+    for name, pattern in (("run_id", RUN_RE), ("proposal_id", PROPOSAL_RE)):
+        if fields[name] is not None and not pattern.fullmatch(fields[name]):
+            return None
+    try:
+        parse_timestamp(fields["finished_at"], "receipt finished_at")
+    except BimriError:
+        return None
+    fields["status"] = "receipt"
+    return fields
+
+
+def read_save_receipt_lines(path):
+    """Lines of one receipts file; [] when absent. A redirected file raises."""
+    if path_is_redirected(path):
+        raise BimriError(
+            f"{path.name} cannot be a symbolic link or reparse point; "
+            "move it aside."
+        )
+    if not path.exists():
+        return []
+    if not path.is_file():
+        raise BimriError(f"{path.name} is not a regular file; move it aside.")
+    return path.read_text(encoding="utf-8").splitlines()
+
+
+def lookup_save_receipt(paths, request_id):
+    """This and the previous month's receipts (D2.7); absent files are fine.
+
+    The window reads only today() (the clock seam). Within one month file
+    the last intact line for the id wins: compaction appends, so a later
+    answer for the same id (a refusal retried and finished) follows the
+    earlier one. A damaged line is skipped, so its id is a new request.
+    """
+    current = today()
+    for month in (current[:7], previous_month(current)):
+        try:
+            lines = read_save_receipt_lines(save_receipts_path(paths, month))
+        except (BimriError, OSError, UnicodeError):
+            continue
+        found = None
+        for line in lines:
+            if not line.startswith(request_id + "\t"):
+                continue
+            fields = parse_save_receipt_line(line)
+            if fields is not None and fields["request_id"] == request_id:
+                found = fields
+        if found is not None:
+            return found
+    return None
+
+
+def lookup_save_ticket(paths, request_id):
+    """D2.7 order: open/<id>, done/<id>, this then last month's receipts."""
+    ticket = read_save_ticket(paths, request_id, "open")
+    if ticket is not None:
+        return "open", ticket
+    ticket = read_save_ticket(paths, request_id, "done")
+    if ticket is not None:
+        return "done", ticket
+    receipt = lookup_save_receipt(paths, request_id)
+    if receipt is not None:
+        return "receipt", receipt
+    return None, None
+
+
+def list_save_ticket_names(paths, directory="open"):
+    base = paths.saves_open if directory == "open" else paths.saves_done
+    if path_is_redirected(base) or not base.is_dir():
+        return []
+    names = []
+    for entry in base.iterdir():
+        if not entry.name.endswith(".json"):
+            continue
+        stem = entry.name[:-5]
+        if REQUEST_ID_RE.fullmatch(stem) and stem.split(".", 1)[0] not in (
+            RESERVED_REQUEST_STEMS
+        ):
+            names.append(stem)
+    return sorted(names)
+
+
+def save_ticket_age_days(ticket, current):
+    """Whole days from a finished ticket's finished_at date to ``current``."""
+    finished_on = dt.date.fromisoformat(ticket["finished_at"][:10])
+    return (current - finished_on).days
+
+
+def compact_save_tickets(paths):
+    """D2.7 ticket compaction, run by `maintain` and a PASSED `doctor`
+    (never by a save).
+
+    Every safe ``done/`` ticket finished more than SAVE_TICKET_KEEP_DAYS
+    days before today() (the engine's one clock seam; never now_iso())
+    becomes one line of ``saves/receipts-<finished_at[:7]>.tsv`` and is then
+    unlinked. Per month, the missing lines are appended by one fsynced
+    append_line, then that month's tickets are unlinked. A crash between
+    the two leaves both: lookup reads done/ first, so the JSON wins, and
+    the next compaction finds the identical line already present and only
+    unlinks. An unsafe ticket is never touched (doctor names it); the live
+    save marker's own ticket is left alone. Returns a summary dict.
+    """
+    summary = {"compacted": 0, "kept": 0, "unsafe": [], "months": []}
+    for directory in (paths.saves, paths.saves_done):
+        if path_is_redirected(directory):
+            raise BimriError(
+                f"{directory.relative_to(paths.root).as_posix()} cannot be a "
+                "symbolic link or reparse point."
+            )
+    if not paths.saves_done.is_dir():
+        return summary
+    current = dt.date.fromisoformat(today())
+    marker = load_live_save_marker(paths)
+    in_flight = (
+        marker["scope"].get("request_id") if marker is not None else None
+    )
+    by_month = {}
+    for name in list_save_ticket_names(paths, "done"):
+        if name == in_flight:
+            summary["kept"] += 1
+            continue
+        try:
+            ticket = read_save_ticket(paths, name, "done")
+        except BimriError:
+            summary["unsafe"].append(name)
+            continue
+        if ticket is None:
+            continue
+        if save_ticket_age_days(ticket, current) <= SAVE_TICKET_KEEP_DAYS:
+            summary["kept"] += 1
+            continue
+        by_month.setdefault(ticket["finished_at"][:7], []).append(
+            (name, render_save_receipt_line(ticket))
+        )
+    for month in sorted(by_month):
+        receipts = save_receipts_path(paths, month)
+        try:
+            present = set(read_save_receipt_lines(receipts))
+        except UnicodeError as exc:
+            # This month's tickets stay JSON (always safe); doctor names
+            # the file and its move-aside remedy.
+            raise BimriError(
+                f"{receipts.name} cannot be read ({exc}); move the file aside."
+            ) from exc
+        missing = []
+        for _name, line in by_month[month]:
+            if line not in present:
+                present.add(line)
+                missing.append(line)
+        if missing:
+            append_line(receipts, missing, tsv=True)
+        try:
+            for name, _line in by_month[month]:
+                remove_protected_file(save_ticket_path(paths, name, "done"))
+                summary["compacted"] += 1
+        finally:
+            fsync_directory(paths.saves_done)
+        summary["months"].append(month)
+    return summary
+
+
+def unfinished_save_line(paths, request_id):
+    """D3.4.2: a ticket-only save is reported, never finished, by a read.
+
+    One small read of the ticket by exact path; a ticket that cannot be read
+    prints ``(admitted unknown)`` (section 06 1.1).
+    """
+    admitted = None
+    path = save_ticket_path(paths, request_id, "open")
+    if not path_is_redirected(path) and path.is_file():
+        try:
+            record = read_json_strict(path, "save ticket")
+        except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+            record = None
+        if isinstance(record, dict):
+            admitted = record.get("created_at")
+    if not isinstance(admitted, str) or not admitted or any(
+        character.isspace() for character in admitted
+    ):
+        admitted = "unknown"
+    prefix = f"Unfinished save: {request_id} (admitted {admitted}); "
+    if paths.wedged_save and paths.wedged_save["request_id"] == request_id:
+        return prefix + "owner recovery required"
+    return prefix + "the next save or doctor finishes it"
+
+
+def unfinished_save_summary(paths, limit=UNFINISHED_SAVE_LIMIT):
+    """Return (admitted tickets in saves/open, at most ``limit`` lines).
+
+    One listing of ``saves/open`` (missing means none) and at most ``limit``
+    small reads, sorted by request id. Reads and status use it; the next
+    save or doctor is what finishes a ticket (D3.4.2).
+    """
+    names = list_save_ticket_names(paths, "open")
+    return len(names), [
+        unfinished_save_line(paths, request_id) for request_id in names[:limit]
+    ]
+
+
+def unfinished_save_lines(paths, limit=UNFINISHED_SAVE_LIMIT):
+    """D3.4.2: reads name an admitted save; the next save or doctor ends it."""
+    return unfinished_save_summary(paths, limit)[1]
+
+
+# ---- planned bytes ---------------------------------------------------------
+
+
+def proposal_file_text(proposal):
+    return json.dumps(proposal, indent=2, sort_keys=True) + "\n"
+
+
+def render_save_log(proposal):
+    """B4: the exact initial run log of a save (D2.9, section 03 4.1)."""
+    return (
+        f"# Run {proposal['run_id']} | {proposal['created_at']} | "
+        f"actor:{proposal['actor']} | base:V{proposal['base_revision']:06d} | "
+        f"save:{proposal['request_id']}\n\n"
+        "## Journal\n\n"
+        f"[ID:{proposal['entry_id']}] [I:{proposal['importance']}] "
+        f"{proposal['rationale']}\n\n"
+        "## Proposals\n\n"
+        f"[PROPOSE:{proposal['proposal_id']}] [{proposal['operation']}] "
+        f"[K:{proposal['key']}] [BASE:{proposal['base_hash']}] "
+        f"{proposal['text']}\n\n"
+        "## Outcome\n\n"
+    )
+
+
+def save_outcome_line(request_id, outcome, summary=None):
+    if outcome == "failed":
+        return f"[OUTCOME:fail] {summary or 'save cancelled'}"
+    status = "success" if outcome in {"accepted", "unchanged"} else "partial"
+    return f"[OUTCOME:{status}] save {request_id} {outcome}"
+
+
+def plan_save_run(paths, state, after=0):
+    """L6: the next free run id from run_count, the checkpoint's run
+    watermark when one is in hand (D3.2), and an exists loop (no glob)."""
+    facts = checkpoint_facts(paths, state)
+    watermark = facts["watermarks"]["run"] if facts is not None else 0
+    number = max(state["run_count"], after, watermark) + 1
+    while True:
+        if number > 999999:
+            raise BimriError("BIMRI has exhausted its six-digit run ID space.")
+        run_id = f"R{number:06d}"
+        if not save_run_is_taken(paths, run_id):
+            return run_id
+        number += 1
+
+
+def save_run_is_taken(paths, run_id):
+    candidates = (
+        run_log_path(paths, run_id),
+        proposal_path(paths, f"{run_id}-Q001"),
+        decision_path(paths, f"{run_id}-Q001"),
+    )
+    return any(path.exists() or path.is_symlink() for path in candidates)
+
+
+def save_plan(request_id, actor, run_id, planned_at):
+    return {
+        "request_id": request_id,
+        "actor": actor,
+        "run_id": run_id,
+        "proposal_id": f"{run_id}-Q001",
+        "entry_id": f"{run_id}-E001",
+        "planned_at": planned_at,
+    }
+
+
+def build_save_proposal(paths, state, intent, base_entry, plan, head_entries,
+                        defer_new_subject=False):
+    """Base inheritance exactly as the legacy propose lane (cmd_propose).
+
+    defer_new_subject leaves the `--new-subject on an existing key` refusal
+    to the caller, which first checks whether the live record already is the
+    requested value (a retried new-subject save is `unchanged`, R-Q).
+    """
+    key = intent["key"]
+    operation = intent["operation"]
+    run_id = plan["run_id"]
+    target = intent["target"]
+    if target and not base_entry:
+        raise BimriError(f"target {target} does not exist in current memory.")
+    if intent["new_subject"] and base_entry and not defer_new_subject:
+        raise BimriError(f"{key} already exists; omit --new-subject to update it.")
+    if operation in {"touch", "close"} and not base_entry:
+        raise BimriError(f"{operation} requires an existing key or target.")
+    if operation == "touch" and base_entry["tier"] != 2:
+        raise BimriError("only Tier 2 entries can be touched.")
+    tier = intent["tier"] or (base_entry["tier"] if base_entry else None)
+    if (
+        tier is None
+        and base_entry is None
+        and operation == "set"
+        and not intent["new_subject"]
+    ):
+        # No current subject and no --new-subject: the candidate is held
+        # classification-required (section 03 2), so it needs no tier from
+        # the caller; it is preserved at the working tier.
+        tier = 2
+    if tier not in {1, 2, 3}:
+        raise BimriError("tier must be 1, 2 or 3.")
+    kind = intent["kind"] or (
+        base_entry.get("kind")
+        if base_entry and base_entry["tier"] == 1
+        else "fact"
+    )
+    importance = intent["importance"] if intent["importance"] is not None else (
+        int(base_entry["imp"])
+        if base_entry and base_entry["tier"] == 2
+        else 3
+    )
+    status = intent["status"] or (
+        base_entry.get("status")
+        if base_entry and base_entry["tier"] == 2
+        else "active"
+    )
+    tags = (
+        list(intent["tags"])
+        if intent["tags"]
+        else clean_tags(base_entry.get("tags", "") if base_entry else "")
+    )
+    confidence = intent["confidence"] or (
+        base_entry.get("conf")
+        if base_entry and base_entry["tier"] == 3
+        else "emerging"
+    )
+    observations = (
+        intent["observations"]
+        if intent["observations"] is not None
+        else (
+            int(base_entry["obs"])
+            if base_entry and base_entry["tier"] == 3
+            else 1
+        )
+    )
+    if tier == 1 and kind not in TIER1_KINDS:
+        raise BimriError("Tier 1 requires a valid --kind.")
+    if tier == 2 and status not in TIER2_STATUSES:
+        raise BimriError("Tier 2 requires a valid --status.")
+    if operation in {"touch", "close"}:
+        text = base_entry["text"]
+        if len(text) > state["entry_max_chars"]:
+            descriptor = (
+                f"{operation} inherited {base_entry['id']} "
+                f"sha256:{sha256_text(text)}"
+            )
+            text = descriptor[:state["entry_max_chars"]]
+    else:
+        text = clean_scalar(
+            intent["text"], "memory text", state["entry_max_chars"]
+        )
+    rationale = clean_scalar(
+        intent["rationale"] or text, "proposal rationale", 4000
+    )
+    if tier == 3:
+        if operation != "set":
+            raise BimriError("Tier 3 currently supports set proposals only.")
+        if confidence not in PATTERN_CONFIDENCE:
+            raise BimriError("Tier 3 requires a valid --confidence.")
+        if not isinstance(observations, int) or observations < 1:
+            raise BimriError("--observations must be a positive integer.")
+        falsifier_input = intent["falsifier"] or (
+            base_entry.get("falsifier")
+            if base_entry and base_entry["tier"] == 3
+            else None
+        )
+        if not falsifier_input:
+            raise BimriError("Tier 3 requires --falsifier.")
+        evidence_input = intent["evidence"] or (
+            base_entry.get("ev")
+            if base_entry and base_entry["tier"] == 3
+            else plan["entry_id"]
+        )
+        evidence = [
+            validate_fixed_id(item.strip(), LEGACY_ENTRY_RE, "evidence ID")
+            for item in evidence_input.split(",")
+        ]
+        pattern_id = (
+            base_entry["id"]
+            if base_entry and base_entry["tier"] == 3
+            else allocate_pattern_id(paths, state, head_entries)
+        )
+    else:
+        evidence = []
+        pattern_id = None
+        falsifier_input = intent["falsifier"]
+    return {
+        **({"settles": intent["settles"]} if intent["settles"] else {}),
+        "bimri_version": MEMORY_FORMAT_VERSION,
+        "proposal_id": plan["proposal_id"],
+        "run_id": run_id,
+        "actor": plan["actor"],
+        "created_at": plan["planned_at"],
+        "request_id": plan["request_id"],
+        "base_revision": state["head_revision"],
+        "base_hash": line_hash(base_entry["raw"]) if base_entry else "absent",
+        "base_storage": (
+            base_entry.get("storage", "hot") if base_entry else "absent"
+        ),
+        "base_archive_proposal_id": (
+            base_entry.get("archive_proposal_id")
+            if base_entry and base_entry.get("storage") == "cold"
+            else None
+        ),
+        "operation": operation,
+        "new_subject": bool(intent["new_subject"]),
+        "tier": tier,
+        "key": key,
+        "target_id": base_entry["id"] if base_entry else target,
+        "entry_id": plan["entry_id"],
+        "kind": kind,
+        "importance": importance,
+        "status": status,
+        "trust": intent["trust"],
+        "source": intent["source"],
+        "tags": tags,
+        "text": text,
+        "rationale": rationale,
+        "needs_human": False,
+        "question": "",
+        "confidence": confidence,
+        "observations": observations,
+        "evidence": evidence,
+        "falsifier": clean_scalar(
+            falsifier_input or "", "falsifier", 500, allow_empty=True
+        ),
+        "pattern_id": pattern_id,
+        "first_run": (
+            base_entry.get("first")
+            if base_entry and base_entry["tier"] == 2
+            else run_id
+        ),
+    }
+
+
+def preflight_save(paths, state, intent, observed, plan):
+    """L5 (read-only): the binding table of D3.1 and the legacy hold ladder.
+
+    Returns ("stale"|"unchanged", {"token"}) or ("proceed", {"proposal",
+    "dependencies", "live"}); a refusal raises BimriError before any write.
+    The live value is never substituted for the observation.
+    """
+    head_revision = state["head_revision"]
+    head_content, head_hash, head_entries = load_preflight_head(paths, state)
+    key = intent["key"]
+    live = find_current_entry(head_entries, state, key, intent["target"])
+    if live is not None and live.get("key") != key:
+        raise BimriError(
+            f"target {intent['target']} identifies another subject, not {key}."
+        )
+    live_hash = line_hash(live["raw"]) if live else "absent"
+    current = subject_token(head_revision, live)
+    dependencies = {}
+    verdict = "proceed"
+    final_stale = False
+    storage = observed["storage"]
+    if storage == "head":
+        if live is not None and live.get("storage") == "cold":
+            # A head token covers the hot view only (section 03 L18).
+            verdict, final_stale = "stale", True
+        elif observed["revision"] == head_revision:
+            if observed["key_hash"] != head_hash:
+                raise BimriError(
+                    "the observed head token names no accepted revision."
+                )
+        elif observed["revision"] > head_revision:
+            raise BimriError(
+                "the observed head token names no accepted revision."
+            )
+        else:
+            relative = _scoped_revision_path(observed["revision"])
+            digest = scoped_protected_file_hash(paths, relative)
+            if digest != observed["key_hash"]:
+                raise BimriError(
+                    "the observed head token names no accepted revision."
+                )
+            dependencies[relative] = digest
+            try:
+                old_content = revision_path(
+                    paths, observed["revision"]
+                ).read_bytes().decode("utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                raise BimriError(
+                    f"observed revision V{observed['revision']:06d} is "
+                    f"unreadable: {exc}"
+                ) from exc
+            _, old_entries, old_errors = parse_hot(old_content)
+            if old_errors:
+                raise BimriError(
+                    f"observed revision V{observed['revision']:06d} is "
+                    "malformed: " + "; ".join(old_errors[:3])
+                )
+            seen = find_entry(old_entries, key=key)
+            if seen is None:
+                if live is not None:
+                    verdict = "stale"
+            elif (
+                live is None
+                or live.get("storage") == "cold"
+                or line_hash(seen["raw"]) != live_hash
+            ):
+                verdict = "stale"
+    elif observed["key_hash"] != live_hash:
+        verdict = "stale"
+    proposal = build_save_proposal(
+        paths, state, intent, live, plan, head_entries,
+        defer_new_subject=True,
+    )
+    if intent["settles"]:
+        check_settlement_targets(paths, state, proposal)
+    if (
+        not intent["settles"]
+        and not final_stale
+        and intent["operation"] == "set"
+        and proposal_equivalent(proposal, live)
+    ):
+        return "unchanged", {"token": current}
+    if intent["new_subject"] and live is not None:
+        raise BimriError(f"{key} already exists; omit --new-subject to update it.")
+    if verdict == "stale":
+        return "stale", {"token": current}
+    proposal = bind_preflight_proposal(
+        paths, state, proposal, live, live_hash, head_content, head_hash
+    )
+    return "proceed", {
+        "proposal": proposal,
+        "dependencies": dependencies,
+        "live": live,
+    }
+
+
+# ---- scope, markers and the wedge line -------------------------------------
+
+
+def save_declared_paths(ticket, extra=()):
+    proposal_id = ticket["proposal_id"]
+    declared = {
+        f".bimri/proposals/{proposal_id}.json",
+        f".bimri/decisions/{proposal_id}.json",
+        _scoped_revision_path(ticket["revision"]),
+    }
+    declared.update(f".bimri/archive/{month}.md" for month in ticket["archive_months"])
+    declared.update(extra)
+    declared.update(f".bimri/settlements/{pid}.json" for pid in ticket["intent"]["settles"])
+    return sorted(declared)
+
+
+def save_marker_scope(paths, state, ticket, dependencies=None, live=None,
+                      extra_declared=()):
+    """The D2.4 `save` scope, frozen at B2a."""
+    proposal_id = ticket["proposal_id"]
+    declared = save_declared_paths(ticket, extra_declared)
+    wanted = set((dependencies or {}).keys())
+    facts = checkpoint_facts(paths, state) or {}
+    for row in facts.get("open_conflicts", ()):
+        if row.get("key") == ticket["intent"]["key"]:
+            cid = row["conflict_id"]
+            wanted.update({f".bimri/conflicts/{cid}.json", f".bimri/resolutions/{cid}.json"})
+    for pid in ticket["intent"]["settles"]:
+        wanted.update({f".bimri/proposals/{pid}.json", f".bimri/decisions/{pid}.json"})
+    wanted.add(_scoped_revision_path(state["head_revision"]))
+    wanted.update(
+        f".bimri/archive/{month}.md" for month in ticket["archive_months"]
+    )
+    if live is not None and live.get("storage") == "cold":
+        archived_on = live.get("archive_date")
+        if isinstance(archived_on, str) and re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}", archived_on
+        ):
+            wanted.add(f".bimri/archive/{archived_on[:7]}.md")
+    frozen = {}
+    for relative in sorted(wanted):
+        if relative in (dependencies or {}):
+            frozen[relative] = dependencies[relative]
+        else:
+            frozen[relative] = scoped_protected_file_hash(paths, relative)
+    return {
+        "proposal_ids": [proposal_id],
+        "proposal_hashes": {proposal_id: ticket["proposal_sha256"]},
+        "request_id": ticket["request_id"],
+        "ticket_hash": ticket["ticket_hash"],
+        "settles": list(ticket["intent"]["settles"]),
+        "run_log": f".bimri/log/{ticket['run_id']}.md",
+        "declared_paths": declared,
+        "dependency_hashes": frozen,
+        "intent": copy.deepcopy(ticket["intent"]),
+        "started_on": ticket["started_on"],
+    }
+
+
+def load_live_save_marker(paths):
+    """The live `save` transition marker, or None (any other marker too)."""
+    if not (paths.audit_transition.exists() or paths.audit_transition.is_symlink()):
+        return None
+    try:
+        marker = load_audit_transition(paths)
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        return None
+    if (
+        marker is None
+        or marker["kind"] != "authority"
+        or marker["operation"] != "save"
+    ):
+        return None
+    return marker
+
+
+def unfinished_operation_line(paths):
+    """D3.5: name the live authority marker a lifecycle write must not pass."""
+    wedged = getattr(paths, "wedged_save", None)
+    if wedged:
+        return wedged["line"]
+    try:
+        marker = load_audit_transition(paths)
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        marker = None
+    if marker is None:
+        return "an engine authority operation is unfinished (unknown -); run doctor"
+    scope = marker.get("scope") or {}
+    ident = (
+        scope.get("request_id")
+        or marker.get("run_id")
+        or scope.get("conflict_id")
+        or "-"
+    )
+    return (
+        f"an engine authority operation is unfinished "
+        f"({marker['operation']} {ident}); run doctor"
+    )
+
+
+# v5.2 engine-owned operations that plan their own run and records under a
+# live marker. A lifecycle write beside one would squat a planned run id
+# (R-A); a retained v5.1.x marker (a failed resolution awaiting its explicit
+# retry) keeps today's behaviour, where unrelated runs proceed.
+ENGINE_OWNED_MARKER_OPERATIONS = frozenset({
+    "save", "abandon-run", "dismiss-held", "recover-save",
+})
+
+
+def refuse_lifecycle_write_under_authority_marker(paths):
+    """D3.5: lifecycle writes never run beside an unfinished engine-owned
+    authority operation (a degraded start would squat a planned run id)."""
+    if not (
+        paths.audit_transition.exists() or paths.audit_transition.is_symlink()
+    ):
+        return
+    try:
+        marker = load_audit_transition(paths)
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        marker = None
+    if marker is not None and (
+        marker["kind"] != "authority"
+        or marker["operation"] not in ENGINE_OWNED_MARKER_OPERATIONS
+    ):
+        return
+    raise_pending_save_error(paths)
+    raise BimriError(unfinished_operation_line(paths))
+
+
+def save_cancel_conditions(paths, state, marker):
+    """D1.10 (revised): None when --cancel is legal, else (kind, message)."""
+    scope = marker["scope"]
+    request_id = scope.get("request_id")
+    proposal_id = scope["proposal_ids"][0]
+    before = marker["pre_write_state"].get("head_revision")
+    if (
+        state["head_revision"] != before
+        or state.get("last_revision_reason") == f"accepted {proposal_id}"
+    ):
+        return (
+            "effect",
+            f"save {request_id} already reached its decision or effect; run "
+            f"recover-save {request_id} --rebuild",
+        )
+    dpath = decision_path(paths, proposal_id)
+    if dpath.exists() or dpath.is_symlink():
+        try:
+            decision = validate_decision(
+                read_json_strict(dpath, dpath.name), proposal_id
+            )
+            outcome = decision["outcome"]
+            authority = decision.get("authority")
+        except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+            outcome = "invalid"
+            authority = None
+        if outcome == "abandoned" and authority == "human-asserted":
+            # An owner cancel interrupted after its decision is a cancel
+            # already under way: finishing it is legal and idempotent.
+            pass
+        elif outcome != "applying":
+            return (
+                "effect",
+                f"save {request_id} already reached its decision or effect; "
+                f"run recover-save {request_id} --rebuild",
+            )
+    ppath = proposal_path(paths, proposal_id)
+    log = paths.root.joinpath(*PurePosixPath(scope.get("run_log") or (
+        f".bimri/log/{marker['run_id']}.md"
+    )).parts)
+    damaged = (
+        f"proposal {proposal_id} does not match its sealed hash (or is "
+        "missing behind its log marker); run doctor"
+    )
+    if ppath.exists() or ppath.is_symlink():
+        if path_is_redirected(ppath) or not ppath.is_file():
+            return "proposal", damaged
+        raw = ppath.read_bytes()
+        if sha256_bytes(raw) == scope["proposal_hashes"][proposal_id]:
+            return None
+        try:
+            if is_quarantine_stub(json.loads(raw.decode("utf-8"))):
+                return None
+        except (UnicodeError, ValueError):
+            pass
+        return "proposal", damaged
+    if log.exists() or log.is_symlink():
+        try:
+            names_it = f"[PROPOSE:{proposal_id}]" in log.read_text(
+                encoding="utf-8"
+            )
+        except (OSError, UnicodeError):
+            names_it = True
+        if names_it:
+            return "proposal", damaged
+    return None
+
+
+def save_wedged_line(paths, state, request_id, marker=None, cause=None):
+    """R0c: the line every writer and doctor prints (D1.10 revised)."""
+    cancel = (
+        f'save {request_id} is wedged: run recover-save {request_id} --cancel '
+        '--human-approved --summary "..." (or --rebuild when its proposal is '
+        "intact)"
+    )
+    line = cancel
+    if marker is not None:
+        try:
+            condition = save_cancel_conditions(paths, state, marker)
+        except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+            condition = None
+        if condition is not None and condition[0] == "effect":
+            line = (
+                f"save {request_id} is wedged: run recover-save {request_id} "
+                '--rebuild --summary "..."'
+            )
+        elif condition is not None:
+            line = (
+                f"save {request_id} is wedged: run recover-save {request_id} "
+                '--rebuild --summary "..." once ' + condition[1].split(";")[0]
+                + " is restored, or --cancel --human-approved after "
+                "quarantine-authority of that proposal"
+            )
+    if cause:
+        line += f"; cause: {cause}"
+    return line
+
+
+def release_save_write_mode(paths):
+    paths.authority_write_mode = False
+    paths.authority_write_audit_healthy = False
+    end_scoped_write_recording(paths)
+
+
+def require_save_store_writable(paths, state):
+    """L4: a blocked store or a foreign live marker refuses every save."""
+    blocked = load_audit_blocked_issues(paths)
+    if blocked:
+        raise SaveStoreRefusal(
+            "authority recovery is required; shared-memory writes are paused: "
+            + " | ".join(blocked[:3])
+        )
+    if paths.audit_transition.exists() or paths.audit_transition.is_symlink():
+        raise_pending_save_error(paths)
+        if getattr(paths, "wedged_save", None):
+            raise SaveStoreRefusal(paths.wedged_save["line"])
+        if load_live_save_marker(paths) is not None:
+            raise SaveStoreRefusal(unfinished_operation_line(paths))
+        # A cold load can republish the completed W1 after reconciling the
+        # interrupted legacy marker. Finish its cleanup in this invocation.
+        witness = load_sealed_audit_witness(paths)
+        if witness is not None and sealed_witness_matches_state(witness, state):
+            reconcile_audit_transition(paths, state)
+            if not os.path.lexists(str(paths.audit_transition)):
+                return
+        raise SaveStoreRefusal(unfinished_authority_reason(paths) or unfinished_operation_line(paths))
+
+
+def cancel_authority_transition(paths, state, marker):
+    """R0b: a marker with nothing written under it is withdrawn and W0
+    republished with the new epoch (the publish_lifecycle_checkpoint
+    pattern). Refuses unless every declared path still has its frozen bytes,
+    the run log is absent and state differs only in epoch and version."""
+    scope = marker["scope"]
+    dependencies = scope.get("dependency_hashes", {})
+    for relative in scope.get("declared_paths", []):
+        expected = dependencies.get(relative, "absent")
+        if scoped_protected_file_hash(paths, relative) != expected:
+            raise SaveWedged(
+                f"cannot cancel the transition: {relative} changed under it"
+            )
+    run_log = scope.get("run_log")
+    if run_log:
+        log = paths.root.joinpath(*PurePosixPath(run_log).parts)
+        if log.exists() or log.is_symlink():
+            raise SaveWedged("cannot cancel the transition: its run log exists")
+    for proposal_id in scope.get("proposal_ids", []):
+        if proposal_path(paths, proposal_id).exists():
+            raise SaveWedged(
+                f"cannot cancel the transition: {proposal_id} exists"
+            )
+    before = dict(marker["pre_write_state"])
+    current = audit_witness_write_state_payload(state)
+    before.pop("bimri_version", None)
+    current.pop("bimri_version", None)
+    prior = marker["prior_witness"]
+    if (
+        before != current
+        or state["head_revision"] != prior["head_revision"]
+        or state["head_hash"] != prior["head_hash"]
+    ):
+        raise SaveWedged("cannot cancel the transition: state moved under it")
+    if audit_witness_schema(prior) == AUDIT_WITNESS_SCHEMA:
+        load_audit_facts_evidence(paths, prior)
+    witness = dict(prior)
+    witness.update({
+        "state_hash": audit_witness_state_hash(state, witness["proposal_runs"]),
+        "write_state_hash": audit_witness_write_state_hash(state),
+        "audit_epoch": state_audit_epoch(state),
+    })
+    if audit_witness_schema(witness) == AUDIT_WITNESS_SCHEMA:
+        witness["audit_origin"] = "lifecycle"
+    witness["witness_hash"] = audit_record_seal(witness, "witness_hash")
+    ensure_audit_manifest_generation(paths, prior)
+    atomic_write_json(paths.audit_witness, witness)
+    paths.validated_audit_witness = (
+        witness if audit_witness_uses_current_policy(witness) else None
+    )
+    clear_audit_transition(paths)
+    prune_audit_manifest_generations(paths)
+
+
+def archive_prefix_matches(remainder, frozen, proposal_id):
+    """Only complete, valid rows of this proposal may follow the frozen bytes."""
+    while True:
+        if frozen == "absent":
+            if remainder == b"":
+                return True
+        elif sha256_bytes(remainder) == frozen:
+            return True
+        if not remainder.endswith(b"\n"):
+            return False
+        cut = remainder.rfind(b"\n", 0, len(remainder) - 1)
+        try:
+            row = parse_archive_record(remainder[cut + 1:-1].decode("utf-8"), strict=True)
+        except (BimriError, UnicodeError):
+            return False
+        if row["proposal_id"] != proposal_id:
+            return False
+        remainder = remainder[:cut + 1]
+
+
+def recover_archive_tail(paths, state, marker, relative, frozen):
+    """Restore a torn pre-release append only when both halves are proven.
+
+    The complete prefix must match the frozen month plus this proposal's
+    completed rows. The fragment must be a prefix of a row the sealed,
+    applying proposal can produce from the still-accepted head.
+    """
+    path = paths.root.joinpath(*PurePosixPath(relative).parts)
+    if path_is_redirected(path):
+        return False
+    if not path.exists():
+        return frozen == "absent"
+    if not path.is_file():
+        return False
+    data = path.read_bytes()
+    scope = marker["scope"]
+    proposal_id = scope["proposal_ids"][0]
+    if not data or data.endswith(b"\n"):
+        return archive_prefix_matches(data, frozen, proposal_id)
+    cut = data.rfind(b"\n") + 1
+    whole, fragment = data[:cut], data[cut:]
+    if not archive_prefix_matches(whole, frozen, proposal_id):
+        return False
+    if state["head_revision"] != marker["pre_write_state"]["head_revision"]:
+        return False
+    started_on = scope["started_on"]
+    if path.name != started_on[:7] + ".md":
+        return False
+    dpath = decision_path(paths, proposal_id)
+    if path_is_redirected(dpath) or not dpath.is_file():
+        return False
+    decision = validate_decision(read_json_strict(dpath, dpath.name), proposal_id)
+    if decision["outcome"] != "applying":
+        return False
+    _, proposal = read_planned_save_proposal(paths, scope, proposal_id)
+    if proposal is None:
+        return False
+    content, _, entries = load_preflight_head(paths, state)
+    current = find_current_entry(entries, state, proposal["key"], proposal.get("target_id"))
+    planned, archived = proposal_effect_content(content, state, proposal, current)
+    candidates = []
+    if archived or (current and proposal["operation"] == "set"):
+        reason = "closed" if proposal["operation"] == "close" else "replaced"
+        candidates.append((reason, archived or current["raw"]))
+    if not strictly_reduces_overflow(content, planned, state):
+        _, cooled = pressure_cooling_plan(paths, state, proposal, planned)
+        candidates.extend(("cooled", entry["raw"]) for entry in cooled)
+    for reason, raw in candidates:
+        row = f"[ARCHIVED:{started_on}] [BY:{proposal_id}] [{reason}] {raw}\n"
+        if row.encode("utf-8").startswith(fragment):
+            if not whole and frozen == "absent":
+                remove_protected_file(path)
+                fsync_directory(path.parent)
+            else:
+                atomic_write_bytes(path, whole)
+            return True
+    return False
+
+
+def verify_save_dependencies(paths, state, marker, ticket):
+    """R2: frozen dependencies, split by declared_paths (section 03 L17)."""
+    scope = marker["scope"]
+    declared = set(scope.get("declared_paths", []))
+    for relative, frozen in sorted(scope.get("dependency_hashes", {}).items()):
+        if relative not in declared:
+            if scoped_protected_file_hash(paths, relative) != frozen:
+                raise SaveWedged(save_wedged_line(
+                    paths, state, ticket["request_id"], marker,
+                    f"dependency {relative} changed under the live marker",
+                ))
+        elif relative.startswith(".bimri/archive/"):
+            if not recover_archive_tail(paths, state, marker, relative, frozen):
+                raise SaveWedged(save_wedged_line(
+                    paths, state, ticket["request_id"], marker,
+                    f"{relative} changed beyond this save's own rows; "
+                    "restore its verified bytes from backup before retrying",
+                ))
+
+
+# ---- the ladder (B3..L9) ---------------------------------------------------
+
+
+def ensure_generated_view_matches_head(paths, state):
+    head = revision_path(paths, state["head_revision"])
+    expected = head.read_bytes()
+    current = paths.hot.read_bytes() if paths.hot.is_file() else None
+    if current != expected:
+        write_generated_view(paths, expected.decode("utf-8"), warn_only=True)
+
+
+def resume_save_preflight(paths, state, ticket, marker):
+    """R2 first rung (Q and log absent): the binding table again, against the
+    ticket's own observation; any other answer than proceed is a wedge."""
+    plan = save_plan(
+        ticket["request_id"], ticket["actor"], ticket["run_id"],
+        ticket["planned_at"],
+    )
+    try:
+        verdict, payload = preflight_save(
+            paths, state, ticket["intent"], ticket["observed"], plan
+        )
+    except BimriError as exc:
+        raise SaveWedged(save_wedged_line(
+            paths, state, ticket["request_id"], marker, str(exc)
+        )) from exc
+    if verdict != "proceed":
+        raise SaveWedged(save_wedged_line(
+            paths, state, ticket["request_id"], marker,
+            f"its observation is now {verdict} under the live marker",
+        ))
+    return payload["proposal"]
+
+
+def run_save_ladder(paths, state, ticket, proposal=None, full_replay=False,
+                    marker=None):
+    """B3 to L9 under the live save marker of this ticket.
+
+    Every boundary is exclusive-create, verified or idempotent, so the same
+    call continues an interrupted save at its first missing boundary. A
+    condition the ladder cannot continue raises SaveWedged before writing.
+    """
+    request_id = ticket["request_id"]
+    run_id = ticket["run_id"]
+    proposal_id = ticket["proposal_id"]
+    if marker is None:
+        marker = load_live_save_marker(paths)
+    # R-N: a reader finishing this save holds existing_store_lock, which
+    # never lays the store out; every directory the ladder appends into or
+    # creates in exists durably first.
+    for directory in (
+        paths.logs, paths.archive, paths.saves_open, paths.saves_done,
+    ):
+        ensure_directory_durable(directory)
+    paths.authority_write_mode = True
+    paths.authority_write_audit_healthy = True
+    if not isinstance(paths.scoped_write_set, set):
+        begin_scoped_write_recording(paths)
+    if not isinstance(paths.scoped_checkpoint, dict) and scoped_publication_applies(
+        marker
+    ):
+        # A save resumed by another process reads the same prior facts
+        # (watermarks, writers) its first attempt planned from (D3.4.3).
+        try:
+            paths.scoped_checkpoint = load_scoped_checkpoint(paths, marker)
+        except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+            paths.scoped_checkpoint = None
+
+    def wedge(cause):
+        return SaveWedged(save_wedged_line(
+            paths, state, request_id, marker, cause
+        ))
+
+    ppath = proposal_path(paths, proposal_id)
+    log = run_log_path(paths, run_id)
+    if path_is_redirected(ppath) or path_is_redirected(log):
+        raise wedge("a planned record is redirected")
+    # B3
+    if not (ppath.exists() or ppath.is_symlink()):
+        if log.exists() or log.is_symlink():
+            raise wedge(f"proposal {proposal_id} is missing behind its log")
+        if proposal is None:
+            proposal = resume_save_preflight(paths, state, ticket, marker)
+        content = proposal_file_text(proposal)
+        if sha256_text(content) != ticket["proposal_sha256"]:
+            raise wedge(
+                f"proposal {proposal_id} no longer renders to its sealed bytes"
+            )
+        exclusive_write_text(ppath, content)
+    else:
+        if not ppath.is_file():
+            raise wedge(f"proposal {proposal_id} is not a regular file")
+        raw = ppath.read_bytes()
+        if sha256_bytes(raw) != ticket["proposal_sha256"]:
+            raise wedge(f"proposal {proposal_id} does not match its sealed hash")
+        proposal = json.loads(raw.decode("utf-8"))
+    # B4
+    log_text = render_save_log(proposal)
+    if sha256_text(log_text) != ticket["log_sha256"]:
+        raise wedge(f"log/{run_id}.md no longer renders to its sealed bytes")
+    if not (log.exists() or log.is_symlink()):
+        exclusive_write_text(log, log_text)
+    else:
+        if not log.is_file():
+            raise wedge(f"log/{run_id}.md is not a regular file")
+        if not log.read_text(encoding="utf-8").startswith(log_text):
+            raise wedge(
+                f"log/{run_id}.md does not begin with this save's planned bytes"
+            )
+    number = int(run_id[1:])
+    bookkeeping_dirty = (
+        state["run_count"] < number or run_id not in state["run_dates"]
+    )
+    state["run_count"] = max(state["run_count"], number)
+    state["run_dates"].setdefault(run_id, ticket["started_on"])
+    head_before = state["head_revision"]
+    # L8: B5-B9 (an existing final decision is replayed, an applying one is
+    # finished from the head; a held reason is honoured).
+    result = apply_proposal(
+        paths,
+        state,
+        proposal,
+        archive_date=ticket["started_on"],
+        archive_months=list(ticket["archive_months"]),
+        planned_revision=ticket["revision"],
+    )
+    committed = state["head_revision"] != head_before
+    decision = result.get("outcome")
+    outcome = SAVE_DECISION_OUTCOMES.get(decision)
+    if outcome is None:
+        raise wedge(f"decision {proposal_id} is {decision}")
+    if outcome == "accepted" and not committed:
+        ensure_generated_view_matches_head(paths, state)
+    summary = result.get("summary") if decision == "abandoned" else None
+    settled = settle_from_proposal(paths, state, proposal, result, request_id)
+    # B11
+    lines = log.read_text(encoding="utf-8").splitlines()
+    closed_re = re.compile(rf"^\[CLOSED:{re.escape(run_id)} \S+\]$")
+    has_outcome = any(line.startswith("[OUTCOME:") for line in lines)
+    has_closed = any(closed_re.match(line) for line in lines)
+    close_at = now_iso()
+    if not has_closed:
+        if not has_outcome:
+            append_line(log, save_outcome_line(request_id, outcome, summary))
+        append_line(log, f"[CLOSED:{run_id} {close_at}]")
+    needs_state = bookkeeping_dirty and not committed
+    if outcome != "accepted" and not has_closed:
+        state["last_closed_at"] = close_at
+        needs_state = True
+    if needs_state:
+        save_state(paths, state)
+    # B12
+    token = None
+    if outcome in {"accepted", "unchanged"}:
+        token = current_subject_token(paths, state, proposal["key"])
+    cooled = [
+        key for key, record in state.get("cold_current", {}).items()
+        if record.get("archived_by") == proposal_id
+    ]
+    revision = result.get("revision")
+    if revision is None:
+        revision = state["head_revision"]
+    finished = finish_save_ticket(
+        paths,
+        ticket,
+        make_save_result(
+            outcome,
+            decision=decision,
+            revision=revision,
+            conflict_id=result.get("conflict_id") or result.get("_conflict_id"),
+            reason=result.get("reason") if decision == "held" else None,
+            token=token,
+            cooled=cooled,
+            error=summary,
+            settled=settled,
+        ),
+    )
+    # L9
+    publish_save_checkpoint(paths, state, full_replay=full_replay)
+    return finished
+
+
+def publish_save_checkpoint(paths, state, full_replay=False):
+    """L9 (B13-B15): the successor checkpoint of the live save marker."""
+    marker = load_audit_transition(paths)
+    if marker is None:
+        return True
+    if full_replay:
+        return publish_authority_full_replay(paths, state, marker)
+    checkpoint = paths.scoped_checkpoint
+    if not isinstance(checkpoint, dict):
+        checkpoint = load_scoped_checkpoint(paths, marker)
+    paths.last_witness_error = None
+    if not publish_scoped_checkpoint(
+        paths, state, checkpoint["m0"], checkpoint["f0"]
+    ):
+        error = getattr(paths, "last_witness_error", None)
+        if isinstance(error, OSError):
+            # The boundary state stays as it is; the next invocation
+            # resumes the publication (section 03 9).
+            raise error
+        raise BimriError(
+            "the save is durable but its checkpoint could not be published"
+            + (f" ({error})" if error is not None else "")
+            + "; the next command finishes it"
+        )
+    return True
+
+
+def publish_authority_full_replay(paths, state, marker):
+    """Publish a finished transition from a full inventory and replay.
+
+    Used by recover-save, where the engine cannot know what a failed process
+    wrote outside its declared set. A clean replay publishes and completes
+    the marker; anything else is receipted as drift, the witness discarded
+    and the marker retired, so the next write pays a full audit.
+    """
+    if load_audit_blocked_issues(paths):
+        # An owner repair (quarantine) is in progress: the save is finished,
+        # so its marker retires and the full audit decides, clearing the
+        # repair boundary only when the store proves clean.
+        clear_audit_transition(paths)
+        write_mode = paths.authority_write_mode
+        paths.authority_write_mode = False
+        try:
+            _conflicts, issues = governance_snapshot(
+                paths,
+                state,
+                use_witness=False,
+                audit_blocked=True,
+                recover_blocked=True,
+            )
+        finally:
+            paths.authority_write_mode = write_mode
+        prune_audit_manifest_generations(paths)
+        return not issues
+    incomplete_reason = (
+        "interrupted authority transition has no frozen post-effect closure"
+    )
+    manifest = audit_witness_manifest(paths)
+    run_facts = audit_witness_run_facts(paths, state)
+    issues = [
+        issue for issue in authority_transition_completion_issues(
+            paths, state, marker, manifest, run_facts, scoped=None
+        )
+        if issue != incomplete_reason
+    ]
+    if not issues:
+        if write_audit_witness(
+            paths, state, manifest=manifest, run_facts=run_facts
+        ):
+            complete_authority_checkpoint_transition(paths)
+            return True
+        issues = ["the rebuilt checkpoint could not be published"]
+    prior = marker["prior_witness"]
+    prior_m = load_audit_manifest_evidence(paths, prior)
+    allowed = authority_transition_allowed_manifest_paths(
+        paths, state, marker
+    ) | archive_paths_explained_by_transition(paths, marker)
+    delta = audit_checkpoint_drift_delta(prior_m, manifest, allowed)
+    if write_audit_drift_receipt(
+        paths, issues, marker=marker, prior_witness=prior, state=state,
+        delta=delta,
+    ) is None:
+        raise BimriError(
+            "the transition's drift evidence could not be durably recorded; "
+            "the marker remains in place. Repair .bimri/audit-drift, then retry."
+        )
+    discard_audit_witness(paths)
+    clear_audit_transition(paths)
+    prune_audit_manifest_generations(paths)
+    return False
+
+
+# ---- starting and resuming -------------------------------------------------
+
+
+def run_planned_save(paths, state, ticket, proposal, dependencies=None,
+                     live=None, extra_declared=()):
+    """L7 onward for an admitted ticket whose plan is final, no marker yet."""
+    scope = save_marker_scope(
+        paths, state, ticket, dependencies, live, extra_declared
+    )
+    begin_scoped_write_recording(paths)
+    try:
+        try:
+            # L7 (D4.2): checkpoint-scoped; a cold or drifted store falls
+            # through to the full audit inside.
+            begin_scoped_authority_write(
+                paths,
+                state,
+                "save",
+                run_id=ticket["run_id"],
+                scope=scope,
+                require_transition=True,
+            )
+        except BimriError as exc:
+            # Nothing was allocated. A marker of ours with no effect (an
+            # error between B2a and B3) is withdrawn first (R0b).
+            marker = load_live_save_marker(paths)
+            if (
+                marker is not None
+                and marker["scope"].get("request_id") == ticket["request_id"]
+            ):
+                cancel_authority_transition(paths, state, marker)
+            return finish_save_refusal(paths, ticket, exc)
+        try:
+            return run_save_ladder(paths, state, ticket, proposal=proposal)
+        except BimriError as exc:
+            if read_save_ticket(paths, ticket["request_id"], "open") is None:
+                # The answer is durable; only publication is left (R3).
+                raise
+            raise BimriError(f"{exc}; recovery=needed") from exc
+    finally:
+        release_save_write_mode(paths)
+
+
+def save_ticket_has_artifacts(paths, ticket):
+    """R1b: this ticket's own proposal or run log already exists."""
+    if ticket["run_id"] is None:
+        return False
+    ppath = proposal_path(paths, ticket["proposal_id"])
+    if ppath.is_file() and not path_is_redirected(ppath):
+        try:
+            data = json.loads(ppath.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError):
+            data = None
+        if isinstance(data, dict) and data.get("request_id") == ticket["request_id"]:
+            return True
+    log = run_log_path(paths, ticket["run_id"])
+    if log.is_file() and not path_is_redirected(log):
+        try:
+            with log.open("r", encoding="utf-8") as handle:
+                header = handle.readline()
+        except (OSError, UnicodeError):
+            header = ""
+        if header.rstrip("\n").endswith(f"| save:{ticket['request_id']}"):
+            return True
+    return False
+
+
+def finish_save_answer(paths, ticket, verdict, payload, state):
+    """stale / unchanged at preflight: the finished ticket is the only write."""
+    return finish_save_ticket(
+        paths,
+        ticket,
+        make_save_result(
+            verdict,
+            revision=state["head_revision"],
+            token=payload["token"],
+        ),
+        null_plan=True,
+    )
+
+
+def replan_save_ticket(ticket, run_id, revision, started_on, planned_at,
+                       proposal):
+    replanned = dict(ticket)
+    replanned.update({
+        "run_id": run_id,
+        "proposal_id": f"{run_id}-Q001",
+        "entry_id": f"{run_id}-E001",
+        "revision": revision,
+        "started_on": started_on,
+        "archive_months": [started_on[:7]],
+        "planned_at": planned_at,
+        "proposal_sha256": sha256_text(proposal_file_text(proposal)),
+        "log_sha256": sha256_text(render_save_log(proposal)),
+        "updated_at": now_iso(),
+    })
+    return seal_save_ticket(replanned)
+
+
+def resume_admitted_ticket(paths, state, ticket):
+    """R1 (nothing durable) and R1b (own artifacts) for an admitted ticket
+    with no live marker. Returns the finished ticket."""
+    if save_ticket_has_artifacts(paths, ticket):
+        return resume_durable_ticket(paths, state, ticket)
+    require_save_store_writable(paths, state)
+    request_id = ticket["request_id"]
+    run_id = ticket["run_id"]
+    if run_id is None or save_run_is_taken(paths, run_id):
+        # A legacy start (or another writer) took the planned run between
+        # the crash and now: R1 is the only place ids are re-planned.
+        run_id = plan_save_run(paths, state)
+    started_on = ticket["started_on"]
+    if today() != started_on:
+        started_on = today()
+    planned_at = ticket["planned_at"] or now_iso()
+    try:
+        plan = save_plan(request_id, ticket["actor"], run_id, planned_at)
+        verdict, payload = preflight_save(
+            paths, state, ticket["intent"], ticket["observed"], plan
+        )
+        changed = False
+        if verdict == "proceed":
+            revision = next_commit_revision_number(paths, state)
+            changed = (
+                run_id != ticket["run_id"]
+                or revision != ticket["revision"]
+                or started_on != ticket["started_on"]
+                or sha256_text(proposal_file_text(payload["proposal"]))
+                != ticket["proposal_sha256"]
+            )
+            if changed:
+                planned_at = now_iso()
+                plan = save_plan(request_id, ticket["actor"], run_id, planned_at)
+                verdict, payload = preflight_save(
+                    paths, state, ticket["intent"], ticket["observed"], plan
+                )
+    except BimriError as exc:
+        return finish_save_refusal(paths, ticket, exc)
+    if verdict != "proceed":
+        return finish_save_answer(paths, ticket, verdict, payload, state)
+    proposal = payload["proposal"]
+    if changed:
+        ticket = replan_save_ticket(
+            ticket, run_id, next_commit_revision_number(paths, state),
+            started_on, planned_at, proposal,
+        )
+        rewrite_save_ticket(paths, ticket)
+    return run_planned_save(
+        paths, state, ticket, proposal,
+        dependencies=payload["dependencies"], live=payload["live"],
+    )
+
+
+def resume_durable_ticket(paths, state, ticket):
+    """R1b: own artifacts but no marker (owner repair or the drift path).
+    Never the binding table: the durable proposal's own base decides, and a
+    later cross-run writer makes it a conflict, never a rebase."""
+    request_id = ticket["request_id"]
+    proposal_id = ticket["proposal_id"]
+    ppath = proposal_path(paths, proposal_id)
+    log = run_log_path(paths, ticket["run_id"])
+    if not ppath.is_file() or path_is_redirected(ppath):
+        raise SaveWedged(save_wedged_line(
+            paths, state, request_id, None,
+            f"proposal {proposal_id} is missing behind its log",
+        ))
+    raw = ppath.read_bytes()
+    if sha256_bytes(raw) != ticket["proposal_sha256"]:
+        raise SaveWedged(save_wedged_line(
+            paths, state, request_id, None,
+            f"proposal {proposal_id} does not match its sealed hash",
+        ))
+    proposal = json.loads(raw.decode("utf-8"))
+    if log.is_file() and not log.read_text(encoding="utf-8").startswith(
+        render_save_log(proposal)
+    ):
+        raise SaveWedged(save_wedged_line(
+            paths, state, request_id, None,
+            f"log/{ticket['run_id']}.md does not begin with its planned bytes",
+        ))
+    require_save_store_writable(paths, state)
+    revision = next_commit_revision_number(paths, state)
+    if revision != ticket["revision"]:
+        ticket = dict(ticket)
+        ticket.update({"revision": revision, "updated_at": now_iso()})
+        ticket = seal_save_ticket(ticket)
+        rewrite_save_ticket(paths, ticket)
+    extra = {f".bimri/conflicts/C{state['conflict_count'] + 1:06d}.json"}
+    try:
+        open_items, _issues = scan_open_conflicts(paths, state)
+    except (BimriError, OSError, UnicodeError):
+        open_items = []
+    for item in open_items:
+        if item.get("key") == proposal["key"] and CONFLICT_RE.fullmatch(
+            str(item.get("conflict_id"))
+        ):
+            extra.add(f".bimri/conflicts/{item['conflict_id']}.json")
+    return run_planned_save(
+        paths, state, ticket, proposal, extra_declared=sorted(extra)
+    )
+
+
+def rebuild_save_ticket(paths, state, marker):
+    """R0a: the lost ticket rebuilt from Q + the marker scope + its log."""
+    scope = marker["scope"]
+    request_id = scope["request_id"]
+    proposal_id = scope["proposal_ids"][0]
+    ppath = proposal_path(paths, proposal_id)
+
+    def wedge(cause):
+        return SaveWedged(save_wedged_line(
+            paths, state, request_id, marker, cause
+        ))
+
+    if path_is_redirected(ppath) or not ppath.is_file():
+        raise wedge(f"proposal {proposal_id} is not a regular file")
+    raw = ppath.read_bytes()
+    if sha256_bytes(raw) != scope["proposal_hashes"][proposal_id]:
+        raise wedge(f"proposal {proposal_id} does not match its sealed hash")
+    try:
+        proposal = validate_proposal(json.loads(raw.decode("utf-8")))
+    except (BimriError, UnicodeError, ValueError) as exc:
+        raise wedge(f"proposal {proposal_id} is invalid: {exc}") from exc
+    if proposal.get("request_id") != request_id:
+        raise wedge(f"proposal {proposal_id} belongs to another request")
+    intent, started_on, revision, months = save_marker_plan(marker, wedge)
+    now = now_iso()
+    ticket = seal_save_ticket({
+        "ticket_schema": SAVE_TICKET_SCHEMA,
+        "bimri_version": MEMORY_FORMAT_VERSION,
+        "engine_release": ENGINE_VERSION,
+        "request_id": request_id,
+        "actor": proposal["actor"],
+        "status": "admitted",
+        "created_at": proposal["created_at"],
+        "updated_at": now,
+        "started_on": started_on,
+        "intent": copy.deepcopy(intent),
+        "intent_hash": audit_witness_digest(intent),
+        "observed": parse_observed_token(intent["observed"]),
+        "run_id": proposal["run_id"],
+        "proposal_id": proposal_id,
+        "entry_id": proposal["entry_id"],
+        "revision": revision,
+        "archive_months": months,
+        "planned_at": proposal["created_at"],
+        "proposal_sha256": scope["proposal_hashes"][proposal_id],
+        "log_sha256": sha256_text(render_save_log(proposal)),
+        "result": None,
+        "finished_at": None,
+    })
+    validate_save_ticket(paths, ticket, request_id, "open")
+    return ticket
+
+
+def save_marker_plan(marker, wedge):
+    """The caller's intent, start date, planned revision and archive months
+    a save marker froze at B2a (D2.4 plus Deviation 1)."""
+    scope = marker["scope"]
+    intent = scope.get("intent")
+    started_on = scope.get("started_on")
+    if intent is None or started_on is None:
+        raise wedge("the marker carries no intent to rebuild the ticket from")
+    revisions = [
+        int(PurePosixPath(path).stem[1:])
+        for path in scope.get("declared_paths", [])
+        if path.startswith(".bimri/revisions/")
+    ]
+    months = sorted(
+        PurePosixPath(path).stem
+        for path in scope.get("declared_paths", [])
+        if path.startswith(".bimri/archive/")
+    )
+    if len(revisions) != 1 or not months:
+        raise wedge("the marker's declared plan is incomplete")
+    return intent, started_on, revisions[0], months
+
+
+SAVE_LOG_HEADER_RE = re.compile(
+    r"^# Run (?P<run>R\d{6}) \| (?P<at>\S+) \| "
+    r"actor:(?P<actor>[a-z0-9][a-z0-9._-]{0,63}) \| base:V\d{6} \| "
+    r"save:(?P<request>[a-z0-9][a-z0-9._-]{0,99})$"
+)
+SAVE_LOG_OPENING_END = "## Outcome\n\n"
+# A cancelled save whose proposal and log are both gone names no actor of
+# its own; its rebuilt ticket is attributed to the repair that closed it.
+CANCELLED_SAVE_ACTOR = "recover-save"
+
+
+def rebuild_cancelled_save_ticket(paths, state, marker):
+    """R0a for a cancel whose proposal is gone (a quarantine stub, or no
+    file at all): the lost ticket rebuilt from the marker scope and the run
+    log header alone (D1.10), so the request replays `failed` afterwards
+    instead of being taken as new."""
+    scope = marker["scope"]
+    request_id = scope["request_id"]
+    proposal_id = scope["proposal_ids"][0]
+    run_id = marker["run_id"]
+
+    def wedge(cause):
+        return SaveWedged(save_wedged_line(
+            paths, state, request_id, marker, cause
+        ))
+
+    intent, started_on, revision, months = save_marker_plan(marker, wedge)
+    actor = CANCELLED_SAVE_ACTOR
+    planned_at = marker["created_at"]
+    # No log: the planned opening bytes are unknown, and the empty log is
+    # what this run leaves behind.
+    log_sha256 = sha256_text("")
+    log = run_log_path(paths, run_id)
+    if log.is_file() and not path_is_redirected(log):
+        try:
+            text = log.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise wedge(f"log/{run_id}.md is unreadable: {exc}") from exc
+        match = SAVE_LOG_HEADER_RE.match(text.split("\n", 1)[0])
+        if (
+            match is not None
+            and match.group("run") == run_id
+            and match.group("request") == request_id
+        ):
+            actor = match.group("actor")
+            try:
+                parse_timestamp(match.group("at"), "save log time")
+                planned_at = match.group("at")
+            except BimriError:
+                pass
+        cut = text.find(SAVE_LOG_OPENING_END)
+        if cut >= 0:
+            log_sha256 = sha256_text(text[:cut + len(SAVE_LOG_OPENING_END)])
+    ticket = seal_save_ticket({
+        "ticket_schema": SAVE_TICKET_SCHEMA,
+        "bimri_version": MEMORY_FORMAT_VERSION,
+        "engine_release": ENGINE_VERSION,
+        "request_id": request_id,
+        "actor": actor,
+        "status": "admitted",
+        "created_at": planned_at,
+        "updated_at": now_iso(),
+        "started_on": started_on,
+        "intent": copy.deepcopy(intent),
+        "intent_hash": audit_witness_digest(intent),
+        "observed": parse_observed_token(intent["observed"]),
+        "run_id": run_id,
+        "proposal_id": proposal_id,
+        "entry_id": f"{run_id}-E001",
+        "revision": revision,
+        "archive_months": months,
+        "planned_at": planned_at,
+        "proposal_sha256": scope["proposal_hashes"][proposal_id],
+        "log_sha256": log_sha256,
+        "result": None,
+        "finished_at": None,
+    })
+    validate_save_ticket(paths, ticket, request_id, "open")
+    return ticket
+
+
+def resume_save_marker(paths, state, marker, rebuild=False):
+    """R0 / R2 / R3 for a live save marker (D3.4.4). Returns the finished
+    ticket, or None when the marker was withdrawn (R0b)."""
+    scope = marker["scope"]
+    request_id = scope.get("request_id")
+    if (
+        not isinstance(request_id, str)
+        or not REQUEST_ID_RE.fullmatch(request_id)
+        or len(scope.get("proposal_ids", [])) != 1
+    ):
+        raise SaveWedged(
+            "a save transition marker carries no usable request; run doctor"
+        )
+    proposal_id = scope["proposal_ids"][0]
+    cancelled = owner_abandoned_decision(paths, proposal_id)
+    if cancelled is not None:
+        # recover-save --cancel was interrupted after its decision: the save
+        # is closed as the owner asked. A quarantine stub at Q is the
+        # owner's repair, never a hash mismatch to wedge on.
+        return finish_cancelled_save(paths, state, marker, cancelled)
+    try:
+        ticket = read_save_ticket(paths, request_id, "open")
+        where = "open" if ticket is not None else None
+        if ticket is None:
+            ticket = read_save_ticket(paths, request_id, "done")
+            where = "done" if ticket is not None else None
+    except BimriError as exc:
+        raise SaveWedged(save_wedged_line(
+            paths, state, request_id, marker, str(exc)
+        )) from exc
+    if where == "done":
+        # R3: the answer is durable; only the publication is left.
+        if ticket["proposal_id"] != proposal_id:
+            raise SaveWedged(save_wedged_line(
+                paths, state, request_id, marker,
+                "its finished ticket does not match the live marker",
+            ))
+        paths.authority_write_mode = True
+        paths.authority_write_audit_healthy = True
+        publish_save_checkpoint(paths, state, full_replay=rebuild)
+        return ticket
+    if where == "open":
+        if (
+            ticket["proposal_id"] != proposal_id
+            or ticket["run_id"] != marker["run_id"]
+            or ticket["proposal_sha256"] != scope["proposal_hashes"][proposal_id]
+        ):
+            raise SaveWedged(save_wedged_line(
+                paths, state, request_id, marker,
+                "its open ticket does not match the live marker",
+            ))
+        verify_save_dependencies(paths, state, marker, ticket)
+        return run_save_ladder(
+            paths, state, ticket, full_replay=rebuild, marker=marker
+        )
+    # R0: the ticket is missing.
+    ppath = proposal_path(paths, proposal_id)
+    if ppath.exists() or ppath.is_symlink():
+        ticket = rebuild_save_ticket(paths, state, marker)
+        write_save_ticket(paths, ticket)
+        verify_save_dependencies(paths, state, marker, ticket)
+        return run_save_ladder(
+            paths, state, ticket, full_replay=rebuild, marker=marker
+        )
+    log = run_log_path(paths, marker["run_id"])
+    if log.exists() or log.is_symlink():
+        raise SaveWedged(save_wedged_line(
+            paths, state, request_id, marker,
+            f"proposal {proposal_id} is missing behind its log",
+        ))
+    cancel_authority_transition(paths, state, marker)
+    return None
+
+
+def finish_pending_save(paths, state):
+    """D3.4.1: every reconciling invocation finishes a live save marker.
+
+    A marker the ladder cannot continue stays in place and is recorded on
+    paths.wedged_save; writers then refuse with its line (R0c). A
+    filesystem error (a full disk) never finishes or cancels anything
+    (section 03 9): the marker stays resumable, the error is recorded on
+    paths.pending_save_error, a read serves memory around the marker and a
+    writer fails with the error (raise_pending_save_error).
+    """
+    paths.wedged_save = None
+    paths.pending_save_error = None
+    marker = load_live_save_marker(paths)
+    if marker is None or marker["scope"].get("completion") is not None:
+        return state
+    request_id = marker["scope"].get("request_id") or "-"
+    try:
+        resume_save_marker(paths, state, marker)
+    except SaveWedged as exc:
+        paths.wedged_save = {"request_id": request_id, "line": str(exc)}
+    except BimriError as exc:
+        if load_live_save_marker(paths) is None:
+            raise
+        paths.wedged_save = {
+            "request_id": request_id,
+            "line": save_wedged_line(paths, state, request_id, marker, str(exc)),
+        }
+    except OSError as exc:
+        if load_live_save_marker(paths) is None:
+            raise
+        paths.pending_save_error = exc
+        print(
+            f"BIMRI NOTICE: save {request_id} is unfinished; the next "
+            f"invocation finishes it ({exc})",
+            file=sys.stderr,
+        )
+        # The interrupted ladder may have moved this process's state ahead
+        # of what reached the disk: serve what is durable.
+        state = load_current_state_read_only(paths)
+    finally:
+        release_save_write_mode(paths)
+    return state
+
+
+def raise_pending_save_error(paths):
+    """A writer beside a save marker this process could not finish for a
+    filesystem error fails with that error, never a wedge (section 03 9)."""
+    error = getattr(paths, "pending_save_error", None)
+    if error is not None:
+        raise error
+
+
+def finish_open_save_tickets(paths, state, exclude=None, strict=True):
+    """D3.4.2: a writer (save, doctor) finishes other admitted tickets (R1)
+    before its own work. Returns notices for doctor when strict is false."""
+    notices = []
+    for request_id in list_save_ticket_names(paths, "open"):
+        if request_id == exclude:
+            continue
+        try:
+            ticket = read_save_ticket(paths, request_id, "open")
+        except BimriError as exc:
+            message = f"BIMRI NOTICE: {exc}"
+            notices.append(message)
+            if strict:
+                print(message, file=sys.stderr)
+            continue
+        if ticket is None or save_ticket_has_artifacts(paths, ticket):
+            # R1b belongs to its own request or recover-save.
+            continue
+        try:
+            finished = resume_admitted_ticket(paths, state, ticket)
+        except SaveStoreRefusal:
+            if strict:
+                raise
+            break
+        except SaveWedged as exc:
+            if strict:
+                raise BimriError(str(exc)) from exc
+            notices.append(str(exc))
+            continue
+        except OSError as exc:
+            message = (
+                f"save {request_id} is unfinished; it is finished by the "
+                f"next invocation ({exc})"
+            )
+            if strict:
+                raise BimriError(message) from exc
+            notices.append(message)
+            continue
+        result = finished["result"]
+        if result["outcome"] == "failed":
+            message = (
+                f"BIMRI NOTICE: save {request_id} failed: {result['error']}; "
+                "nothing was remembered"
+            )
+            notices.append(message)
+            if strict:
+                print(message, file=sys.stderr)
+    return notices
+
+
+# ---- the command -----------------------------------------------------------
+
+
+def render_save_line(ticket):
+    result = ticket["result"]
+    outcome = result["outcome"]
+    revision = (
+        f"V{result['revision']:06d}" if result["revision"] is not None else "-"
+    )
+    parts = [
+        f"BIMRI SAVE {outcome}",
+        f"request={ticket['request_id']}",
+        f"key={ticket['intent']['key']}",
+        f"run={ticket['run_id'] or '-'}",
+        f"proposal={ticket['proposal_id'] or '-'}",
+        f"decision={result['decision'] or '-'}",
+        f"revision={revision}",
+    ]
+    if outcome in {"accepted", "unchanged"}:
+        parts.append(f"token={result['token']}")
+    elif outcome == "held":
+        parts.append(f"reason={result['reason']}")
+    elif outcome == "stale":
+        parts.append(f"observed={ticket['intent']['observed']}")
+        parts.append(f"current={result['token']}")
+    elif outcome == "conflict":
+        parts.append(f"conflict={result['conflict_id']}")
+    return " ".join(parts)
+
+
+def save_conflict_block(paths, state, conflict_id, proposal_id):
+    try:
+        path = conflict_path(paths, conflict_id)
+        conflict = validate_conflict_record(
+            paths,
+            read_json_strict(path, path.name),
+            expected_conflict_id=conflict_id,
+        )
+        return (
+            render_conflict_review(
+                paths, state, conflict, proposal_ids=[proposal_id]
+            )
+            + "\nNew conflict notices: total 1 | displayed 1-1 | remaining 0"
+        )
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        return None
+
+
+def save_ticket_from_receipt(receipt, request_id, intent, paths, state):
+    """L8: render a replay from a compacted receipt line."""
+    outcome = receipt["outcome"]
+    proposal_id = receipt["proposal_id"]
+    decision = None
+    reason = None
+    conflict_id = None
+    if proposal_id:
+        try:
+            record = validate_decision(
+                read_json_strict(
+                    decision_path(paths, proposal_id), f"{proposal_id}.json"
+                ),
+                proposal_id,
+            )
+            decision = record["outcome"]
+            reason = record.get("reason") if decision == "held" else None
+            conflict_id = record.get("conflict_id")
+        except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+            decision = None
+    revision = receipt["revision"]
+    if isinstance(revision, str) and re.fullmatch(r"V?\d{1,6}", revision):
+        revision = int(revision.lstrip("V"))
+    else:
+        revision = None
+    token = None
+    if outcome in {"accepted", "unchanged", "stale"} and revision is not None:
+        key = intent["key"]
+        entries = authority_revision_entries(paths, state, revision, "compacted save")
+        entry = find_entry(entries, key=key)
+        if entry is None:
+            entry = accepted_cold_current_at_revision(paths, state, key, revision)
+        token = subject_token(revision, entry)
+    settled = []
+    cooled = []
+    if proposal_id and decision in {"accepted", "noop"}:
+        for pid in intent["settles"]:
+            if settlement_path(paths, pid).exists() and read_settlement(paths, state, pid)["settled_by"] == proposal_id:
+                settled.append(pid)
+        if decision == "accepted":
+            cooled = sorted({parse_entry_line(row["raw_line"])["key"]
+                            for row in archive_records(paths, strict=True)
+                            if row["proposal_id"] == proposal_id and row["reason"] == "cooled"})
+    return {
+        "request_id": request_id,
+        "intent": intent,
+        "run_id": receipt["run_id"],
+        "proposal_id": proposal_id,
+        "result": {
+            "outcome": outcome,
+            "decision": decision,
+            "revision": revision,
+            "conflict_id": conflict_id,
+            "reason": reason,
+            "token": token,
+            "settled": settled,
+            "cooled": cooled,
+            "error": None,
+        },
+    }
+
+
+def render_save_output(paths, state, ticket, replayed, lock_held_ms, output):
+    """L10: the result line (and notices), or the --json object."""
+    result = ticket["result"]
+    outcome = result["outcome"]
+    if outcome == "failed":
+        return []
+    if output == "json":
+        payload = {
+            "result": outcome,
+            "request": ticket["request_id"],
+            "key": ticket["intent"]["key"],
+            "run": ticket["run_id"],
+            "proposal": ticket["proposal_id"],
+            "decision": result["decision"],
+            "revision": result["revision"],
+            "token": result["token"] if outcome != "stale" else None,
+            "reason": result["reason"],
+            "observed": ticket["intent"]["observed"],
+            "current": result["token"] if outcome == "stale" else None,
+            "conflict": result["conflict_id"],
+            "settled": list(result["settled"]),
+            "cooled": list(result["cooled"]),
+            "replayed": bool(replayed),
+            "error": result["error"],
+            "lock_held_ms": int(lock_held_ms),
+        }
+        return [json.dumps(payload, ensure_ascii=False, sort_keys=True)]
+    lines = [render_save_line(ticket)]
+    if (
+        outcome == "accepted"
+        and ticket["intent"]["key"] in (result.get("cooled") or [])
+    ):
+        # Section 06 3.2 / local decision 17: an incoming generation that
+        # scored below every resident it could displace was accepted
+        # straight into cold memory; the line after the result says where.
+        lines.append(self_cooled_notice(ticket["intent"]["key"]))
+    if outcome == "held":
+        lines.append(
+            "BIMRI HELD: " + HOLD_MESSAGES.get(
+                result["reason"],
+                "The candidate is preserved and current truth is unchanged.",
+            )
+        )
+    elif outcome == "conflict" and result["conflict_id"]:
+        block = save_conflict_block(
+            paths, state, result["conflict_id"], ticket["proposal_id"]
+        )
+        if block:
+            lines.append(block)
+    return lines
+
+
+def save_request(paths, state, request_id, actor, intent, intent_hash, observed):
+    """L3 to L9 for one request. Returns (finished ticket, replayed)."""
+    where, ticket = lookup_save_ticket(paths, request_id)
+    if ticket is not None:
+        if ticket["intent_hash"] != intent_hash:
+            raise BimriError(
+                f"request {request_id} was already used with different content"
+            )
+        if where == "receipt":
+            if not (
+                ticket["outcome"] == "failed" and ticket["run_id"] is None
+            ):
+                return (
+                    save_ticket_from_receipt(
+                        ticket, request_id, intent, paths, state
+                    ),
+                    True,
+                )
+        elif ticket["status"] == "finished":
+            if not save_ticket_is_refusal(ticket):
+                return ticket, True
+        else:
+            return resume_admitted_ticket(paths, state, ticket), False
+    # L4
+    require_save_store_writable(paths, state)
+    # L5 with the L6 plan (reads only)
+    run_id = plan_save_run(paths, state)
+    planned_at = now_iso()
+    plan = save_plan(request_id, actor, run_id, planned_at)
+    verdict, payload = preflight_save(paths, state, intent, observed, plan)
+    now = planned_at
+    ticket = {
+        "ticket_schema": SAVE_TICKET_SCHEMA,
+        "bimri_version": MEMORY_FORMAT_VERSION,
+        "engine_release": ENGINE_VERSION,
+        "request_id": request_id,
+        "actor": actor,
+        "status": "admitted",
+        "created_at": now,
+        "updated_at": now,
+        "started_on": today(),
+        "intent": intent,
+        "intent_hash": intent_hash,
+        "observed": observed,
+        "run_id": None,
+        "proposal_id": None,
+        "entry_id": None,
+        "revision": None,
+        "archive_months": None,
+        "planned_at": None,
+        "proposal_sha256": None,
+        "log_sha256": None,
+        "result": None,
+        "finished_at": None,
+    }
+    if verdict != "proceed":
+        return finish_save_answer(
+            paths, seal_save_ticket(ticket), verdict, payload, state
+        ), False
+    proposal = payload["proposal"]
+    ticket.update({
+        "run_id": run_id,
+        "proposal_id": plan["proposal_id"],
+        "entry_id": plan["entry_id"],
+        "revision": next_commit_revision_number(paths, state),
+        "archive_months": [ticket["started_on"][:7]],
+        "planned_at": planned_at,
+        "proposal_sha256": sha256_text(proposal_file_text(proposal)),
+        "log_sha256": sha256_text(render_save_log(proposal)),
+    })
+    ticket = seal_save_ticket(ticket)
+    validate_save_ticket(paths, ticket, request_id, "open")
+    write_save_ticket(paths, ticket)  # B1
+    return run_planned_save(
+        paths, state, ticket, proposal,
+        dependencies=payload["dependencies"], live=payload["live"],
+    ), False
+
+
+def finished_save_replay(paths, state, request_id, intent, intent_hash):
+    """L3 replay only: this request's finished answer (ticket or compacted
+    receipt) with the same content, else None. Never writes; a different
+    content, an admitted ticket and a refusal that allocated nothing are
+    left to save_request."""
+    where, ticket = lookup_save_ticket(paths, request_id)
+    if ticket is None or ticket["intent_hash"] != intent_hash:
+        return None
+    if where == "receipt":
+        if ticket["outcome"] == "failed" and ticket["run_id"] is None:
+            return None
+        return save_ticket_from_receipt(ticket, request_id, intent, paths, state)
+    if ticket["status"] == "finished" and not save_ticket_is_refusal(ticket):
+        return ticket
+    return None
+
+
+def refuse_if_save_wedged(paths):
+    wedged = getattr(paths, "wedged_save", None)
+    if wedged:
+        raise BimriError(wedged["line"])
+
+
+def cmd_save(paths, args):
+    """`save` (D1.2): exit 0 accepted/unchanged, 1 held/stale/conflict,
+    2 failed. Only accepted means remembered."""
+    request_id = clean_request_id(args.request)
+    output = "json" if getattr(args, "json", False) else "tsv"
+    try:
+        observed = parse_observed_token(args.observed)
+        actor = clean_actor(args.actor)
+        intent = build_save_intent(args, observed)
+        intent_hash = audit_witness_digest(intent)
+    except BimriError as exc:
+        print(f"BIMRI ERROR: save {request_id} failed: {exc}", file=sys.stderr)
+        return 2
+    try:
+        with engine_lock(paths):
+            started = time.monotonic()
+            state = load_or_initialize(paths)
+            if not (
+                paths.audit_transition.exists()
+                or paths.audit_transition.is_symlink()
+            ):
+                # Finish an interrupted B15: a crash between clearing the
+                # marker and pruning leaves superseded generations behind
+                # (a retry that replays finishes it too).
+                prune_audit_manifest_generations(paths)
+            # D3.2 L3 before L4 (D3.3.4): this request's own finished answer
+            # replays with its recorded line and code even beside another
+            # wedged or unfinished save, or a blocked store.
+            ticket = finished_save_replay(
+                paths, state, request_id, intent, intent_hash
+            )
+            replayed = ticket is not None
+            if ticket is None:
+                refuse_if_save_wedged(paths)
+                raise_pending_save_error(paths)
+                sync_generated_view(paths, state)
+                finish_open_save_tickets(paths, state, exclude=request_id)
+                ticket, replayed = save_request(
+                    paths, state, request_id, actor, intent, intent_hash,
+                    observed,
+                )
+            lock_held_ms = int((time.monotonic() - started) * 1000)
+            lines = render_save_output(
+                paths, state, ticket, replayed, lock_held_ms, output
+            )
+    except BimriError as exc:
+        print(f"BIMRI ERROR: save {request_id} failed: {exc}", file=sys.stderr)
+        return 2
+    outcome = ticket["result"]["outcome"]
+    if outcome == "failed":
+        print(
+            f"BIMRI ERROR: save {request_id} failed: "
+            f"{ticket['result']['error'] or 'nothing was remembered'}",
+            file=sys.stderr,
+        )
+        return 2
+    for line in lines:
+        print(line)
+    return SAVE_EXIT_CODES[outcome]
+
+
+# ---- recover-save (D1.10) --------------------------------------------------
+
+
+def cancel_wedged_save(paths, state, marker, summary):
+    """--cancel: abandon the planned proposal and close the save run without
+    effect, legal only before any decision or effect (D1.10 revised)."""
+    scope = marker["scope"]
+    for relative, frozen in scope.get("dependency_hashes", {}).items():
+        if relative.startswith(".bimri/archive/") and relative in scope["declared_paths"]:
+            if not recover_archive_tail(paths, state, marker, relative, frozen):
+                raise BimriError(f"cannot cancel: restore the verified bytes of {relative} before retrying")
+            if scoped_protected_file_hash(paths, relative) != frozen:
+                raise BimriError(f"save already archived a row in {relative}; use recover-save {scope['request_id']} --rebuild")
+    condition = save_cancel_conditions(paths, state, marker)
+    if condition is not None:
+        raise BimriError(condition[1])
+    request_id = scope["request_id"]
+    proposal_id = scope["proposal_ids"][0]
+    run_id = marker["run_id"]
+    under_way = owner_abandoned_decision(paths, proposal_id)
+    if under_way is not None:
+        # This cancel was interrupted after its decision: the owner's
+        # recorded word stands and the rest of the cancel is finished.
+        return finish_cancelled_save(paths, state, marker, under_way)
+    ppath = proposal_path(paths, proposal_id)
+    log = run_log_path(paths, run_id)
+    ticket = read_save_ticket(paths, request_id, "open")
+    if ticket is None:
+        done = read_save_ticket(paths, request_id, "done")
+        if done is not None:
+            raise BimriError(
+                f"save {request_id} already finished; run recover-save "
+                f"{request_id} --rebuild"
+            )
+    if not ppath.exists() and not (log.exists() or log.is_symlink()):
+        # R0b: nothing durable under the marker.
+        cancel_authority_transition(paths, state, marker)
+        if ticket is not None:
+            finish_save_refusal(paths, ticket, summary)
+        return None
+    stub, proposal = read_planned_save_proposal(paths, scope, proposal_id)
+    if ticket is None:
+        # D1.10: a missing ticket is rebuilt as in R0a (from the proposal,
+        # or from the marker and log when the proposal is a stub) so the
+        # cancel is recorded and the same request replays `failed`.
+        if proposal is not None:
+            ticket = rebuild_save_ticket(paths, state, marker)
+        else:
+            ticket = rebuild_cancelled_save_ticket(paths, state, marker)
+        write_save_ticket(paths, ticket)
+    ensure_save_directories(paths)
+    paths.authority_write_mode = True
+    paths.authority_write_audit_healthy = True
+    begin_scoped_write_recording(paths)
+    try:
+        decision = None
+        if proposal is not None or stub:
+            dpath = decision_path(paths, proposal_id)
+            existing = None
+            if dpath.exists():
+                existing = validate_decision(
+                    read_json_strict(dpath, dpath.name), proposal_id
+                )
+            decision = write_decision(
+                paths,
+                proposal_id,
+                "abandoned",
+                replace_applying=True,
+                revision=state["head_revision"],
+                authority="human-asserted",
+                summary=(
+                    CANCELLED_WHILE_APPLYING + summary
+                    if existing is not None else summary
+                ),
+                engine_release=ENGINE_VERSION,
+            )
+        close_cancelled_save(
+            paths, state, marker, ticket, summary, proposal,
+            abandoned=(
+                decision is not None and decision["outcome"] == "abandoned"
+            ),
+        )
+    finally:
+        release_save_write_mode(paths)
+    return None
+
+
+CANCELLED_WHILE_APPLYING = "cancelled while applying: "
+
+
+def ensure_save_directories(paths):
+    # R-N: a reader finishing a save holds existing_store_lock, which never
+    # lays the store out; every directory a save appends into or creates in
+    # exists durably first.
+    for directory in (
+        paths.logs, paths.archive, paths.saves_open, paths.saves_done,
+    ):
+        ensure_directory_durable(directory)
+
+
+def read_planned_save_proposal(paths, scope, proposal_id):
+    """(stub, proposal) for a save's planned Q: a quarantine stub, the
+    intact proposal (bytes equal to its sealed hash), or neither."""
+    ppath = proposal_path(paths, proposal_id)
+    if path_is_redirected(ppath) or not ppath.is_file():
+        return False, None
+    raw = ppath.read_bytes()
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError):
+        return False, None
+    if is_quarantine_stub(data):
+        return True, None
+    if sha256_bytes(raw) != scope["proposal_hashes"].get(proposal_id):
+        return False, None
+    return False, data
+
+
+def close_cancelled_save(paths, state, marker, ticket, summary, proposal,
+                         abandoned):
+    """The tail of an owner cancel (D1.10): the save log closed
+    `[OUTCOME:fail]`, the run's bookkeeping, the ticket finished `failed`
+    and the checkpoint republished from a full replay. Every step is
+    create-if-missing or idempotent, so a cancel interrupted anywhere is
+    finished by the next invocation. Returns the finished ticket."""
+    run_id = marker["run_id"]
+    log = run_log_path(paths, run_id)
+    if proposal is not None and not (log.exists() or log.is_symlink()):
+        exclusive_write_text(log, render_save_log(proposal))
+    if log.exists():
+        lines = log.read_text(encoding="utf-8").splitlines()
+        closed_re = re.compile(rf"^\[CLOSED:{re.escape(run_id)} \S+\]$")
+        if not any(closed_re.match(line) for line in lines):
+            if not any(line.startswith("[OUTCOME:") for line in lines):
+                append_line(log, f"[OUTCOME:fail] {summary}")
+            append_line(log, f"[CLOSED:{run_id} {now_iso()}]")
+    number = int(run_id[1:])
+    state["run_count"] = max(state["run_count"], number)
+    state["run_dates"].setdefault(run_id, ticket["started_on"])
+    state["last_closed_at"] = now_iso()
+    save_state(paths, state)
+    finished = finish_save_ticket(
+        paths,
+        ticket,
+        make_save_result(
+            "failed",
+            decision="abandoned" if abandoned else None,
+            revision=state["head_revision"],
+            error=summary,
+        ),
+        null_plan=not abandoned,
+    )
+    publish_authority_full_replay(paths, state, marker)
+    return finished
+
+
+def cancelled_save_summary(decision):
+    """The owner's summary an abandoned decision recorded (without the
+    applying prefix), so a resumed cancel closes exactly as an
+    uninterrupted one."""
+    summary = decision.get("summary") or "save cancelled"
+    if summary.startswith(CANCELLED_WHILE_APPLYING):
+        summary = summary[len(CANCELLED_WHILE_APPLYING):]
+    return summary
+
+
+def finish_cancelled_save(paths, state, marker, decision):
+    """An owner cancel already under way: the planned proposal carries the
+    owner-asserted `abandoned` decision under the live save marker (the
+    cancel was interrupted after B5 of D1.10). Whatever is left of the
+    cancel is finished; the proposal may be intact or a quarantine stub,
+    and is never re-checked against its sealed hash (D3.4.4 R0c does not
+    apply to a save the owner closed). Returns the finished ticket."""
+    scope = marker["scope"]
+    request_id = scope["request_id"]
+    proposal_id = scope["proposal_ids"][0]
+    summary = cancelled_save_summary(decision)
+    try:
+        ticket = read_save_ticket(paths, request_id, "open")
+        done = None
+        if ticket is None:
+            done = read_save_ticket(paths, request_id, "done")
+    except BimriError as exc:
+        raise SaveWedged(save_wedged_line(
+            paths, state, request_id, marker, str(exc)
+        )) from exc
+    stub, proposal = read_planned_save_proposal(paths, scope, proposal_id)
+    del stub
+    if done is not None:
+        if (
+            done["proposal_id"] not in (None, proposal_id)
+            or done["result"]["outcome"] != "failed"
+        ):
+            raise SaveWedged(save_wedged_line(
+                paths, state, request_id, marker,
+                "its finished ticket does not match the live marker",
+            ))
+    elif ticket is None:
+        if proposal is not None:
+            ticket = rebuild_save_ticket(paths, state, marker)
+        else:
+            ticket = rebuild_cancelled_save_ticket(paths, state, marker)
+        write_save_ticket(paths, ticket)
+    ensure_save_directories(paths)
+    paths.authority_write_mode = True
+    paths.authority_write_audit_healthy = True
+    begin_scoped_write_recording(paths)
+    try:
+        if done is not None:
+            # The cancel's answer is durable; only publication is left.
+            publish_authority_full_replay(paths, state, marker)
+            return done
+        return close_cancelled_save(
+            paths, state, marker, ticket, summary, proposal, abandoned=True
+        )
+    finally:
+        release_save_write_mode(paths)
+
+
+def finish_retired_cancel(paths, state, request_id):
+    """A repeated --cancel of a cancel whose marker already retired: True
+    when the request's finished ticket records that owner cancel. A
+    publication interrupted after the marker cleared (an owner quarantine
+    still blocking the store) is finished by the same blocked recovery the
+    cancel runs, so the owner's retry, not only doctor, ends the repair."""
+    done = read_save_ticket(paths, request_id, "done")
+    if done is None:
+        return False
+    result = done["result"]
+    if (
+        result["outcome"] != "failed"
+        or result["decision"] != "abandoned"
+        or done["proposal_id"] is None
+        or owner_abandoned_decision(paths, done["proposal_id"]) is None
+    ):
+        return False
+    if load_audit_blocked_issues(paths):
+        governance_snapshot(
+            paths,
+            state,
+            use_witness=False,
+            audit_blocked=True,
+            recover_blocked=True,
+        )
+        prune_audit_manifest_generations(paths)
+    return True
+
+
+def cmd_recover_save(paths, request_id, cancel=False, rebuild=False,
+                     summary=None, human_approved=False):
+    """`recover-save` (D1.10): the owner-word repair of a wedged save."""
+    request_id = clean_request_id(request_id)
+    summary = clean_scalar(summary, "recovery summary", 900)
+    if cancel == rebuild:
+        raise BimriError("recover-save needs exactly one of --cancel or --rebuild.")
+    if cancel and not human_approved:
+        raise BimriError(
+            "recover-save --cancel requires --human-approved after the owner "
+            "explicitly cancels the save. This is an attestation, not "
+            "authentication."
+        )
+    with engine_lock(paths):
+        state = load_or_initialize(paths, finish_saves=False)
+        marker = load_live_save_marker(paths)
+        if marker is not None and marker["scope"].get("completion") is None:
+            if marker["scope"].get("request_id") != request_id:
+                raise BimriError(f"no wedged save named {request_id}")
+            if cancel:
+                cancel_wedged_save(paths, state, marker, summary)
+                print(
+                    f"BIMRI: save {request_id} cancelled; nothing was remembered."
+                )
+                return 0
+            try:
+                finished = resume_save_marker(paths, state, marker, rebuild=True)
+            except SaveWedged as exc:
+                raise BimriError(str(exc)) from exc
+            finally:
+                release_save_write_mode(paths)
+            if finished is None:
+                ticket = read_save_ticket(paths, request_id, "open")
+                if ticket is None:
+                    raise BimriError(
+                        f"save {request_id} had no durable proposal; its "
+                        "transition was withdrawn and nothing was remembered"
+                    )
+                finished = resume_admitted_ticket(paths, state, ticket)
+        else:
+            if marker is not None or (
+                paths.audit_transition.exists()
+                or paths.audit_transition.is_symlink()
+            ):
+                raise BimriError(f"no wedged save named {request_id}")
+            ticket = read_save_ticket(paths, request_id, "open")
+            if ticket is None:
+                if cancel and finish_retired_cancel(paths, state, request_id):
+                    print(
+                        f"BIMRI: save {request_id} cancelled; nothing was "
+                        "remembered."
+                    )
+                    return 0
+                raise BimriError(f"no wedged save named {request_id}")
+            if cancel:
+                finish_save_refusal(paths, ticket, summary)
+                print(
+                    f"BIMRI: save {request_id} cancelled; nothing was remembered."
+                )
+                return 0
+            try:
+                finished = resume_admitted_ticket(paths, state, ticket)
+            except SaveWedged as exc:
+                raise BimriError(str(exc)) from exc
+        lines = render_save_output(paths, state, finished, False, 0, "tsv")
+    outcome = finished["result"]["outcome"]
+    if outcome == "failed":
+        print(
+            f"BIMRI ERROR: save {request_id} failed: "
+            f"{finished['result']['error'] or 'nothing was remembered'}",
+            file=sys.stderr,
+        )
+        return 2
+    for line in lines:
+        print(line)
+    return SAVE_EXIT_CODES[outcome]
+
+
+# ---- doctor's save pass (D2.1, D1.10) --------------------------------------
+
+
+def save_undeclared_writes(paths, state, marker):
+    """Protected paths changed under a live save marker beyond its scope."""
+    manifest = getattr(paths, "full_audit_manifest", None)
+    if manifest is None:
+        return []
+    try:
+        prior = load_audit_manifest_evidence(paths, marker["prior_witness"])
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        return []
+    scope = marker["scope"]
+    allowed = {
+        path for path in scope.get("declared_paths", [])
+        if not path.startswith(".bimri/archive/")
+    }
+    for number in range(
+        marker["prior_witness"]["head_revision"] + 1,
+        state["head_revision"] + 1,
+    ):
+        allowed.add(_scoped_revision_path(number))
+    # A declared archive month is explained only by its own [BY:Q] rows.
+    allowed |= archive_paths_explained_by_transition(paths, marker)
+    prior_by_path = {row["path"]: row["sha256"] for row in prior}
+    live_by_path = {row["path"]: row["sha256"] for row in manifest}
+    changed = [
+        path for path in sorted(set(prior_by_path) | set(live_by_path))
+        if prior_by_path.get(path) != live_by_path.get(path)
+        and path not in allowed
+    ]
+    return changed
+
+
+def save_receipts_findings(paths):
+    """Doctor's receipts pass (D2.7, section 02 2.10).
+
+    Every line of every ``saves/receipts-YYYY-MM.tsv`` must have eight
+    columns and a reproducing line_hash; a damaged line is an error with the
+    move-aside remedy (its id simply stops being recognised, so a retry is a
+    new request). Returns (errors, {intact line: receipts file name}).
+    """
+    errors = []
+    intact = {}
+    base = paths.saves
+    if path_is_redirected(base) or not base.is_dir():
+        return errors, intact
+    remedy = (
+        "move the file aside (retries of those ids become new requests: "
+        "unchanged or stale, never a second effect)"
+    )
+    for entry in sorted(base.iterdir(), key=lambda item: item.name):
+        if not SAVE_RECEIPTS_NAME_RE.fullmatch(entry.name):
+            continue
+        if path_is_redirected(entry) or not entry.is_file():
+            continue  # the filename pass names it
+        try:
+            lines = entry.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError) as exc:
+            errors.append(
+                f"receipts file {entry.name} cannot be read ({exc}); {remedy}"
+            )
+            continue
+        damaged = []
+        for number, line in enumerate(lines, 1):
+            fields = parse_save_receipt_line(line)
+            if fields is None:
+                damaged.append(number)
+            else:
+                intact[line] = entry.name
+        for number in damaged[:SAVE_RECEIPT_DAMAGE_LIMIT]:
+            errors.append(
+                f"receipts file {entry.name} line {number} is damaged; {remedy}"
+            )
+        if len(damaged) > SAVE_RECEIPT_DAMAGE_LIMIT:
+            errors.append(
+                f"receipts file {entry.name} has "
+                f"{len(damaged) - SAVE_RECEIPT_DAMAGE_LIMIT} more damaged "
+                f"lines; {remedy}"
+            )
+    return errors, intact
+
+
+def save_doctor_findings(paths, state):
+    """Doctor's ticket and save-marker pass (crash-first 2.1 wording)."""
+    errors = []
+    warnings = []
+    for directory in (paths.saves, paths.saves_open, paths.saves_done):
+        if path_is_redirected(directory):
+            errors.append(
+                f"{directory.relative_to(paths.root).as_posix()} cannot be a "
+                "symbolic link or reparse point."
+            )
+            continue
+        if not directory.is_dir():
+            continue
+        for entry in sorted(directory.iterdir(), key=lambda item: item.name):
+            if directory == paths.saves and entry.name in {"open", "done"}:
+                continue
+            relative = entry.relative_to(paths.root).as_posix()
+            if path_is_redirected(entry) or entry.is_dir():
+                errors.append(
+                    f"{relative} is a subdirectory or redirected entry; "
+                    "move it aside."
+                )
+                continue
+            stem = entry.name[:-5] if entry.name.endswith(".json") else None
+            valid = (
+                directory != paths.saves
+                and stem is not None
+                and REQUEST_ID_RE.fullmatch(stem)
+                and stem.split(".", 1)[0] not in RESERVED_REQUEST_STEMS
+            ) or (
+                directory == paths.saves
+                and re.fullmatch(r"receipts-\d{4}-\d{2}\.tsv", entry.name)
+            )
+            if not valid:
+                warnings.append(
+                    f"ignored unknown filename in "
+                    f"{directory.relative_to(paths.root).as_posix()}: "
+                    f"{entry.name}."
+                )
+    receipt_errors, receipt_lines = save_receipts_findings(paths)
+    errors.extend(receipt_errors)
+    marker = load_live_save_marker(paths)
+    marker_request = (
+        marker["scope"].get("request_id") if marker is not None else None
+    )
+    for name in list_save_ticket_names(paths, "done"):
+        try:
+            ticket = read_save_ticket(paths, name, "done")
+        except BimriError as exc:
+            errors.append(str(exc))
+            continue
+        # Its own line already appended: compaction stopped between the
+        # append and the unlink (a later answer for a reused id is not).
+        compacted_into = (
+            receipt_lines.get(render_save_receipt_line(ticket))
+            if ticket is not None and receipt_lines else None
+        )
+        if compacted_into:
+            warnings.append(
+                f"save ticket done/{name}.json is also in {compacted_into} "
+                "(compaction interrupted; the next compaction unlinks it)"
+            )
+    for name in list_save_ticket_names(paths, "open"):
+        try:
+            ticket = read_save_ticket(paths, name, "open")
+        except BimriError as exc:
+            errors.append(str(exc))
+            continue
+        if ticket is None or name == marker_request:
+            continue
+        if save_ticket_has_artifacts(paths, ticket):
+            errors.append(
+                f"save {name} has durable records but no live transition "
+                f"marker; retry the same save request, or run recover-save "
+                f"{name} --rebuild"
+            )
+        else:
+            warnings.append(
+                f"unfinished save {name} (admitted {ticket['created_at']}); "
+                "the next save or doctor finishes it"
+            )
+    if marker is not None:
+        wedged = getattr(paths, "wedged_save", None)
+        scope_size = len(marker["scope"].get("declared_paths", []))
+        if wedged:
+            errors.append(wedged["line"])
+        undeclared = save_undeclared_writes(paths, state, marker)
+        for path in undeclared:
+            errors.append(
+                f"Unfinished engine operation: save {marker_request} wrote an "
+                f"undeclared protected path {path}; run recover-save "
+                f"{marker_request} --rebuild --summary \"...\" to finish it "
+                "through the full audit"
+            )
+        if not wedged and not undeclared:
+            warnings.append(
+                f"Unfinished engine operation: save {marker_request} (scope "
+                f"{scope_size} paths); the next command finishes it"
+            )
+    return errors, warnings
 
 
 def human_confirmed_proposal(proposal, preserve_source=True):
@@ -11587,6 +19149,21 @@ def resolution_candidate_reflected_at_revision(
     )
 
 
+def begin_resolve_write(paths, state, conflict_id):
+    """The resolve write boundary (D4.2): checkpoint-scoped when the gate
+    took the checkpoint path; a retry under its retained transition, or a
+    store the gate audited in full, keeps enter_authority_write_after_audit
+    (require_governance_for_resolution_retry already ran that audit)."""
+    if paths.resolution_gate_scoped:
+        begin_scoped_authority_write(
+            paths, state, "resolve", scope={"conflict_id": conflict_id}
+        )
+        return
+    enter_authority_write_after_audit(
+        paths, state, operation="resolve", scope={"conflict_id": conflict_id}
+    )
+
+
 def cmd_resolve(paths, conflict_id, choice, human_approved=False):
     conflict_id = validate_fixed_id(conflict_id, CONFLICT_RE, "conflict ID")
     choice = clean_scalar(choice, "resolution choice", 80)
@@ -11628,9 +19205,7 @@ def cmd_resolve(paths, conflict_id, choice, human_approved=False):
         validate_conflict_candidate_decisions(paths, conflict, existing)
         if existing and existing["status"] == "resolved":
             validate_resolution_effect(paths, state, conflict, existing)
-            enter_authority_write_after_audit(
-                paths, state, operation="resolve", scope={"conflict_id": conflict_id}
-            )
+            begin_resolve_write(paths, state, conflict_id)
             finalize_conflict_decisions(paths, existing)
             refresh_audit_witness_after_trusted_write(paths, state)
             print(
@@ -11714,9 +19289,7 @@ def cmd_resolve(paths, conflict_id, choice, human_approved=False):
                 expected_conflict_id=conflict_id,
             )
             validate_resolution_effect(paths, state, conflict, resolution)
-            enter_authority_write_after_audit(
-                paths, state, operation="resolve", scope={"conflict_id": conflict_id}
-            )
+            begin_resolve_write(paths, state, conflict_id)
             atomic_write_json(resolution_path, resolution)
             finalize_conflict_decisions(paths, resolution)
             refresh_audit_witness_after_trusted_write(paths, state)
@@ -11796,12 +19369,7 @@ def cmd_resolve(paths, conflict_id, choice, human_approved=False):
                 validate_resolution_effect(
                     paths, state, conflict, resolution
                 )
-                enter_authority_write_after_audit(
-                    paths,
-                    state,
-                    operation="resolve",
-                    scope={"conflict_id": conflict_id},
-                )
+                begin_resolve_write(paths, state, conflict_id)
                 atomic_write_json(resolution_path, resolution)
                 finalize_conflict_decisions(paths, resolution)
                 refresh_audit_witness_after_trusted_write(paths, state)
@@ -11852,9 +19420,7 @@ def cmd_resolve(paths, conflict_id, choice, human_approved=False):
             expected_conflict_id=conflict_id,
         )
         validate_resolution_state_bounds(paths, state, resolution)
-        enter_authority_write_after_audit(
-            paths, state, operation="resolve", scope={"conflict_id": conflict_id}
-        )
+        begin_resolve_write(paths, state, conflict_id)
         atomic_write_json(resolution_path, resolution)
         try:
             if choice in {"current", "dismiss"}:
@@ -11890,6 +19456,7 @@ def cmd_resolve(paths, conflict_id, choice, human_approved=False):
             paths.validated_audit_witness = None
             paths.authority_write_mode = False
             paths.authority_write_audit_healthy = False
+            end_scoped_write_recording(paths)
             raise
         resolution.update({
             "status": "resolved",
@@ -12218,8 +19785,11 @@ def validate_authority_replacement_graph(
             "conflicts",
             "resolutions",
             "recovery",
+            "settlements",
         ):
             source = getattr(paths, attribute)
+            if attribute == "settlements" and not source.exists() and not path_is_redirected(source):
+                continue
             destination = getattr(shadow_paths, attribute)
             if source.is_symlink() or not source.is_dir():
                 raise BimriError(
@@ -12548,31 +20118,74 @@ def lookup(table, value):
     return table[-1][1]
 
 
+def evidence_runs(entry):
+    """Every run prefix of a Tier 3 entry's R<n>-E<n> evidence IDs."""
+    return {
+        item.strip().split("-", 1)[0]
+        for item in str(entry.get("ev") or "").split(",")
+        if LEGACY_ENTRY_RE.fullmatch(item.strip())
+    }
+
+
+def newest_evidence_run(entry):
+    """Return the newest run among a Tier 3 entry's evidence IDs."""
+    runs = evidence_runs(entry)
+    if not runs:
+        return None
+    return max(runs, key=lambda run: (int(run[1:]), run))
+
+
+def retention_activity_run(entry):
+    if entry.get("tier") == 3:
+        return newest_evidence_run(entry)
+    return entry.get("last")
+
+
 def composite(entry, state):
-    importance = int(entry.get("imp", 3))
-    last_date = state.get("run_dates", {}).get(entry.get("last"))
+    """Retention score: importance x decay x trust x source (D6.3).
+
+    Tier 3 scores confidence weight x decay from its newest evidence run.
+    """
+    run = retention_activity_run(entry)
+    last_date = state.get("run_dates", {}).get(run) if run else None
+    dated = False
     if last_date:
         try:
             days = max(0, (dt.date.today() - dt.date.fromisoformat(last_date)).days)
             day_mult = lookup(DECAY_DAYS, days)
-        except ValueError:
+            dated = True
+        except (TypeError, ValueError):
             day_mult = DECAY_DAYS[-1][1]
     else:
         # Older releases could prune dates still referenced by current memory.
         # Unknown age must be conservatively coolable, never treated as fresh.
         day_mult = DECAY_DAYS[-1][1]
-    return importance * day_mult
+    if entry.get("tier") == 3:
+        return PATTERN_CONFIDENCE_WEIGHT.get(entry.get("conf"), 1) * day_mult * 1.0
+    if entry.get("trust") == "confirmed" and dated:
+        day_mult = max(day_mult, CONFIRMED_DECAY_FLOOR)
+    importance = int(entry.get("imp", 3))
+    trust_weight = 2.0 if entry.get("trust") == "confirmed" else 1.0
+    source_weight = 1.25 if entry.get("source") == "user" else 1.0
+    return importance * day_mult * trust_weight * source_weight
 
 
 def retention_order(entry, state):
     """One wall-clock retention order for forecast and actual cooling."""
-    status_rank = {"closed": 0, "watch": 1, "active": 2}
-    activity = state.get("run_dates", {}).get(
-        entry.get("last"), "0001-01-01"
+    run = retention_activity_run(entry)
+    activity = (
+        state.get("run_dates", {}).get(run, "0001-01-01")
+        if run else "0001-01-01"
     )
+    if entry.get("tier") == 3:
+        status_rank = 2
+    else:
+        status_rank = {"closed": 0, "watch": 1, "active": 2}.get(
+            entry.get("status"), 3
+        )
     return (
         composite(entry, state),
-        status_rank.get(entry.get("status"), 3),
+        status_rank,
         activity,
         entry.get("key", ""),
         entry.get("id", ""),
@@ -12659,6 +20272,7 @@ def exact_current_recall_records(paths, state, key, hot_entries=None):
             "trust": entry.get("trust", ""),
             "source": entry.get("source", ""),
             "typed": typed_recall_fields(entry),
+            "raw": entry["raw"],
         })
     cold = state.get("cold_current", {}).get(key)
     if cold is not None:
@@ -12672,8 +20286,24 @@ def exact_current_recall_records(paths, state, key, hot_entries=None):
             "trust": entry.get("trust", ""),
             "source": entry.get("source", ""),
             "typed": typed_recall_fields(entry),
+            "raw": cold["raw_line"],
         })
     return records
+
+
+def candidate_recall_row(paths, state, proposal, decision, current_by_key):
+    pid = proposal["proposal_id"]
+    file = settlement_path(paths, pid)
+    settlement = read_settlement(paths, state, pid) if file.exists() else None
+    if settlement is None and proposal_equivalent(proposal, current_by_key.get(proposal["key"])):
+        return None
+    return {
+        "location": "HISTORY" if settlement else "HELD", "key": proposal["key"],
+        "id": pid, "detail": proposal["text"],
+        "reason": "settled by " + settlement["settled_by"] if settlement else decision["reason"],
+        "trust": proposal.get("trust", ""), "source": proposal.get("source", ""),
+        "typed": typed_proposal_fields(proposal),
+    }
 
 
 def held_recall_records(paths, state, key=None):
@@ -12700,19 +20330,48 @@ def held_recall_records(paths, state, key=None):
         proposal = authority_proposal(paths, state, path.stem)
         if key is not None and proposal["key"] != key:
             continue
-        if proposal_equivalent(
-            proposal, current_by_key.get(proposal["key"])
-        ):
+        row = candidate_recall_row(paths, state, proposal, decision, current_by_key)
+        if row is not None:
+            records.append(row)
+    return records
+
+
+def history_recall_records(archive_rows, current_cold_effects):
+    """HISTORY records from strictly parsed archive rows, deduped by line.
+
+    Shared by the full path (``recall_records``) and the warm search
+    (``checkpoint_recall_records``) so both build the same records in the
+    same order.
+    """
+    historical = {}
+    reason_rank = {"cooled": 0, "replaced": 1, "closed": 2}
+    for record in archive_rows:
+        if (
+            record["proposal_id"], record["raw_line"], record["reason"]
+        ) in current_cold_effects:
             continue
+        generation_key = record["raw_line"]
+        existing = historical.get(generation_key)
+        if (
+            existing is None
+            or reason_rank.get(record["reason"], 1)
+            > reason_rank.get(existing["reason"], 1)
+        ):
+            historical[generation_key] = record
+    records = []
+    for record in historical.values():
+        entry = record["entry"]
+        if entry is None:
+            entry = parse_entry_line(record["raw_line"])
         records.append({
-            "location": "HELD",
-            "key": proposal["key"],
-            "id": proposal["proposal_id"],
-            "detail": proposal["text"],
-            "reason": decision["reason"],
-            "trust": proposal.get("trust", ""),
-            "source": proposal.get("source", ""),
-            "typed": typed_proposal_fields(proposal),
+            "location": "HISTORY",
+            "key": entry.get("key", ""),
+            "id": entry["id"],
+            "detail": entry.get("text", ""),
+            "reason": record["reason"],
+            "trust": entry.get("trust", ""),
+            "source": entry.get("source", ""),
+            "typed": typed_recall_fields(entry),
         })
     return records
 
@@ -12738,6 +20397,7 @@ def recall_records(paths, state):
             "trust": entry.get("trust", ""),
             "source": entry.get("source", ""),
             "typed": typed_recall_fields(entry),
+            "raw": entry["raw"],
         })
     current_cold_effects = set()
     for key, cold in sorted(state.get("cold_current", {}).items()):
@@ -12752,37 +20412,16 @@ def recall_records(paths, state):
             "trust": entry.get("trust", ""),
             "source": entry.get("source", ""),
             "typed": typed_recall_fields(entry),
+            "raw": cold["raw_line"],
         })
         current_cold_effects.add(
             (cold["archived_by"], cold["raw_line"], "cooled")
         )
-    historical = {}
-    reason_rank = {"cooled": 0, "replaced": 1, "closed": 2}
-    for record in archive_records(paths):
-        if (
-            record["proposal_id"], record["raw_line"], record["reason"]
-        ) in current_cold_effects:
-            continue
-        generation_key = record["raw_line"]
-        existing = historical.get(generation_key)
-        if (
-            existing is None
-            or reason_rank.get(record["reason"], 1)
-            > reason_rank.get(existing["reason"], 1)
-        ):
-            historical[generation_key] = record
-    for record in historical.values():
-        entry = parse_entry_line(record["raw_line"])
-        records.append({
-            "location": "HISTORY",
-            "key": entry.get("key", ""),
-            "id": entry["id"],
-            "detail": entry.get("text", ""),
-            "reason": record["reason"],
-            "trust": entry.get("trust", ""),
-            "source": entry.get("source", ""),
-            "typed": typed_recall_fields(entry),
-        })
+    records.extend(
+        history_recall_records(
+            archive_records(paths, strict=True), current_cold_effects
+        )
+    )
     for path in sorted(paths.decisions.glob("R*-Q*.json")):
         if path.is_symlink() or not path.is_file():
             continue
@@ -12791,53 +20430,43 @@ def recall_records(paths, state):
             continue
         decision = validate_decision(decision_data, path.stem)
         proposal = authority_proposal(paths, state, path.stem)
-        if proposal_equivalent(
-            proposal, current_by_key.get(proposal["key"])
-        ):
-            continue
-        records.append({
-            "location": "HELD",
-            "key": proposal["key"],
-            "id": proposal["proposal_id"],
-            "detail": proposal["text"],
-            "reason": decision["reason"],
-            "trust": proposal.get("trust", ""),
-            "source": proposal.get("source", ""),
-            "typed": typed_proposal_fields(proposal),
-        })
+        row = candidate_recall_row(paths, state, proposal, decision, current_by_key)
+        if row is not None:
+            records.append(row)
     return records
 
 
-def cmd_recall(
-    paths, key=None, query=None, history=True, limit=20, output="tsv"
-):
-    if output not in {"tsv", "json"}:
-        raise BimriError("recall output must be tsv or json.")
-    if (key is None) == (query is None):
-        raise BimriError("recall requires exactly one of --key or --query.")
-    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
-        raise BimriError("recall limit must be a positive integer.")
-    if limit > 500:
-        raise BimriError("recall limit cannot exceed 500.")
-    exact_key = clean_key(key) if key is not None else None
-    search_text = (
-        clean_scalar(query, "recall query", 500).casefold()
-        if query is not None else None
+def full_check_recall_records(paths, exact_key=None):
+    """(state, recall records) after a full governance audit of paths (a
+    copy); the state is the audited tree's, read for the version token."""
+    state = load_current_state_read_only(paths)
+    _conflicts, authority_issues = governance_snapshot(
+        paths,
+        state,
+        use_witness=False,
+        write_witness=False,
     )
-    search_tokens = (
-        re.findall(r"[a-z0-9]+", search_text) if search_text is not None else []
-    )
-    if search_text is not None and (not search_tokens or len(search_tokens) > 32):
-        raise BimriError("recall query must contain 1 to 32 lexical tokens.")
+    if authority_issues:
+        raise BimriError(
+            "recall stopped because authority recovery is required: "
+            + "; ".join(authority_issues[:3])
+        )
+    if exact_key is not None:
+        return state, exact_current_recall_records(paths, state, exact_key)
+    return state, recall_records(paths, state)
+
+
+def exact_recall_records_live(paths, exact_key):
+    """(state, records) for the exact current read: warm from the
+    checkpoint, else today's live full check (which still publishes a
+    checkpoint on a cold store)."""
     with existing_store_lock(paths):
         authority_issues = []
-        checkpoint = None
-        if exact_key is not None and not history:
+        checkpoint = load_exact_checkpoint_state(paths, exact_key)
+        if checkpoint is None and reconcile_engine_checkpoint_for_exact_read(
+            paths
+        ):
             checkpoint = load_exact_checkpoint_state(paths, exact_key)
-            if checkpoint is None and reconcile_engine_checkpoint_for_exact_read(
-                paths
-            ):
-                checkpoint = load_exact_checkpoint_state(paths, exact_key)
         if checkpoint is not None:
             state, hot_entries, _witness = checkpoint
             records = exact_current_recall_records(
@@ -12850,17 +20479,310 @@ def cmd_recall(
                 state,
                 use_witness=False,
             )
-            if exact_key is not None and not history:
-                records = exact_current_recall_records(
-                    paths, state, exact_key
-                )
-            else:
-                records = recall_records(paths, state)
+            records = exact_current_recall_records(paths, state, exact_key)
         if authority_issues:
             raise BimriError(
                 "recall stopped because authority recovery is required: "
                 + "; ".join(authority_issues[:3])
             )
+    return state, records
+
+
+def _warm_read_debug(label, exc):
+    """A warm-path miss must never hide as a slow read (BIMRI_DEBUG=1)."""
+    if os.environ.get("BIMRI_DEBUG") == "1":
+        print(
+            f"BIMRI DEBUG: {label} fell back to the full path: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+
+
+def _checkpoint_state_from_fixed_files(paths):
+    """Strictly load state.json as the warm exact read does, or None."""
+    if path_is_redirected(paths.state) or not paths.state.is_file():
+        return None
+    try:
+        raw = json.loads(paths.state.read_bytes().decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(raw, dict)
+        or raw.get("bimri_version") not in READABLE_STATE_VERSIONS
+    ):
+        return None
+    require_complete_v5_state(raw)
+    state = fresh_state()
+    state.update(raw)
+    if (
+        isinstance(state.get("head_revision"), bool)
+        or not isinstance(state.get("head_revision"), int)
+        or state["head_revision"] < 0
+        or not isinstance(state.get("head_hash"), str)
+        or not HASH_RE.fullmatch(state["head_hash"])
+    ):
+        return None
+    return state
+
+
+def checkpoint_search_state(paths):
+    """Fixed-file evidence for a warm search, or None (a cache miss).
+
+    Mirrors ``load_exact_checkpoint_state`` without the per-key part: state,
+    legacy lineage, a valid checkpoint, no blocked record, the accepted head,
+    the checkpoint's manifest (M0) and facts (F0). Reads no run log,
+    revision history, decision or proposal in bulk; writes nothing.
+    """
+    try:
+        state = _checkpoint_state_from_fixed_files(paths)
+        if state is None:
+            return None
+        require_read_only_legacy_lineage(paths, state)
+        witness = load_valid_audit_witness(paths, state)
+        if witness is None or load_audit_blocked_issues(paths):
+            return None
+        validate_cold_current(state.get("cold_current", {}))
+        hot_entries = validate_checkpoint_head(paths, state)
+        m0 = load_audit_manifest_evidence(paths, witness)
+        f0 = load_audit_facts_evidence(paths, witness)
+        return state, hot_entries, witness, m0, f0
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError) as exc:
+        _warm_read_debug("warm search checkpoint", exc)
+        return None
+
+
+def _manifest_bound_bytes(paths, path, m0_by_path):
+    """Live bytes of one protected file, or None unless they match M0."""
+    relative = path.relative_to(paths.root).as_posix()
+    expected = m0_by_path.get(relative)
+    if expected is None or path_is_redirected(path) or not path.is_file():
+        return None
+    content = path.read_bytes()
+    if sha256_bytes(content) != expected:
+        return None
+    return content
+
+
+def checkpoint_recall_records(paths, state, hot_entries, m0, f0, current_words=None):
+    """Build ``recall_records``'s records from the checkpoint, or None.
+
+    HOT from the validated head, COLD from ``state.cold_current`` (inside
+    the checkpoint's state hash), HISTORY from archive months whose live
+    bytes hash to M0, HELD from F0's held list with each decision and
+    proposal hash-checked against M0. Any mismatch is a cache miss (None)
+    and the caller takes the full path, which writes any drift receipt.
+    """
+    records = []
+    current_by_key = {}
+    for entry in hot_entries:
+        if entry.get("key"):
+            current_by_key[entry["key"]] = entry
+        records.append({
+            "location": "HOT",
+            "key": entry.get("key", ""),
+            "id": entry["id"],
+            "detail": entry.get("text", ""),
+            "reason": "current",
+            "trust": entry.get("trust", ""),
+            "source": entry.get("source", ""),
+            "typed": typed_recall_fields(entry),
+            "raw": entry["raw"],
+        })
+    current_cold_effects = set()
+    for key, cold in sorted(state.get("cold_current", {}).items()):
+        entry = parse_entry_line(cold["raw_line"])
+        current_by_key[key] = entry
+        records.append({
+            "location": "COLD",
+            "key": key,
+            "id": entry["id"],
+            "detail": entry.get("text", ""),
+            "reason": "current",
+            "trust": entry.get("trust", ""),
+            "source": entry.get("source", ""),
+            "typed": typed_recall_fields(entry),
+            "raw": cold["raw_line"],
+        })
+        current_cold_effects.add(
+            (cold["archived_by"], cold["raw_line"], "cooled")
+        )
+    m0_by_path = {row["path"]: row["sha256"] for row in m0}
+    if current_words is not None:
+        # The checkpoint proves each cold binding. Check its current archive
+        # bytes once per matched month, even when many results share a month.
+        months = {state["cold_current"][record["key"]]["archived_on"][:7]
+                  for record in records if record["location"] == "COLD"
+                  and current_query_score(record, current_words)}
+        for month in months:
+            if _manifest_bound_bytes(paths, paths.archive / (month + ".md"), m0_by_path) is None:
+                return None
+        return records
+    if path_is_redirected(paths.archive) or not paths.archive.is_dir():
+        return None
+    archive_prefix = paths.archive.relative_to(paths.root).as_posix() + "/"
+    expected_months = {
+        relative for relative in m0_by_path
+        if relative.startswith(archive_prefix)
+        and relative.endswith(".md")
+        and "/" not in relative[len(archive_prefix):]
+    }
+    live_months = sorted(paths.archive.glob("*.md"))
+    if {
+        target.relative_to(paths.root).as_posix() for target in live_months
+    } != expected_months:
+        return None
+    archive_rows = []
+    for target in live_months:
+        content = _manifest_bound_bytes(paths, target, m0_by_path)
+        if content is None:
+            return None
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        # A hash-matching month was audited; a foreign row in it is a real
+        # defect, named by month and line exactly as the full path names it.
+        archive_rows.extend(
+            parse_archive_month(target, strict=True, content=text)
+        )
+    records.extend(history_recall_records(archive_rows, current_cold_effects))
+    for proposal_id in sorted(set(f0["held"]) | set(f0["settled"])):
+        if proposal_id in f0["settled"] and _manifest_bound_bytes(
+            paths, settlement_path(paths, proposal_id), m0_by_path
+        ) is None:
+            return None
+        decision_bytes = _manifest_bound_bytes(
+            paths, decision_path(paths, proposal_id), m0_by_path
+        )
+        proposal_bytes = _manifest_bound_bytes(
+            paths, proposal_path(paths, proposal_id), m0_by_path
+        )
+        if decision_bytes is None or proposal_bytes is None:
+            return None
+        decision_data = json.loads(decision_bytes.decode("utf-8"))
+        proposal_data = json.loads(proposal_bytes.decode("utf-8"))
+        if (
+            not isinstance(decision_data, dict)
+            or decision_data.get("outcome") != "held"
+            or not isinstance(proposal_data, dict)
+            or is_quarantine_stub(proposal_data)
+        ):
+            return None
+        decision = validate_decision(decision_data, proposal_id)
+        proposal = validate_proposal(proposal_data, state)
+        if proposal["proposal_id"] != proposal_id:
+            return None
+        row = candidate_recall_row(paths, state, proposal, decision, current_by_key)
+        if row is not None:
+            records.append(row)
+    return records
+
+
+def warm_search_records(paths, current_words=None):
+    """(state, records) for a warm search, or None when the checkpoint
+    cannot serve it."""
+    checkpoint = checkpoint_search_state(paths)
+    if checkpoint is None:
+        return None
+    state, hot_entries, _witness, m0, f0 = checkpoint
+    try:
+        records = checkpoint_recall_records(paths, state, hot_entries, m0, f0,
+                                            current_words=current_words)
+        return None if records is None else (state, records)
+    except BimriError as exc:
+        if str(exc).startswith("archive authority/recovery corruption in "):
+            raise
+        _warm_read_debug("warm search records", exc)
+        return None
+    except (OSError, UnicodeError, ValueError, TypeError, KeyError) as exc:
+        _warm_read_debug("warm search records", exc)
+        return None
+
+
+QUERY_FILLER = frozenset(
+    "a an are can do does for how i in is it may me my of on our the to "
+    "what when which with".split()
+)
+
+
+def current_query_words(text):
+    return set(re.findall(r"[^\W_]+", text.casefold(), flags=re.UNICODE)) - QUERY_FILLER
+
+
+def current_query_score(record, words):
+    """Match every content word against an accepted record and its saved aliases."""
+    if record["location"] not in {"HOT", "COLD"} or not words:
+        return 0
+    tags = current_query_words(" ".join(record.get("typed", {}).get("tags") or []))
+    key = current_query_words(record["key"])
+    detail = current_query_words(record.get("detail", ""))
+    if not words.issubset(key | detail | tags):
+        return 0
+    return 1 + len(words & key) * 2 + len(words & tags)
+
+
+def cmd_recall(
+    paths, key=None, query=None, history=True, limit=20, output="tsv",
+    audit=False, current=False,
+):
+    if output not in {"tsv", "json"}:
+        raise BimriError("recall output must be tsv or json.")
+    if (key is None) == (query is None):
+        raise BimriError("recall requires exactly one of --key or --query.")
+    if current and query is None:
+        raise BimriError("--current requires --query; exact keys already return current memory.")
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise BimriError("recall limit must be a positive integer.")
+    if limit > 500:
+        raise BimriError("recall limit cannot exceed 500.")
+    exact_key = clean_key(key) if key is not None else None
+    search_text = (
+        clean_scalar(query, "recall query", 500).casefold()
+        if query is not None else None
+    )
+    search_tokens = (
+        re.findall(r"[^\W_]+" if current else r"[a-z0-9]+", search_text)
+        if search_text is not None else []
+    )
+    if search_text is not None and (not search_tokens or len(search_tokens) > 32):
+        raise BimriError("recall query must contain 1 to 32 lexical tokens.")
+    # Section 06 4.2 / section 05 5: A an exact current read is warm from
+    # the checkpoint (else today's live full check); B a query without
+    # --audit is the warm search (D6.4), reconciling a sealed engine
+    # transition once on a miss; C/D --audit, --history and a warm-search
+    # miss take the full check on a copy captured under the read lock,
+    # which never publishes, condemns or reconciles (D5.3.3).
+    state = None
+    records = None
+    current_words = current_query_words(search_text) if current else None
+    if search_text is not None and not audit:
+        with existing_store_lock(paths):
+            warm = warm_search_records(paths, current_words)
+            if warm is None and reconcile_engine_checkpoint_for_exact_read(
+                paths
+            ):
+                warm = warm_search_records(paths, current_words)
+        if warm is not None:
+            state, records = warm
+    if records is None and (history or search_text is not None or audit):
+        try:
+            state, records = audit_copy_read(
+                paths,
+                lambda copy_paths, _receipt: full_check_recall_records(
+                    copy_paths,
+                    exact_key if exact_key is not None and not history else None,
+                ),
+            )
+        except AuditCopyDeferred as exc:
+            return print_audit_copy_read_deferral(exc)
+        except AuditCopyRefused as exc:
+            raise BimriError(
+                "recall stopped because authority recovery is required: "
+                + str(exc)
+            ) from exc
+    elif records is None:
+        state, records = exact_recall_records_live(paths, exact_key)
+    scores = {}
     matches = []
     for record in records:
         if exact_key is not None:
@@ -12868,6 +20790,11 @@ def cmd_recall(
                 continue
             if not history and record["location"] == "HISTORY":
                 continue
+        elif current:
+            score = current_query_score(record, current_words)
+            if not score:
+                continue
+            scores[record["id"]] = score
         else:
             typed = record.get("typed", {})
             haystack = " ".join(
@@ -12887,6 +20814,7 @@ def cmd_recall(
     location_rank = {"HOT": 0, "COLD": 1, "HELD": 2, "HISTORY": 3}
     matches.sort(
         key=lambda item: (
+            -scores.get(item["id"], 0),
             location_rank.get(item["location"], 9),
             item["key"],
             item["id"],
@@ -12894,25 +20822,53 @@ def cmd_recall(
         )
     )
     if output == "json":
+        head_revision = state["head_revision"]
+
+        def record_token(record):
+            # D1.3: the version token an agent passes to save --observed.
+            storage = "hot" if record["location"] == "HOT" else "cold"
+            return (
+                f"V{head_revision:06d}:{storage}:{line_hash(record['raw'])}"
+            )
+
+        rendered = []
+        for record in matches[:limit]:
+            item = dict(
+                {
+                    "location": record["location"],
+                    "key": record["key"],
+                    "id": record["id"],
+                    "reason": record["reason"],
+                    "trust": record["trust"],
+                    "source": record["source"],
+                    "text": record["detail"],
+                },
+                **record.get("typed", {})
+            )
+            if (
+                exact_key is not None
+                and record["location"] in {"HOT", "COLD"}
+                and record.get("raw") is not None
+            ):
+                item["token"] = record_token(record)
+            rendered.append(item)
         payload = {
-            "matches": [
-                dict(
-                    {
-                        "location": record["location"],
-                        "key": record["key"],
-                        "id": record["id"],
-                        "reason": record["reason"],
-                        "trust": record["trust"],
-                        "source": record["source"],
-                        "text": record["detail"],
-                    },
-                    **record.get("typed", {})
-                )
-                for record in matches[:limit]
-            ],
+            "matches": rendered,
             "total": len(matches),
             "omitted": max(0, len(matches) - limit),
         }
+        if exact_key is not None:
+            current = [
+                record for record in matches
+                if record["location"] in {"HOT", "COLD"}
+                and record["key"] == exact_key
+                and record.get("raw") is not None
+            ]
+            payload["token"] = (
+                record_token(current[0])
+                if current
+                else f"V{head_revision:06d}:absent"
+            )
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         return 0 if matches else 1
     for record in matches[:limit]:
@@ -12938,6 +20894,214 @@ def cmd_recall(
     return 0
 
 
+COLD_LIMIT_DEFAULT = 100
+COLD_LIMIT_MAX = 5000
+COLD_PREFIX_RE = re.compile(r"[a-z0-9._-]{1,80}")
+COLD_FIRST_SENTENCE_CHARS = 160
+
+
+def first_sentence(text):
+    """Text up to the first '. ', '? ' or '! ' (mark kept), capped at 160."""
+    text = str(text or "")
+    ends = [
+        index for index in (
+            text.find(". "), text.find("? "), text.find("! ")
+        )
+        if index >= 0
+    ]
+    if ends:
+        text = text[:min(ends) + 1]
+    return text[:COLD_FIRST_SENTENCE_CHARS]
+
+
+def load_listing_state(paths):
+    """State for ``cold``: ``(state, warm)``.
+
+    Warm: a valid checkpoint binds ``state.cold_current`` inside its state
+    hash, so the listing reads no archive month, run log or revision. No
+    valid checkpoint (after one sealed-transition reconcile): the state is
+    loaded read-only as ``recall`` does, which binds every cold month.
+    """
+    state = None
+    for attempt in (0, 1):
+        try:
+            candidate = _checkpoint_state_from_fixed_files(paths)
+        except (BimriError, OSError, UnicodeError, ValueError, TypeError) as exc:
+            _warm_read_debug("cold listing checkpoint", exc)
+            candidate = None
+        if candidate is not None:
+            # A lineage refusal is an error, never a cache miss.
+            require_read_only_legacy_lineage(paths, candidate)
+            try:
+                witness = load_valid_audit_witness(paths, candidate)
+                if witness is not None:
+                    validate_cold_current(candidate.get("cold_current", {}))
+                    state = candidate
+            except (
+                BimriError, OSError, UnicodeError, ValueError, TypeError
+            ) as exc:
+                _warm_read_debug("cold listing checkpoint", exc)
+        if state is not None or attempt:
+            break
+        if not reconcile_engine_checkpoint_for_exact_read(paths):
+            break
+    warm = state is not None
+    if not warm:
+        state = load_current_state_read_only(paths)
+    blocked = load_audit_blocked_issues(paths)
+    if blocked:
+        raise BimriError(
+            "cold stopped because authority recovery is required: "
+            + "; ".join(blocked[:3])
+        )
+    return state, warm
+
+
+def cold_listing_rows(state):
+    """One row per cold-current subject, straight from ``state``.
+
+    Never ``cold_entry``: the listing iterates the checkpointed records and
+    parses each raw line once.
+    """
+    head = state["head_revision"]
+    rows = []
+    for key, record in sorted(state.get("cold_current", {}).items()):
+        entry = parse_entry_line(record["raw_line"])
+        tier = int(entry.get("tier", 0) or 0)
+        if tier == 3:
+            trust = source = importance = ""
+            status = entry.get("conf", "")
+        else:
+            trust = entry.get("trust", "")
+            source = entry.get("source", "")
+            importance = str(entry.get("imp", "") or "")
+            status = entry.get("status", "") or entry.get("kind", "")
+        text = entry.get("text", "")
+        sentence = first_sentence(text)
+        token = f"V{head:06d}:cold:{record['line_hash']}"
+        subject = {
+            "key": key,
+            "id": entry["id"],
+            "entry_id": entry["id"],
+            "text": text,
+            "trust": entry.get("trust", ""),
+            "source": entry.get("source", ""),
+        }
+        subject.update(typed_recall_fields(entry))
+        subject.update({
+            "archived_on": record["archived_on"],
+            "archived_by": record["archived_by"],
+            "first_sentence": sentence,
+            "token": token,
+        })
+        rows.append({
+            "tsv": (
+                key, record["archived_on"], trust, source, importance,
+                status, sentence,
+            ),
+            "json": subject,
+            "archived_on": record["archived_on"],
+            "key": key,
+        })
+    # archived_on descending, then key ascending (stable sort).
+    rows.sort(key=lambda row: row["key"])
+    rows.sort(key=lambda row: row["archived_on"], reverse=True)
+    return rows
+
+
+def cmd_cold(paths, limit=COLD_LIMIT_DEFAULT, prefix=None, output="tsv"):
+    """List cold-current subjects: key, archive date, provenance, first sentence."""
+    if output not in {"tsv", "json"}:
+        raise BimriError("cold output must be tsv or json.")
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not 1 <= limit <= COLD_LIMIT_MAX
+    ):
+        raise BimriError(
+            f"cold limit must be between 1 and {COLD_LIMIT_MAX}."
+        )
+    if prefix is not None:
+        prefix = str(prefix).lower()
+        if not COLD_PREFIX_RE.fullmatch(prefix):
+            raise BimriError(
+                "cold prefix must be 1-80 characters of a-z 0-9 . _ -"
+            )
+    with existing_store_lock(paths):
+        state, _warm = load_listing_state(paths)
+        rows = cold_listing_rows(state)
+    if prefix is not None:
+        rows = [row for row in rows if row["key"].startswith(prefix)]
+    total = len(rows)
+    shown = rows[:limit]
+    omitted = total - len(shown)
+    if output == "json":
+        print(
+            json.dumps(
+                {
+                    "subjects": [row["json"] for row in shown],
+                    "total": total,
+                    "omitted": omitted,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 0 if total else 1
+    under = f" under {prefix}" if prefix is not None else ""
+    if not total:
+        print(f"BIMRI: no cold subjects{under}.")
+        return 1
+    for row in shown:
+        print("\t".join(row["tsv"]))
+    print(f"BIMRI: {total} cold subjects{under}.")
+    if omitted:
+        print(
+            f"BIMRI: {omitted} additional subjects omitted; narrow with "
+            "--prefix <key-prefix> or use search."
+        )
+    return 0
+
+
+def core_comparison_text(paths, name):
+    relative = Path(name)
+    if relative.anchor or ".." in relative.parts or relative.suffix.lower() != ".md":
+        raise BimriError("--compare requires a project-relative Markdown file.")
+    file = paths.root
+    for component in relative.parts:
+        file = file / component
+        if path_is_redirected(file):
+            raise BimriError(f"comparison file is redirected: {name}")
+    if not file.is_file():
+        raise BimriError(f"comparison file is missing: {name}")
+    return " ".join(file.read_text(encoding="utf-8-sig").casefold().split())
+
+
+def cmd_review_core(paths, compare):
+    """Read-only inventory of permanent entries and exact matching policy text."""
+    documents = {name: core_comparison_text(paths, name) for name in compare}
+    with existing_store_lock(paths):
+        state = load_current_state_read_only(paths)
+        content = revision_path(paths, state["head_revision"]).read_text(encoding="utf-8")
+        _, entries, errors = parse_hot(content)
+        if errors:
+            raise BimriError("core review requires a valid accepted revision.")
+    report = []
+    for entry in entries:
+        if entry["tier"] != 1:
+            continue
+        normalized = " ".join(entry["text"].casefold().split())
+        duplicates = [name for name, document in documents.items()
+                      if normalized and normalized in document]
+        report.append({"key": entry["key"], "text": entry["text"],
+                       "entry_bytes": len((entry["raw"] + "\n").encode("utf-8")),
+                       "source": entry.get("source"), "trust": entry.get("trust"),
+                       "also_in": duplicates})
+    report.sort(key=lambda row: (not row["also_in"], -row["entry_bytes"], row["key"]))
+    print(json.dumps({"revision": state["head_revision"], "core_entries": report},
+                     ensure_ascii=True, indent=2))
+
+
 def cmd_maintain(paths):
     with engine_lock(paths):
         state = load_or_initialize(paths)
@@ -12950,7 +21114,7 @@ def cmd_maintain(paths):
         candidates = sorted(
             (
                 entry for entry in entries
-                if entry["tier"] == 2
+                if entry["tier"] in COLD_TIERS
             ),
             key=lambda entry: retention_order(entry, state),
         )
@@ -12962,6 +21126,14 @@ def cmd_maintain(paths):
             f"({pressure:.0%}); cold current "
             f"{len(state.get('cold_current', {}))}."
         )
+        patterns = [entry for entry in candidates if entry["tier"] == 3]
+        if patterns:
+            print(
+                f"Tier 3 patterns: {len(patterns)} cooling-eligible; "
+                f"lowest retention: {patterns[0]['key']}."
+            )
+        else:
+            print("Tier 3 patterns: 0 cooling-eligible.")
         if pressure >= 0.9 and candidates:
             candidate = candidates[0]
             print(
@@ -12970,16 +21142,36 @@ def cmd_maintain(paths):
             )
         elif pressure >= 0.9:
             print(
-                "No Tier 2 resident is currently eligible; an oversized incoming "
-                "intent will be held durably without changing current truth."
+                "No Tier 2 or Tier 3 resident is currently eligible; an oversized "
+                "incoming intent will be held durably without changing current truth."
             )
         else:
             print("Residency is healthy; no pressure action is needed.")
         index_count = build_index(paths, state)
         print(f"BIMRI: index rebuilt with {index_count} rows.")
+        # D1.16 / D2.7: finished save tickets older than seven days by
+        # today() move into their month's receipts (never done by a save).
+        print(save_compaction_line(compact_save_tickets(paths)))
 
 
-def cmd_review(paths, conflict_id=None, show_all=False, offset=0, limit=20):
+def save_compaction_line(summary):
+    """`maintain`'s compaction line (D1.16)."""
+    line = (
+        f"BIMRI save tickets: {summary['compacted']} compacted into receipts; "
+        f"{summary['kept']} finished within {SAVE_TICKET_KEEP_DAYS} days kept."
+    )
+    if summary["unsafe"]:
+        line += (
+            f" {len(summary['unsafe'])} unsafe tickets left in place; "
+            "run doctor."
+        )
+    return line
+
+
+def cmd_review(
+    paths, conflict_id=None, show_all=False, offset=0, limit=20,
+    budget_ms=None,
+):
     if isinstance(offset, bool) or offset < 0:
         raise BimriError("review offset must be zero or greater.")
     if isinstance(limit, bool) or limit < 1:
@@ -12990,17 +21182,80 @@ def cmd_review(paths, conflict_id=None, show_all=False, offset=0, limit=20):
         conflict_id = validate_fixed_id(
             conflict_id, CONFLICT_RE, "conflict ID"
         )
-    with existing_store_lock(paths), diagnostic_read_scope(paths):
-        state = load_current_state_read_only(paths)
+    budget_ms = validate_audit_copy_budget(budget_ms)
+    # D1.8, D5.3.3: review audits a copy captured under the read lock and
+    # reports as of that capture. It never reconciles a marker, finishes a
+    # save, publishes a witness or writes a verdict (section 05 4, L13, L20).
+    try:
+        with existing_store_lock(paths):
+            remove_leftover_audit_copies(paths)
+            copy_paths, pending = capture_audit_copy(paths, budget_ms)
+    except AuditCopyDeferred as exc:
+        print(
+            f"BIMRI review: DEFERRED ({exc.describe()}; "
+            f"{newest_verdict_clause(paths)})"
+        )
+        return 3
+    except AuditCopyRefused as exc:
+        print_authority_recovery([str(exc)])
+        return 1
+    try:
+        try:
+            receipt = complete_audit_copy(paths, copy_paths, pending)
+        except AuditCopyDeferred as exc:
+            print(
+                f"BIMRI review: DEFERRED ({exc.describe()}; "
+                f"{newest_verdict_clause(paths)})"
+            )
+            return 3
+        try:
+            return review_audit_copy(
+                paths, copy_paths, receipt, conflict_id, show_all, offset, limit
+            )
+        except BimriError as exc:
+            raise BimriError(
+                map_audit_copy_text(exc, copy_paths, paths)
+            ) from exc
+    finally:
+        release_audit_copy(copy_paths, pending)
+
+
+def review_audit_copy(
+    paths, copy_paths, receipt, conflict_id, show_all, offset, limit
+):
+    if receipt["marker_present"]:
+        try:
+            marker = load_audit_transition(copy_paths)
+        except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+            marker = None
+        if marker is not None:
+            scope = marker.get("scope") if isinstance(
+                marker.get("scope"), dict
+            ) else {}
+            detail = (
+                f"{marker['operation']} "
+                f"{marker.get('run_id') or scope.get('request_id') or ''}"
+            ).strip()
+            print(
+                f"BIMRI: an engine authority operation is unfinished "
+                f"({detail}); the next writable command finishes it"
+            )
+    with diagnostic_read_scope(copy_paths):
+        state = load_current_state_read_only(copy_paths)
         conflicts, authority_issues = governance_snapshot(
-            paths,
+            copy_paths,
             state,
+            allow_recoverable_applying=receipt["marker_present"],
             use_witness=False,
+            write_witness=False,
         )
         if authority_issues:
-            print_authority_recovery(authority_issues)
+            print_authority_recovery([
+                map_audit_copy_text(issue, copy_paths, paths)
+                for issue in authority_issues
+            ])
             return 1
-        groups = classify_review_records(paths, state, conflicts)
+        groups = classify_review_records(copy_paths, state, conflicts)
         counts = review_counts(groups)
         if conflict_id is not None:
             matching = []
@@ -13028,12 +21283,16 @@ def cmd_review(paths, conflict_id=None, show_all=False, offset=0, limit=20):
         rendered = [
             (
                 category,
-                render_conflict_review(
+                map_audit_copy_text(
+                    render_conflict_review(
+                        copy_paths,
+                        state,
+                        item["conflict"],
+                        proposal_ids=item["proposal_ids"],
+                        effective=item.get("effective"),
+                    ),
+                    copy_paths,
                     paths,
-                    state,
-                    item["conflict"],
-                    proposal_ids=item["proposal_ids"],
-                    effective=item.get("effective"),
                 ),
             )
             for category, item in displayed
@@ -13067,116 +21326,347 @@ def cmd_review(paths, conflict_id=None, show_all=False, offset=0, limit=20):
     return 0
 
 
-def cmd_status(paths):
-    with engine_lock(paths):
-        state = load_or_initialize(paths)
-        sync_generated_view(paths, state)
-        with diagnostic_read_scope(paths):
-            conflicts, authority_issues = governance_snapshot(
-                paths,
-                state,
-                use_witness=False,
-            )
-            content = revision_path(
-                paths, state["head_revision"]
-            ).read_text(encoding="utf-8")
-            _, status_entries, errors, counts = validate_hot_content(
-                content, state, allow_legacy_overflow=True
-            )
-            outcomes = {}
-            for log in paths.logs.glob("R*.md"):
-                if log.is_symlink():
-                    raise BimriError(
-                        f"run log cannot be a symbolic link: {log.name}"
-                    )
-                match = re.search(
-                    r"^\[OUTCOME:(success|partial|overflow|fail)\]",
-                    log.read_text(encoding="utf-8"),
-                    re.MULTILINE,
-                )
-                if match:
-                    outcomes[match.group(1)] = outcomes.get(match.group(1), 0) + 1
-            groups = classify_review_records(paths, state, conflicts)
-            counts_by_review = review_counts(groups)
-            conflict_total = len(conflicts)
-            proposal_total = sum(
-                PROPOSAL_RE.fullmatch(path.stem) is not None
-                for path in paths.proposals.glob("*.json")
-            )
-            revision_total = sum(
-                re.fullmatch(r"V\d{6}\.md", path.name) is not None
-                for path in paths.revisions.glob("V*.md")
-            )
-            held_candidates = []
-            current_by_key = {
-                entry.get("key"): entry
-                for entry in status_entries if entry.get("key")
-            }
-            for key in state.get("cold_current", {}):
-                current_by_key[key] = cold_entry(state, key=key)
-            for path in sorted(paths.decisions.glob("R*-Q*.json")):
-                if path.is_symlink() or not path.is_file():
-                    continue
-                data = read_json_strict(path, path.name)
-                if data.get("outcome") != "held":
-                    continue
-                decision = validate_decision(data, path.stem)
-                proposal = authority_proposal(paths, state, path.stem)
-                if proposal_equivalent(
-                    proposal, current_by_key.get(proposal["key"])
-                ):
-                    continue
-                held_candidates.append(
-                    (proposal["key"], decision["reason"], proposal["proposal_id"])
-                )
-    print(
-        f"BIMRI engine v{ENGINE_VERSION} | memory format "
-        f"v{MEMORY_FORMAT_VERSION} | revision V{state['head_revision']:06d} | "
-        f"runs {state['run_count']} | active {len(state['active_runs'])}"
+STATUS_DETAIL_LIMIT = 5
+STATUS_HELD_DEFAULT_MESSAGE = "Candidate preserved; current unchanged."
+REVISION_FILE_RE = re.compile(r"^V\d{6}\.md$")
+CHECKPOINT_UNPROVEN_LINE = "Checkpoint: unproven; run doctor"
+CHECKPOINT_PRIOR_POLICY_LINE = "Checkpoint: prior policy; run doctor"
+
+
+def status_entry_names(directory):
+    """Names in one directory listing; nothing is opened or read."""
+    if path_is_redirected(directory) or not directory.is_dir():
+        return []
+    with os.scandir(directory) as entries:
+        return [entry.name for entry in entries]
+
+
+def status_small_json(path, label):
+    """One small record by exact path, or None when missing or unsafe."""
+    if path_is_redirected(path) or not path.is_file():
+        return None
+    try:
+        record = read_json_strict(path, label)
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def status_held_line(paths, proposal_id):
+    """One held detail line from the held decision and its proposal only."""
+    unreadable = f"  held {proposal_id} [?] <file unreadable>"
+    if not isinstance(proposal_id, str) or not PROPOSAL_RE.fullmatch(proposal_id):
+        return unreadable
+    decision = status_small_json(
+        paths.decisions / f"{proposal_id}.json", f"{proposal_id}.json"
     )
-    if state["active_runs"]:
-        print(
-            "Active runs: "
-            + ", ".join(
-                f"{run_id} ({meta['actor']})"
-                for run_id, meta in sorted(state["active_runs"].items())
-            )
+    proposal = status_small_json(
+        paths.proposals / f"{proposal_id}.json", f"{proposal_id}.json"
+    )
+    if decision is None or proposal is None:
+        return unreadable
+    key = proposal.get("key")
+    if not isinstance(key, str) or not KEY_RE.fullmatch(key):
+        return unreadable
+    reason = decision.get("reason")
+    message = (
+        HOLD_MESSAGES.get(reason, STATUS_HELD_DEFAULT_MESSAGE)
+        if isinstance(reason, str) else STATUS_HELD_DEFAULT_MESSAGE
+    )
+    return f"  held {proposal_id} [{key}] {message}"
+
+
+def unfinished_transition_issue(paths, state=None):
+    """The recovery line for a transition marker that reconcile left.
+
+    D3.5 wording; a ``save`` marker still present after load was not finished
+    by the resume ladder (D3.4.4 R0c) and names the owner's repair instead,
+    through the save's own R0c renderer (D1.10 revised: ``--cancel ...
+    --human-approved`` only when the cancel conditions hold).
+    """
+    wedged = getattr(paths, "wedged_save", None)
+    if wedged:
+        return wedged["line"]
+    try:
+        marker = load_audit_transition(paths)
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        marker = None
+    if marker is None:
+        return (
+            "an engine authority operation is unfinished (unreadable "
+            "marker); run doctor"
         )
-    print(
+    operation = marker.get("operation")
+    scope = marker.get("scope") if isinstance(marker.get("scope"), dict) else {}
+    request_id = scope.get("request_id")
+    if not (
+        isinstance(request_id, str) and REQUEST_ID_RE.fullmatch(request_id)
+    ):
+        request_id = None
+    if operation == "save" and request_id is not None:
+        pending = getattr(paths, "pending_save_error", None)
+        if pending is not None:
+            # Section 03 9: a filesystem error leaves the marker resumable;
+            # it is not a wedge and the next invocation finishes it.
+            return (
+                f"save {request_id} is unfinished; the next invocation "
+                f"finishes it ({pending})"
+            )
+        if state is None:
+            return save_wedged_line(paths, None, request_id)
+        return save_wedged_line(paths, state, request_id, marker)
+    identity = marker.get("run_id") or request_id or "unknown"
+    return (
+        f"an engine authority operation is unfinished ({operation} "
+        f"{identity}); run doctor"
+    )
+
+
+def recorded_recovery_issues(paths, state):
+    """Recovery conditions recorded on disk, read without any audit (D5.2).
+
+    In order: the blocked record's reasons; a transition marker that
+    ``load_or_initialize`` could not clear; otherwise a sealed current-policy
+    checkpoint whose epoch is below the state's (a condemnation or a failed
+    write), with the failed verdict's first issues when it is at the same
+    epoch. Nothing here reads history; an empty list means none is recorded.
+    """
+    issues = list(load_audit_blocked_issues(paths))
+    if paths.audit_transition.exists() or paths.audit_transition.is_symlink():
+        # A live marker carries its own epoch advance; the retained witness
+        # below it is not a condemnation.
+        issues.append(unfinished_transition_issue(paths, state))
+        return issues
+    state_epoch = state_audit_epoch(state)
+    sealed = load_sealed_audit_witness(paths)
+    if sealed is not None and sealed["audit_epoch"] < state_epoch:
+        condemned = (
+            f"audit checkpoint condemned at epoch {state_epoch} "
+            f"(witness epoch {sealed['audit_epoch']})"
+        )
+        verdict = load_audit_verdict(paths)
+        if (
+            verdict is not None
+            and verdict["status"] == "failed"
+            and verdict["audit_epoch"] == state_epoch
+            and verdict["issues"]
+        ):
+            issues.append(condemned)
+            issues.extend(verdict["issues"][:STATUS_DETAIL_LIMIT])
+        else:
+            issues.append(condemned + "; run doctor")
+    return issues
+
+
+def checkpoint_condition_line(paths, state):
+    """Section 05 1.4 items 3-5, for a store without a valid checkpoint.
+
+    Called only when no recovery condition is recorded: a current-policy
+    checkpoint that no longer matches state, or nothing sealed, is unproven;
+    a checkpoint sealed under a prior policy (every 5.1.x witness after the
+    update, D0.5) says so. Both point at ``doctor``; neither is exit 1.
+    """
+    del state  # The recorded conditions were already ruled out by the caller.
+    if load_sealed_audit_witness(paths) is None and load_sealed_audit_witness(
+        paths, allow_prior_policy=True
+    ) is not None:
+        return CHECKPOINT_PRIOR_POLICY_LINE
+    return CHECKPOINT_UNPROVEN_LINE
+
+
+def status_checkpoint(paths, state, issues):
+    """Return (checkpoint line or None, facts generation or None).
+
+    No line while a recovery condition is recorded (the banner carries it);
+    a valid checkpoint names its epoch, the newest deep audit and the scoped
+    publications since; anything else is the ``run doctor`` line.
+    """
+    if issues:
+        return None, None
+    witness = load_valid_audit_witness(paths, state)
+    if witness is None:
+        return checkpoint_condition_line(paths, state), None
+    try:
+        facts = load_audit_facts_evidence(paths, witness)
+    except BimriError:
+        # A checkpoint whose facts evidence is missing or invalid cannot
+        # serve a write; doctor names the damage and the next writer refuses.
+        return CHECKPOINT_UNPROVEN_LINE, None
+    verdict = load_audit_verdict(paths)
+    if verdict is not None:
+        deep = (
+            f"{verdict['created_at']} {verdict['status'].upper()} as of "
+            f"V{verdict['head_revision']:06d}"
+        )
+    else:
+        deep = f"{witness['audited_at']} PASSED"
+    return (
+        f"Checkpoint: valid at V{state['head_revision']:06d} epoch "
+        f"{witness['audit_epoch']} | deep audit {deep} | "
+        f"{witness['scoped_publications']} scoped publications since",
+        facts,
+    )
+
+
+def status_run_rows(paths, state, facts):
+    """``status --runs``: one TSV row per legacy active run, id order.
+
+    ``proposals`` and ``undecided`` come from the facts generation's run facts
+    and one name listing of ``decisions/``; both are ``?`` without a valid
+    checkpoint (section 05 L1, Decisions 6). No run log is read.
+    """
+    decided = None
+    owned_by_run = {}
+    if facts is not None:
+        decided = {
+            name[: -len(".json")]
+            for name in status_entry_names(paths.decisions)
+            if name.endswith(".json")
+        }
+        for fact in facts["run_facts"]:
+            owned_by_run.setdefault(fact["run_id"], []).append(
+                fact["proposal_id"]
+            )
+    rows = []
+    for run_id, meta in sorted(state["active_runs"].items()):
+        seen = run_last_seen(meta)
+        last = (
+            seen.strftime("%Y-%m-%dT%H:%M:%SZ") if seen is not None
+            else "unknown"
+        )
+        if decided is None:
+            proposals = undecided = "?"
+        else:
+            owned = owned_by_run.get(run_id, [])
+            proposals = len(owned)
+            undecided = sum(1 for qid in owned if qid not in decided)
+        actor = meta.get("actor") if isinstance(meta, dict) else None
+        if not isinstance(actor, str) or not actor:
+            actor = "?"
+        rows.append(
+            f"{run_id}\t{actor}\tlast {last}\t"
+            f"proposals {proposals}\tundecided {undecided}"
+        )
+    return rows
+
+
+def collect_status_report(paths, state, runs=False):
+    """Build the quick status from state and a few small files (D5.1).
+
+    Reads: the head revision once, the blocked record, the transition marker
+    when one is left, the checkpoint (witness, its facts generation, the
+    verdict), at most five held decisions and proposals by id, at most five
+    open save tickets, and name listings of proposals/, revisions/,
+    saves/open/ and (only with ``runs``) decisions/. It never audits, scans
+    history, publishes or opens a run log.
+    """
+    head = revision_path(paths, state["head_revision"])
+    if path_is_redirected(head) or not head.is_file():
+        raise BimriError("accepted head is missing or unsafe.")
+    head_bytes = head.read_bytes()
+    if sha256_bytes(head_bytes) != state["head_hash"]:
+        # The warm load already refused this; a store without a valid
+        # checkpoint gets the same refusal rather than counts from a head
+        # the state does not name.
+        raise BimriError(
+            "state head hash does not match the accepted head revision."
+        )
+    content = head_bytes.decode("utf-8")
+    _, _, errors, counts = validate_hot_content(
+        content, state, allow_legacy_overflow=True
+    )
+    issues = recorded_recovery_issues(paths, state)
+    checkpoint_line, facts = status_checkpoint(paths, state, issues)
+    held_ids = sorted(facts["held"]) if facts is not None else None
+    ticket_total, ticket_lines = unfinished_save_summary(
+        paths, STATUS_DETAIL_LIMIT
+    )
+    proposal_total = sum(
+        1 for name in status_entry_names(paths.proposals)
+        if name.endswith(".json")
+        and PROPOSAL_RE.fullmatch(name[: -len(".json")]) is not None
+    )
+    revision_total = sum(
+        1 for name in status_entry_names(paths.revisions)
+        if REVISION_FILE_RE.fullmatch(name) is not None
+    )
+    lines = [
+        f"BIMRI engine v{ENGINE_VERSION} | memory format "
+        f"v{MEMORY_FORMAT_VERSION} | state v{state['bimri_version']} | "
+        f"revision V{state['head_revision']:06d} | "
+        f"runs {state['run_count']} | active {len(state['active_runs'])}"
+    ]
+    if state["active_runs"]:
+        lines.append(
+            f"Legacy active runs: {len(state['active_runs'])} "
+            "(list them: status --runs)"
+        )
+        if runs:
+            lines.extend(status_run_rows(paths, state, facts))
+    lines.append(
         f"Hot: ~{len(content)//4} tokens | "
         f"bytes {len(content.encode('utf-8'))}/{state['hot_max_bytes']} hard ceiling | "
         f"T1 {counts[1]} (soft target {state['tier1_max']}) | "
         f"T2 {counts[2]} (soft target {state['tier2_max']}) | "
         f"T3 {counts[3]} (soft target {state['tier3_max']})"
     )
-    print(
+    lines.append(
         f"Cold current: {len(state.get('cold_current', {}))} | "
-        f"Held candidates: {len(held_candidates)}"
+        f"Held candidates: {'?' if held_ids is None else len(held_ids)} | "
+        f"Unfinished saves: {ticket_total}"
     )
-    for key, reason, proposal_id in held_candidates[:5]:
-        print(
-            f"  held {proposal_id} [{key}] "
-            + HOLD_MESSAGES.get(reason, "Candidate preserved; current unchanged.")
-        )
-    print(
-        f"Open conflicts: {conflict_total} | "
-        f"proposals: {proposal_total} | "
-        f"revisions: {revision_total}"
+    for proposal_id in (held_ids or [])[:STATUS_DETAIL_LIMIT]:
+        lines.append(status_held_line(paths, proposal_id))
+    lines.append(
+        "Open conflicts: "
+        f"{'?' if facts is None else len(facts['open_conflicts'])} | "
+        f"proposals: {proposal_total} | revisions: {revision_total}"
     )
-    print(
-        f"Actionable concurrent conflicts: {counts_by_review['concurrent']} | "
-        f"Legacy review records: {counts_by_review['legacy']} | "
-        f"Recovery reviews: {counts_by_review['recovery']} | "
-        f"Satisfied historical candidates: {counts_by_review['satisfied']}"
-    )
-    if outcomes:
-        print("Outcomes: " + ", ".join(
-            f"{key}={value}" for key, value in sorted(outcomes.items())
-        ))
+    if checkpoint_line is not None:
+        lines.append(checkpoint_line)
+    lines.extend(ticket_lines)
     if errors:
-        print("Validation errors: " + str(len(errors)))
-    print_authority_recovery(authority_issues)
-    return 1 if authority_issues else 0
+        lines.append("Validation errors: " + str(len(errors)))
+    return {
+        "lines": lines,
+        "issues": issues,
+        "exit_code": 1 if issues else 0,
+    }
+
+
+def print_status_report(report, sync_error=None):
+    for line in report["lines"]:
+        print(line)
+    if sync_error is not None:
+        print(
+            "BIMRI NOTICE: generated view could not be refreshed: "
+            f"{sync_error}"
+        )
+    print_authority_recovery(report["issues"])
+
+
+def cmd_status(paths, runs=False):
+    """Short truthful report from current state: no audit, no history scan.
+
+    D5.1: ``load_or_initialize`` without the cold-store audit (a live save
+    marker is still finished there, D3.4.1), the generated-view heal kept,
+    then memory and small files only. Exit 1 only when a recovery condition
+    is recorded on disk (a blocked record, a condemned checkpoint, a marker
+    reconcile left); a missing or prior-policy checkpoint is reported with
+    ``run doctor`` and exit 0 (D5.2). Status never seeds a checkpoint.
+    """
+    with engine_lock(paths):
+        state = load_or_initialize(paths, audit_when_cold=False)
+        sync_error = None
+        if not getattr(paths, "wedged_save", None):
+            # A wedged save keeps its marker: nothing is published around it.
+            try:
+                sync_generated_view(paths, state)
+            except (BimriError, OSError, UnicodeError) as exc:
+                sync_error = str(exc)
+        report = collect_status_report(paths, state, runs=runs)
+    print_status_report(report, sync_error)
+    return report["exit_code"]
 
 
 def restore_receipt_issues(paths):
@@ -13223,7 +21713,7 @@ def restore_receipt_issues(paths):
     return issues
 
 
-def load_current_state_read_only(paths, accepted_versions=None):
+def load_current_state_read_only(paths, accepted_versions=None, allow_checkpoint=False):
     """Validate current-format state/head authority without repairing anything."""
     for directory in paths.dirs:
         if path_is_redirected(directory):
@@ -13240,11 +21730,17 @@ def load_current_state_read_only(paths, accepted_versions=None):
     if path_is_redirected(paths.state) or not paths.state.is_file():
         raise BimriError("existing .bimri/state.json is missing or unsafe.")
     raw = read_json_strict(paths.state, "state.json")
-    accepted_versions = accepted_versions or {MEMORY_FORMAT_VERSION}
+    accepted_versions = accepted_versions or set(READABLE_STATE_VERSIONS)
     if raw.get("bimri_version") not in accepted_versions:
+        # Both readable state versions carry the v5.1.0 memory format.
+        required = (
+            [MEMORY_FORMAT_VERSION]
+            if set(accepted_versions) == set(READABLE_STATE_VERSIONS)
+            else sorted(accepted_versions)
+        )
         raise BimriError(
             "read-only audit requires memory format "
-            f"{', '.join('v' + value for value in sorted(accepted_versions))}; "
+            f"{', '.join('v' + value for value in required)}; "
             f"found {raw.get('bimri_version')}."
         )
     require_complete_v5_state(
@@ -13259,6 +21755,9 @@ def load_current_state_read_only(paths, accepted_versions=None):
         merged, accepted_versions=accepted_versions
     )
     require_read_only_legacy_lineage(paths, state)
+    if allow_checkpoint and load_valid_audit_witness(paths, state) is not None:
+        validate_checkpoint_head(paths, state)
+        return state
     head = revision_path(paths, state["head_revision"])
     if path_is_redirected(head) or not head.is_file():
         raise BimriError(
@@ -13413,7 +21912,8 @@ def doctor_errors(
         except (BimriError, UnicodeDecodeError, OSError) as exc:
             errors.append(f"{path.name}: {exc}")
     try:
-        archive_records(paths)
+        # Strict: a foreign archive row is named by month and line.
+        archive_records(paths, strict=True)
     except (BimriError, OSError, UnicodeError) as exc:
         errors.append(str(exc))
     for skey, rid in state["session_runs"].items():
@@ -13461,9 +21961,12 @@ def doctor_errors(
         try:
             if path.is_symlink():
                 raise BimriError("proposal file cannot be a symbolic link.")
-            proposal = validate_proposal(
-                read_json_strict(path, path.name), state
-            )
+            proposal_data = read_json_strict(path, path.name)
+            if is_quarantine_stub(
+                proposal_data
+            ) and quarantined_proposal_is_abandoned(paths, path.stem):
+                continue
+            proposal = validate_proposal(proposal_data, state)
             if proposal["proposal_id"] != path.stem:
                 raise BimriError("proposal filename does not match its ID.")
             base_path = revision_path(paths, proposal["base_revision"])
@@ -13498,10 +22001,11 @@ def doctor_errors(
                         ).total_seconds()
                     ),
                 )
-                warnings.append(
-                    f"unfinished applying decision {path.stem} "
-                    f"({age}s old); retry that run's sync to recover it."
-                )
+                marker = load_live_save_marker(paths)
+                if marker and path.stem in marker["scope"]["proposal_ids"]:
+                    warnings.append(f"unfinished save decision {path.stem} ({age}s old)")
+                else:
+                    warnings.append(f"{legacy_applying_advice(path.stem)} ({age}s old)")
             if decision["outcome"] == "contested":
                 cpath = conflict_path(paths, decision["conflict_id"])
                 if not cpath.exists():
@@ -13595,16 +22099,22 @@ def doctor_errors(
             f"abandoned temporary file {path.relative_to(paths.root)}; "
             "review it before cleanup."
         )
+    save_errors, save_warnings = save_doctor_findings(paths, state)
+    errors.extend(save_errors)
+    warnings.extend(save_warnings)
     return list(dict.fromkeys(errors)), list(dict.fromkeys(warnings))
 
 
-def read_only_store_audit(paths, accepted_versions=None):
+def read_only_store_audit(
+    paths, accepted_versions=None, allow_recoverable_applying=False
+):
     state = load_current_state_read_only(
         paths, accepted_versions=accepted_versions
     )
     _, governance_issues = governance_snapshot(
         paths,
         state,
+        allow_recoverable_applying=allow_recoverable_applying,
         use_witness=False,
         write_witness=False,
         audit_blocked=True,
@@ -13638,51 +22148,1691 @@ def read_only_store_audit(paths, accepted_versions=None):
     return state, errors, warnings, governance_issues
 
 
-def cmd_doctor(paths, read_only=False):
-    if read_only:
+# ---------------------------------------------------------------------------
+# Copy-under-lock audits (D5.3; DESIGN section 05 2-6)
+#
+# doctor, review and the full-check reads (get/recall --history, search and
+# recall --query, --audit) audit a captured copy of the store instead of
+# holding the store lock for the whole audit. Capture has two phases. Phase A
+# runs under the caller's lock and budget: it byte-copies the mutable small
+# files, records the byte length of every in-place-appended file (log/,
+# archive/) and a name/size/mtime_ns inventory of the linked roots. Phase B
+# runs with the lock released: it hard-links every inventoried file and
+# copies every appended file up to its recorded length, checking each one
+# against what Phase A saw. The copy is therefore the tree as of Phase A.
+# ---------------------------------------------------------------------------
+
+AUDIT_COPY_NO_CHECKPOINT_LINE = (
+    "BIMRI doctor: no valid checkpoint; auditing live under lock"
+)
+
+
+class AuditCopyRefused(BimriError):
+    """A capture met an unsafe entry under the lock; it is a live finding."""
+
+
+def parse_audit_copy_budget(text):
+    """argparse type for --budget-ms: a whole number of ms, 1..600000."""
+    raw = str(text).strip()
+    if not re.fullmatch(r"[0-9]{1,7}", raw):
+        raise argparse.ArgumentTypeError(
+            "--budget-ms must be a whole number of milliseconds from 1 to "
+            f"{AUDIT_COPY_BUDGET_MAX_MS}"
+        )
+    value = int(raw, 10)
+    if value < 1 or value > AUDIT_COPY_BUDGET_MAX_MS:
+        raise argparse.ArgumentTypeError(
+            "--budget-ms must be a whole number of milliseconds from 1 to "
+            f"{AUDIT_COPY_BUDGET_MAX_MS}"
+        )
+    return value
+
+
+def validate_audit_copy_budget(value):
+    if value is None:
+        return AUDIT_COPY_BUDGET_MS
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise BimriError("the copy budget must be a whole number of milliseconds.")
+    if value < 1 or value > AUDIT_COPY_BUDGET_MAX_MS:
+        raise BimriError(
+            "the copy budget must be from 1 to "
+            f"{AUDIT_COPY_BUDGET_MAX_MS} ms."
+        )
+    return value
+
+
+def _metadata_is_redirected(metadata):
+    """path_is_redirected for an lstat/DirEntry result already in hand."""
+    if stat.S_ISLNK(metadata.st_mode):
+        return True
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
+    if not attributes & reparse_flag:
+        return False
+    tag = getattr(metadata, "st_reparse_tag", None)
+    if tag is None:
+        return True
+    name_surrogate = 0x20000000
+    known_redirectors = {
+        value
+        for value in (
+            getattr(stat, "IO_REPARSE_TAG_SYMLINK", None),
+            getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", None),
+            getattr(stat, "IO_REPARSE_TAG_APPEXECLINK", None),
+        )
+        if value is not None
+    }
+    return bool(tag & name_surrogate or tag in known_redirectors)
+
+
+def _audit_copy_try_lock(handle):
+    """Take a copy's own lock without waiting; False when another holds it."""
+    try:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        elif msvcrt is not None:  # pragma: no cover - Windows
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:  # pragma: no cover
+            return False
+    except (BlockingIOError, OSError):
+        return False
+    return True
+
+
+def _audit_copy_open_holder(lock_path):
+    """Open the copy's own lock file for the copy's lifetime.
+
+    On Windows the handle is opened delete-on-close with delete sharing, so
+    the lock file disappears with its owner (a killed audit leaves a copy
+    with no lock, which the next doctor removes) and another process cannot
+    open it while the owner lives (audit_copy_in_use reads that as in use).
+    """
+    flags = (
+        os.O_RDWR
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOINHERIT", 0)
+        | getattr(os, "O_TEMPORARY", 0)
+    )
+    descriptor = os.open(str(lock_path), flags)
+    try:
+        return os.fdopen(descriptor, "r+b")
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _audit_copy_unlock(handle):
+    with contextlib.suppress(OSError, ValueError):
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        elif msvcrt is not None:  # pragma: no cover - Windows
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    with contextlib.suppress(OSError, ValueError):
+        handle.close()
+
+
+def remove_audit_copy_root(root):
+    """Remove one copy directory; True when it is gone.
+
+    The copy holds hard links to live records, so removal only unlinks
+    names and never changes a live byte. Windows refuses to unlink a name
+    whose file another process has open, so a short retry absorbs a
+    concurrent reader; whatever is left is a leftover the next doctor or
+    review removes.
+    """
+    target = str(root)
+    for attempt in range(6):
+        shutil.rmtree(target, ignore_errors=True)
+        if not os.path.lexists(target):
+            return True
+        time.sleep(0.03 * (attempt + 1))
+    return not os.path.lexists(target)
+
+
+def audit_copy_in_use(root):
+    """True when a live process still holds the copy's own lock."""
+    lock = Path(root) / ".bimri" / "engine.lock"
+    try:
+        metadata = os.lstat(str(lock))
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        return True
+    if _metadata_is_redirected(metadata) or not stat.S_ISREG(metadata.st_mode):
+        return False
+    try:
+        handle = open(str(lock), "r+b")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    if _audit_copy_try_lock(handle):
+        _audit_copy_unlock(handle)
+        return False
+    with contextlib.suppress(OSError):
+        handle.close()
+    return True
+
+
+def remove_leftover_audit_copies(paths):
+    """Remove copies a killed audit left beside .bimri (Decisions 26).
+
+    Only entries whose name starts with the exact copy prefix are touched,
+    a redirected entry is never followed, and a copy whose own lock is still
+    held belongs to a running audit and is left alone. Returns a warning for
+    each leftover that could not be removed.
+    """
+    warnings = []
+    try:
+        with os.scandir(str(paths.root)) as entries:
+            candidates = [
+                entry for entry in entries
+                if entry.name.startswith(AUDIT_COPY_PREFIX)
+            ]
+    except OSError:
+        return warnings
+    for entry in sorted(candidates, key=lambda item: item.name):
+        target = Path(entry.path)
         try:
-            with existing_store_lock(paths):
-                _state, errors, warnings, _issues = read_only_store_audit(paths)
+            metadata = entry.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if _metadata_is_redirected(metadata) or not stat.S_ISDIR(
+            metadata.st_mode
+        ):
+            warnings.append(
+                f"leftover audit copy {entry.name} was not removed: it is "
+                "not a plain directory."
+            )
+            continue
+        if audit_copy_in_use(target):
+            continue
+        if not remove_audit_copy_root(target):
+            warnings.append(
+                f"leftover audit copy {entry.name} could not be removed; "
+                "remove it when no doctor or review is running."
+            )
+    return warnings
+
+
+def _audit_copy_stream(source_handle, destination, limit=None):
+    """Write a new file from a stream (at most limit bytes); (sha256, n)."""
+    digest = hashlib.sha256()
+    total = 0
+    with open(str(destination), "xb") as output:
+        while True:
+            want = 1 << 20
+            if limit is not None:
+                want = min(want, limit - total)
+                if want <= 0:
+                    break
+            chunk = source_handle.read(want)
+            if not chunk:
+                break
+            output.write(chunk)
+            digest.update(chunk)
+            total += len(chunk)
+    return digest.hexdigest(), total
+
+
+def _ceil_ms(value):
+    whole = int(value)
+    return whole + 1 if value > whole else whole
+
+
+def _audit_copy_relative(paths, path):
+    return Path(path).relative_to(paths.root).as_posix()
+
+
+class _AuditCopyCapture:
+    """Phase A bookkeeping; never outlives the command that made it."""
+
+    def __init__(self, paths, copy_paths, budget_ms):
+        self.paths = paths
+        self.copy_paths = copy_paths
+        self.budget_ms = budget_ms
+        self.started = time.perf_counter()
+        # files: work items done under the lock (small files copied plus
+        # entries inventoried), the k of a budget deferral. materialized:
+        # files present in the copy, the k of a Phase B deferral.
+        self.files = 0
+        self.small_files = 0
+        self.materialized = 0
+        self.bytes = 0
+        self.holder = None
+        self.released = False
+        self.links_used = True
+        self.small_sha256 = {}
+        self.log_length = {}
+        self.archive_length = {}
+        self.inventory = {}
+        self.directories = []
+        self.marker_present = False
+        self.blocked_present = False
+        self.open_tickets = []
+        self.captured_at = now_iso()
+        self.lock_held_ms = None
+        self.full_sha256 = {}
+
+    def elapsed_ms(self):
+        return (time.perf_counter() - self.started) * 1000.0
+
+    def check(self):
+        elapsed = self.elapsed_ms()
+        if elapsed > self.budget_ms:
+            raise AuditCopyDeferred(
+                "budget", self.files, self.bytes, int(elapsed), self.budget_ms
+            )
+
+    def changed(self):
+        return AuditCopyDeferred(
+            "changed", self.materialized, self.bytes, int(self.elapsed_ms()),
+            self.budget_ms,
+        )
+
+
+def _audit_copy_new_root(paths):
+    if path_is_redirected(paths.root) or not paths.root.is_dir():
+        raise BimriError("the store root is missing or unsafe.")
+    for _attempt in range(2):
+        candidate = paths.root / (AUDIT_COPY_PREFIX + os.urandom(4).hex())
+        try:
+            os.mkdir(str(candidate))
+        except FileExistsError:
+            continue
+        return candidate
+    raise BimriError("could not allocate a fresh audit copy directory.")
+
+
+def _audit_copy_layout(capture):
+    """Mirror the live layout: a directory where live has one, a placeholder
+    file where live has a file-shaped root, nothing where live has none."""
+    paths = capture.paths
+    copy_paths = capture.copy_paths
+    wanted = {
+        _audit_copy_relative(paths, directory): directory
+        for directory in tuple(paths.dirs) + (
+            paths.audit_drift,
+            paths.bdir / "saves",
+            paths.bdir / "settlements",
+        )
+        if directory != paths.bdir
+    }
+    # Parents before children; each directory once (later steps add saves/
+    # and settlements/ to paths.dirs).
+    for relative in sorted(wanted, key=lambda item: (item.count("/"), item)):
+        directory = wanted[relative]
+        if relative in capture.directories:
+            continue
+        parent = relative.rsplit("/", 1)[0]
+        if parent != ".bimri" and parent not in capture.directories:
+            continue
+        try:
+            metadata = os.lstat(str(directory))
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        if _metadata_is_redirected(metadata):
+            raise AuditCopyRefused(
+                f"{relative} cannot be a symbolic link or reparse point."
+            )
+        target = copy_paths.root / relative
+        if stat.S_ISDIR(metadata.st_mode):
+            os.mkdir(str(target))
+            capture.directories.append(relative)
+        else:
+            with open(str(target), "xb"):
+                pass
+
+
+def _audit_copy_probe_links(capture):
+    """One hard link from the live .bimri into the copy proves the volume."""
+    probe = capture.copy_paths.bdir / ".bimri-link-probe"
+    try:
+        os.link(str(capture.paths.state), str(probe))
+    except (AttributeError, NotImplementedError, OSError):
+        return False
+    with contextlib.suppress(OSError):
+        os.unlink(str(probe))
+    return True
+
+
+def _audit_copy_mirror_link(capture, source, relative, metadata):
+    """Reproduce one redirected non-authority entry as a symbolic link.
+
+    Outside the witness roots and run logs the live audit never reads
+    through a redirection: it reports it (an index, the hot view, a marker,
+    an evidence generation) or skips it (a drift receipt, a verdict, a
+    ticket). A link to the same target, made absolute, lets the copy audit
+    meet exactly what the live audit meets, and the copy is removed without
+    following it. The recorded digest is "unsafe", the value the negative
+    re-check computes for a redirected live file. Returns False when the
+    entry is not a symbolic link or no link can be made here (Windows
+    without the privilege); the caller then refuses.
+    """
+    if not stat.S_ISLNK(metadata.st_mode):
+        return False
+    try:
+        text = os.fsdecode(os.readlink(str(source)))
+    except (OSError, ValueError, NotImplementedError, AttributeError):
+        return False
+    target_text = os.path.join(os.path.dirname(str(source)), text)
+    try:
+        os.symlink(target_text, str(capture.copy_paths.root / relative))
+    except (OSError, NotImplementedError, AttributeError):
+        return False
+    capture.small_sha256[relative] = "unsafe"
+    capture.files += 1
+    capture.small_files += 1
+    capture.materialized += 1
+    capture.check()
+    return True
+
+
+def _audit_copy_small_file(capture, source, relative, required=False):
+    """Byte-copy one mutable small file under the lock; record its sha256.
+
+    A redirected name is mirrored as a link (_audit_copy_mirror_link) and
+    refused only when it cannot be. state.json is the exception: every live
+    reader refuses a redirected state with the same sentence, so the
+    capture does too.
+    """
+    try:
+        metadata = os.lstat(str(source))
+    except (FileNotFoundError, NotADirectoryError):
+        if required:
+            raise BimriError(f"existing {relative} is missing or unsafe.")
+        return False
+    if _metadata_is_redirected(metadata):
+        if required:
+            raise BimriError(f"existing {relative} is missing or unsafe.")
+        if _audit_copy_mirror_link(capture, source, relative, metadata):
+            return False
+        raise AuditCopyRefused(f"audit copy refused redirected path {relative}.")
+    target = capture.copy_paths.root / relative
+    if stat.S_ISDIR(metadata.st_mode):
+        # An obstruction is reproduced, not hidden: the copy audit meets the
+        # same directory where the file should be.
+        os.mkdir(str(target))
+        return False
+    if not stat.S_ISREG(metadata.st_mode):
+        raise AuditCopyRefused(f"audit copy refused non-file path {relative}.")
+    with open(str(source), "rb") as handle:
+        digest, length = _audit_copy_stream(handle, target)
+    capture.small_sha256[relative] = digest
+    capture.files += 1
+    capture.small_files += 1
+    capture.materialized += 1
+    capture.bytes += length
+    capture.check()
+    return True
+
+
+def _audit_copy_small_tree(capture, directory):
+    """Byte-copy a small mutable directory (audit-manifests, audit-drift,
+    saves, backups) with its subdirectories; litter included.
+
+    These are not witness roots, so nothing here refuses the way a witness
+    root does: a symbolic link is mirrored (refused only when it cannot be),
+    and a redirected directory (a junction) or a special file is skipped
+    without being followed or opened; every live reader of these trees
+    passes over a name that is not a plain file.
+    """
+    paths = capture.paths
+    relative_root = _audit_copy_relative(paths, directory)
+    if relative_root not in capture.directories:
+        return
+    pending = [directory]
+    while pending:
+        current = pending.pop()
+        with os.scandir(str(current)) as entries:
+            children = sorted(entries, key=lambda item: item.name)
+        for entry in children:
+            child = Path(entry.path)
+            relative = _audit_copy_relative(paths, child)
+            metadata = entry.stat(follow_symlinks=False)
+            if entry.is_symlink() or _metadata_is_redirected(metadata):
+                if stat.S_ISLNK(metadata.st_mode) or entry.is_symlink():
+                    if _audit_copy_mirror_link(
+                        capture, child, relative, metadata
+                    ):
+                        continue
+                elif stat.S_ISDIR(metadata.st_mode):
+                    continue
+                raise AuditCopyRefused(
+                    f"audit copy refused redirected path {relative}."
+                )
+            if stat.S_ISDIR(metadata.st_mode):
+                if relative not in capture.directories:
+                    os.mkdir(str(capture.copy_paths.root / relative))
+                    capture.directories.append(relative)
+                pending.append(child)
+                continue
+            if not stat.S_ISREG(metadata.st_mode):
+                continue
+            _audit_copy_small_file(capture, child, relative)
+
+
+def _audit_copy_litter(capture):
+    """Empty stand-ins for temp-file litter in the store root, .bimri and
+    inbox/, and for unclaimed legacy root files, so the copy's doctor_errors
+    and legacy-root refusal see the same names. (Litter inside the linked,
+    appended and small roots is copied with them.)
+    """
+    paths = capture.paths
+    legacy = {
+        value.casefold() for value in LEGACY_ACTIVE_NAMES + LEGACY_BACKUP_NAMES
+    }
+    places = [("", paths.root), (".bimri", paths.bdir)]
+    for directory in (paths.inbox,):
+        relative = _audit_copy_relative(paths, directory)
+        if relative in capture.directories:
+            places.append((relative, directory))
+    for relative_place, place in places:
+        try:
+            with os.scandir(str(place)) as entries:
+                names = sorted(entry.name for entry in entries)
+        except OSError:
+            continue
+        for name in names:
+            stand_in = name.startswith(".bimri-tmp-") or name.startswith(
+                ".bimri-new-"
+            )
+            if not relative_place and not stand_in and name.casefold() in legacy:
+                try:
+                    stand_in = not os.path.samefile(
+                        str(place / name), str(paths.hot)
+                    )
+                except OSError:
+                    stand_in = True
+            if not stand_in:
+                continue
+            target = capture.copy_paths.root / (
+                f"{relative_place}/{name}" if relative_place else name
+            )
+            if os.path.lexists(str(target)):
+                continue
+            with open(str(target), "xb"):
+                pass
+
+
+def _audit_copy_scan_appended(capture_or_paths, name):
+    """{filename: length} of one in-place-appended root (log/, archive/)."""
+    paths = getattr(capture_or_paths, "paths", capture_or_paths)
+    capture = capture_or_paths if capture_or_paths is not paths else None
+    directory = paths.bdir / name
+    relative_root = f".bimri/{name}"
+    lengths = {}
+    try:
+        metadata = os.lstat(str(directory))
+    except (FileNotFoundError, NotADirectoryError):
+        return lengths
+    if _metadata_is_redirected(metadata) or not stat.S_ISDIR(metadata.st_mode):
+        return lengths
+    with os.scandir(str(directory)) as entries:
+        for entry in entries:
+            relative = f"{relative_root}/{entry.name}"
+            child = entry.stat(follow_symlinks=False)
+            redirected = entry.is_symlink() or _metadata_is_redirected(child)
+            if name == "log":
+                is_log = entry.name.endswith(".md")
+                if redirected or not stat.S_ISREG(child.st_mode):
+                    if is_log and RUN_RE.fullmatch(entry.name[:-3]):
+                        # The live audit refuses exactly these
+                        # (audit_witness_run_facts): a live finding.
+                        raise AuditCopyRefused(
+                            f"run log is missing or unsafe: {entry.name}"
+                        )
+                    if capture is not None and is_log:
+                        # Any other .md name: what doctor_errors meets
+                        # live (a link, a directory) is mirrored.
+                        _audit_copy_log_other(capture, entry, relative, child)
+                    continue
+            else:
+                if redirected:
+                    raise AuditCopyRefused(
+                        f"audit witness refused redirected path {relative}."
+                    )
+                if stat.S_ISDIR(child.st_mode):
+                    raise AuditCopyRefused(
+                        "audit witness refused unexpected subdirectory "
+                        f"{relative}."
+                    )
+                if not stat.S_ISREG(child.st_mode):
+                    raise AuditCopyRefused(
+                        f"audit witness refused non-file path {relative}."
+                    )
+            lengths[entry.name] = child.st_size
+            if capture is not None:
+                capture.files += 1
+                capture.check()
+    return lengths
+
+
+def _audit_copy_log_other(capture, entry, relative, metadata):
+    """Mirror a log/ entry with a .md name that is not a plain run log."""
+    if entry.is_symlink() or _metadata_is_redirected(metadata):
+        if (
+            stat.S_ISLNK(metadata.st_mode) or entry.is_symlink()
+        ) and _audit_copy_mirror_link(
+            capture, Path(entry.path), relative, metadata
+        ):
+            return
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise AuditCopyRefused(
+                f"audit copy refused redirected path {relative}."
+            )
+    if stat.S_ISDIR(metadata.st_mode):
+        target = capture.copy_paths.root / relative
+        if not os.path.lexists(str(target)):
+            os.mkdir(str(target))
+
+
+def _audit_copy_scan_linked(capture_or_paths, name):
+    """{relative path: (size, mtime_ns)} of one linked root.
+
+    Every child is inventoried, litter included, because the witness
+    manifest hashes every child. A redirected, directory or non-file child of
+    a witness root refuses exactly as audit_witness_manifest does.
+    """
+    paths = getattr(capture_or_paths, "paths", capture_or_paths)
+    capture = capture_or_paths if capture_or_paths is not paths else None
+    directory = paths.bdir / name
+    relative_root = f".bimri/{name}"
+    inventory = {}
+    try:
+        metadata = os.lstat(str(directory))
+    except (FileNotFoundError, NotADirectoryError):
+        return inventory
+    if _metadata_is_redirected(metadata):
+        raise AuditCopyRefused(
+            f"audit witness root {relative_root} is missing or unsafe."
+        )
+    if not stat.S_ISDIR(metadata.st_mode):
+        return inventory
+    witness_root = name != "migrations"
+    with os.scandir(str(directory)) as entries:
+        for entry in entries:
+            relative = f"{relative_root}/{entry.name}"
+            child = entry.stat(follow_symlinks=False)
+            if entry.is_symlink() or _metadata_is_redirected(child):
+                raise AuditCopyRefused(
+                    f"audit witness refused redirected path {relative}."
+                )
+            if stat.S_ISDIR(child.st_mode):
+                if witness_root:
+                    raise AuditCopyRefused(
+                        "audit witness refused unexpected subdirectory "
+                        f"{relative}."
+                    )
+                continue
+            if not stat.S_ISREG(child.st_mode):
+                raise AuditCopyRefused(
+                    f"audit witness refused non-file path {relative}."
+                )
+            inventory[relative] = (child.st_size, child.st_mtime_ns)
+            if capture is not None:
+                capture.files += 1
+                capture.check()
+    return inventory
+
+
+def capture_audit_copy(paths, budget_ms=None):
+    """Phase A of a copy capture; the caller holds the store lock.
+
+    Returns (copy_paths, pending). Raises AuditCopyDeferred("budget") when
+    Phase A outlives budget_ms, and AuditCopyRefused for an unsafe entry
+    (a live finding); either way the partial copy is already gone. Nothing
+    is written under .bimri: the copy is <root>/.bimri-audit-copy-<8hex>/,
+    a sibling on the same volume, outside the protected manifest. The copy
+    holds its own lock for as long as it is in use, so a concurrent doctor
+    never removes it as a leftover.
+    """
+    budget_ms = validate_audit_copy_budget(budget_ms)
+    if path_is_redirected(paths.bdir) or not paths.bdir.is_dir():
+        raise BimriError("existing .bimri directory is missing or unsafe.")
+    copy_root = _audit_copy_new_root(paths)
+    copy_paths = Paths(copy_root)
+    capture = _AuditCopyCapture(paths, copy_paths, budget_ms)
+    try:
+        os.mkdir(str(copy_paths.bdir))
+        with open(str(copy_paths.lock), "xb") as handle:
+            handle.write(b"0")
+        capture.holder = _audit_copy_open_holder(copy_paths.lock)
+        if not _audit_copy_try_lock(capture.holder):
+            raise BimriError("could not lock the fresh audit copy.")
+        _audit_copy_layout(capture)
+        capture.links_used = _audit_copy_probe_links(capture)
+        # Mutable small files first (bounded by pruning and compaction, not
+        # by history), then appended-file lengths, then the linked roots.
+        _audit_copy_small_file(capture, paths.hot, "bimri.md")
+        for name in AUDIT_COPY_SMALL_FILES:
+            _audit_copy_small_file(
+                capture, paths.bdir / name, f".bimri/{name}",
+                required=(name == "state.json"),
+            )
+        for name in AUDIT_COPY_SMALL_DIRS:
+            _audit_copy_small_tree(capture, paths.bdir / name)
+        _audit_copy_litter(capture)
+        capture.marker_present = ".bimri/audit-transition.json" in (
+            capture.small_sha256
+        ) or os.path.lexists(str(paths.audit_transition))
+        capture.blocked_present = os.path.lexists(str(paths.audit_blocked))
+        open_tickets = paths.bdir / "saves" / "open"
+        if ".bimri/saves/open" in capture.directories:
+            capture.open_tickets = sorted(
+                entry.name for entry in os.scandir(str(open_tickets))
+            )
+        if capture.links_used:
+            capture.log_length = _audit_copy_scan_appended(capture, "log")
+            capture.archive_length = _audit_copy_scan_appended(
+                capture, "archive"
+            )
+            for name in AUDIT_COPY_LINKED_ROOTS:
+                capture.inventory.update(_audit_copy_scan_linked(capture, name))
+        else:
+            # No hard links on this volume (FAT/exFAT or a store split across
+            # volumes): one phase under the lock, everything byte-copied and
+            # the budget covering the whole copy.
+            _audit_copy_full_copy_under_lock(capture)
+        capture.lock_held_ms = _ceil_ms(capture.elapsed_ms())
+        return copy_paths, capture
+    except BaseException:
+        release_audit_copy(copy_paths, capture)
+        raise
+
+
+def _audit_copy_full_copy_under_lock(capture):
+    paths = capture.paths
+    for name in ("log", "archive"):
+        lengths = _audit_copy_scan_appended(capture, name)
+        target = capture.log_length if name == "log" else capture.archive_length
+        target.update(lengths)
+        for filename in sorted(lengths):
+            relative = f".bimri/{name}/{filename}"
+            handle = _audit_copy_open_regular(paths.bdir / name / filename)
+            if handle is None:
+                raise capture.changed()
+            with handle:
+                digest, length = _audit_copy_stream(
+                    handle, capture.copy_paths.root / relative
+                )
+            target[filename] = length
+            capture.full_sha256[relative] = digest
+            capture.materialized += 1
+            capture.bytes += length
+            capture.check()
+    for name in AUDIT_COPY_LINKED_ROOTS:
+        inventory = _audit_copy_scan_linked(capture, name)
+        capture.inventory.update(inventory)
+        for relative in sorted(inventory):
+            handle = _audit_copy_open_regular(paths.root / relative)
+            if handle is None:
+                raise capture.changed()
+            with handle:
+                digest, length = _audit_copy_stream(
+                    handle, capture.copy_paths.root / relative
+                )
+            capture.full_sha256[relative] = digest
+            capture.materialized += 1
+            capture.bytes += length
+            capture.check()
+
+
+def _audit_copy_same_file(first, second):
+    """True when two stat results name one file.
+
+    st_dev is compared only off Windows: there os.lstat and os.fstat may
+    report the volume serial number at different widths, while st_ino (the
+    file ID) agrees.
+    """
+    if first.st_ino != second.st_ino:
+        return False
+    return os.name == "nt" or first.st_dev == second.st_dev
+
+
+def _audit_copy_link_regular(source, target):
+    """Hard-link one live regular file into the copy; the link's stat, or
+    None when the live name is no longer that plain file.
+
+    The link never follows a symbolic link where the platform allows it,
+    and the live name is re-read with lstat afterwards, so a name swapped
+    for a redirection after Phase A is caught whichever way the platform
+    links: either the copy holds the link itself (not a regular file) or
+    the live name is redirected or names another file.
+    """
+    if os.link in os.supports_follow_symlinks:
+        os.link(str(source), str(target), follow_symlinks=False)
+    else:
+        os.link(str(source), str(target))
+    linked = os.lstat(str(target))
+    live = os.lstat(str(source))
+    if (
+        _metadata_is_redirected(live)
+        or _metadata_is_redirected(linked)
+        or not stat.S_ISREG(live.st_mode)
+        or not stat.S_ISREG(linked.st_mode)
+        or not _audit_copy_same_file(live, linked)
+    ):
+        return None
+    return linked
+
+
+def _audit_copy_open_regular(source):
+    """Open one live file for copying without following a redirection;
+    None when the name is gone, redirected or no longer a plain file.
+
+    The name is lstat-ed first and the opened handle must be that same
+    file (O_NOFOLLOW where the platform has it), so a name swapped for a
+    redirection between Phase A and Phase B is never read through.
+    """
+    try:
+        before = os.lstat(str(source))
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    if _metadata_is_redirected(before) or not stat.S_ISREG(before.st_mode):
+        return None
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOINHERIT", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(str(source), flags)
+    except (FileNotFoundError, NotADirectoryError, IsADirectoryError,
+            PermissionError):
+        return None
+    except OSError as exc:
+        # O_NOFOLLOW on a symbolic link: ELOOP (Linux, macOS), EMLINK (BSD).
+        if exc.errno in {errno.ELOOP, getattr(errno, "EMLINK", errno.ELOOP)}:
+            return None
+        raise
+    try:
+        handle = os.fdopen(descriptor, "rb")
+    except Exception:
+        os.close(descriptor)
+        raise
+    try:
+        opened = os.fstat(handle.fileno())
+    except BaseException:
+        handle.close()
+        raise
+    if not stat.S_ISREG(opened.st_mode) or not _audit_copy_same_file(
+        before, opened
+    ):
+        handle.close()
+        return None
+    return handle
+
+
+def complete_audit_copy(paths, copy_paths, pending):
+    """Phase B, with the store lock released; returns the capture receipt.
+
+    Links every inventoried file and checks it against the Phase A stat;
+    copies every appended file up to its recorded length. A file replaced,
+    removed, shortened or redirected since Phase A raises
+    AuditCopyDeferred("changed") after removing the copy. Nothing is read
+    or linked through a redirection: the bytes audited are bytes a live
+    name held.
+    """
+    capture = pending
+    try:
+        log_sha256 = {}
+        archive_sha256 = {}
+        if capture.links_used:
+            for relative in sorted(capture.inventory):
+                expected = capture.inventory[relative]
+                source = paths.root / relative
+                target = copy_paths.root / relative
+                try:
+                    linked = _audit_copy_link_regular(source, target)
+                except (FileNotFoundError, NotADirectoryError, PermissionError):
+                    # Gone, or (Windows) a name being replaced right now.
+                    raise capture.changed()
+                if linked is None:
+                    raise capture.changed()
+                if (linked.st_size, linked.st_mtime_ns) != tuple(expected):
+                    raise capture.changed()
+                capture.materialized += 1
+            for name, lengths, digests in (
+                ("log", capture.log_length, log_sha256),
+                ("archive", capture.archive_length, archive_sha256),
+            ):
+                for filename in sorted(lengths):
+                    length = lengths[filename]
+                    relative = f".bimri/{name}/{filename}"
+                    handle = _audit_copy_open_regular(paths.root / relative)
+                    if handle is None:
+                        raise capture.changed()
+                    with handle:
+                        if os.fstat(handle.fileno()).st_size < length:
+                            raise capture.changed()
+                        digest, copied = _audit_copy_stream(
+                            handle, copy_paths.root / relative, limit=length
+                        )
+                    if copied != length:
+                        raise capture.changed()
+                    digests[filename] = digest
+                    capture.materialized += 1
+                    capture.bytes += length
+        else:
+            for name, digests in (
+                ("log", log_sha256), ("archive", archive_sha256),
+            ):
+                prefix = f".bimri/{name}/"
+                for relative, digest in capture.full_sha256.items():
+                    if relative.startswith(prefix):
+                        digests[relative[len(prefix):]] = digest
+        receipt = _audit_copy_receipt(capture, log_sha256, archive_sha256)
+        with contextlib.suppress(OSError, TypeError, ValueError):
+            debug = {
+                field: value for field, value in receipt.items()
+                if field != "inventory"
+            }
+            with open(str(copy_paths.root / "capture.json"), "x",
+                      encoding="utf-8") as handle:
+                handle.write(json.dumps(debug, indent=2, sort_keys=True) + "\n")
+        return receipt
+    except BaseException:
+        release_audit_copy(copy_paths, capture)
+        raise
+
+
+def _audit_copy_receipt(capture, log_sha256, archive_sha256):
+    copy_paths = capture.copy_paths
+    head_revision = head_hash = audit_epoch = bimri_version = None
+    try:
+        raw = json.loads(copy_paths.state.read_text(encoding="utf-8"))
+        head_revision = raw.get("head_revision")
+        head_hash = raw.get("head_hash")
+        audit_epoch = state_audit_epoch(raw)
+        bimri_version = raw.get("bimri_version")
+    except (OSError, UnicodeError, ValueError, TypeError, AttributeError,
+            BimriError):
+        pass
+    witness_hash = None
+    manifest_relative = facts_relative = None
+    try:
+        if capture.small_sha256.get(".bimri/audit-witness.json") in (
+            None, "unsafe"
+        ):
+            # Absent, or mirrored as a link: never read through it.
+            raise ValueError("no captured witness bytes")
+        witness = json.loads(
+            copy_paths.audit_witness.read_text(encoding="utf-8")
+        )
+        witness_hash = witness.get("witness_hash")
+        manifest_hash = witness.get("manifest_hash")
+        if isinstance(manifest_hash, str) and HASH_RE.fullmatch(manifest_hash):
+            manifest_relative = f".bimri/audit-manifests/{manifest_hash}.json"
+        facts_hash = witness.get("facts_hash")
+        if isinstance(facts_hash, str) and HASH_RE.fullmatch(facts_hash):
+            facts_relative = f".bimri/audit-manifests/facts-{facts_hash}.json"
+    except (OSError, UnicodeError, ValueError, TypeError, AttributeError):
+        witness = None
+    small = capture.small_sha256
+    return {
+        "captured_at": capture.captured_at,
+        "lock_held_ms": capture.lock_held_ms,
+        "elapsed_ms": _ceil_ms(capture.elapsed_ms()),
+        "files": (
+            capture.small_files + len(capture.inventory)
+            + len(capture.log_length) + len(capture.archive_length)
+        ),
+        "bytes": capture.bytes,
+        "links_used": capture.links_used,
+        "head_revision": head_revision,
+        "head_hash": head_hash,
+        "audit_epoch": audit_epoch,
+        "bimri_version": bimri_version,
+        "state_sha256": small.get(".bimri/state.json"),
+        "hot_sha256": small.get("bimri.md"),
+        "witness_sha256": small.get(".bimri/audit-witness.json"),
+        "witness_hash": witness_hash,
+        "manifest_generation": manifest_relative,
+        "manifest_generation_sha256": (
+            small.get(manifest_relative) if manifest_relative else None
+        ),
+        "facts_generation": facts_relative,
+        "facts_generation_sha256": (
+            small.get(facts_relative) if facts_relative else None
+        ),
+        "marker_present": capture.marker_present,
+        "blocked_present": capture.blocked_present,
+        "log_length": dict(capture.log_length),
+        "archive_length": dict(capture.archive_length),
+        "log_sha256": log_sha256,
+        "archive_sha256": archive_sha256,
+        "inventory": dict(capture.inventory),
+        "open_tickets": list(capture.open_tickets),
+    }
+
+
+def release_audit_copy(copy_paths, pending):
+    """Drop the copy's own lock and remove the copy; idempotent."""
+    if pending is None or getattr(pending, "released", False):
+        return True
+    pending.released = True
+    holder = pending.holder
+    pending.holder = None
+    if holder is not None:
+        _audit_copy_unlock(holder)
+    return remove_audit_copy_root(copy_paths.root)
+
+
+def map_audit_copy_text(text, copy_paths, paths):
+    """Name live paths, not the throwaway copy, in anything shown or kept."""
+    text = str(text)
+    for copy_form, live_form in (
+        # An OSError's text carries the repr of a Windows path (doubled
+        # backslashes); replace that form first.
+        (
+            str(copy_paths.root).replace("\\", "\\\\"),
+            str(paths.root).replace("\\", "\\\\"),
+        ),
+        (str(copy_paths.root), str(paths.root)),
+        (copy_paths.root.as_posix(), paths.root.as_posix()),
+    ):
+        text = text.replace(copy_form, live_form)
+    return text
+
+
+def newest_verdict_clause(paths):
+    verdict = load_audit_verdict(paths)
+    if verdict is None:
+        return "no deep audit on record"
+    return (
+        f"last deep audit {verdict['created_at']} "
+        f"{verdict['status'].upper()} as of V{verdict['head_revision']:06d}"
+    )
+
+
+def _file_sha256_or_none(path):
+    try:
+        metadata = os.lstat(str(path))
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    if _metadata_is_redirected(metadata) or not stat.S_ISREG(metadata.st_mode):
+        return "unsafe"
+    try:
+        return sha256_bytes(Path(path).read_bytes())
+    except OSError:
+        return "unreadable"
+
+
+def _audit_copy_open_tickets(paths):
+    directory = paths.bdir / "saves" / "open"
+    try:
+        with os.scandir(str(directory)) as entries:
+            return sorted(entry.name for entry in entries)
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+
+
+def audit_copy_live_state_and_hot_match(paths, receipt):
+    """Positive-path check (section 05 3.4 step 1): state, hot, no marker,
+    the same open tickets. The inventory is not rehashed."""
+    if os.path.lexists(str(paths.audit_transition)):
+        return False
+    if _file_sha256_or_none(paths.state) != receipt["state_sha256"]:
+        return False
+    if _file_sha256_or_none(paths.hot) != receipt["hot_sha256"]:
+        return False
+    return _audit_copy_open_tickets(paths) == receipt["open_tickets"]
+
+
+def audit_copy_live_matches(paths, receipt, copy_manifest=None):
+    """Negative-path re-check (section 05 3.5 item 1): True only when every
+    byte an audit finding could depend on is what the capture saw."""
+    try:
+        if os.path.lexists(str(paths.audit_transition)):
+            return False
+        if os.path.lexists(str(paths.audit_blocked)) != receipt["blocked_present"]:
+            return False
+        for path, field in (
+            (paths.state, "state_sha256"),
+            (paths.hot, "hot_sha256"),
+            (paths.audit_witness, "witness_sha256"),
+        ):
+            if _file_sha256_or_none(path) != receipt[field]:
+                return False
+        for relative_field, digest_field in (
+            ("manifest_generation", "manifest_generation_sha256"),
+            ("facts_generation", "facts_generation_sha256"),
+        ):
+            relative = receipt.get(relative_field)
+            if relative and (
+                _file_sha256_or_none(paths.root / relative)
+                != receipt[digest_field]
+            ):
+                return False
+        inventory = {}
+        for name in AUDIT_COPY_LINKED_ROOTS:
+            inventory.update(_audit_copy_scan_linked(paths, name))
+        if inventory != receipt["inventory"]:
+            return False
+        logs = _audit_copy_scan_appended(paths, "log")
+        months = _audit_copy_scan_appended(paths, "archive")
+        if logs != receipt["log_length"] or months != receipt["archive_length"]:
+            return False
+        if not receipt["links_used"]:
+            # Without sub-microsecond mtimes a stat cannot prove equality:
+            # compare the witnessed inventory and every appended file's bytes.
+            if copy_manifest is None or audit_witness_manifest(paths) != copy_manifest:
+                return False
+            for name, digests in (
+                ("log", receipt["log_sha256"]),
+                ("archive", receipt["archive_sha256"]),
+            ):
+                for filename, digest in digests.items():
+                    if _file_sha256_or_none(
+                        paths.bdir / name / filename
+                    ) != digest:
+                        return False
+        return True
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        return False
+
+
+def load_live_state_for_recheck(paths):
+    """The cheap live state load of reconcile_engine_checkpoint_for_exact_read."""
+    if path_is_redirected(paths.state) or not paths.state.is_file():
+        raise BimriError("existing .bimri/state.json is missing or unsafe.")
+    raw = read_json_strict(paths.state, "state.json")
+    if raw.get("bimri_version") not in READABLE_STATE_VERSIONS:
+        raise BimriError(
+            f"unsupported BIMRI state version: {raw.get('bimri_version')}"
+        )
+    require_complete_v5_state(raw)
+    state = fresh_state()
+    state.update(raw)
+    return validate_state(state)
+
+
+def copy_audit_drift(copy_paths):
+    """(witness, delta) for checkpoint drift a copy audit observed, else
+    (None, None). The witness is the copy's (the live one as captured)."""
+    if not copy_paths.last_audit_drift or copy_paths.full_audit_manifest is None:
+        return None, None
+    witness = load_sealed_audit_witness(copy_paths)
+    if witness is None:
+        return None, None
+    try:
+        prior = load_audit_manifest_evidence(copy_paths, witness)
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError):
+        return None, None
+    delta = audit_checkpoint_drift_delta(prior, copy_paths.full_audit_manifest)
+    if not any(delta.values()):
+        return None, None
+    return witness, delta
+
+
+def _drift_items(delta):
+    items = []
+    for item in delta.get("changed", ()):
+        items.append((item["path"], item["prior_sha256"], item["sha256"]))
+    for item in delta.get("added", ()):
+        items.append((item["path"], None, item["sha256"]))
+    for item in delta.get("deleted", ()):
+        items.append((item["path"], item["prior_sha256"], None))
+    return sorted(items)
+
+
+def copy_drift_warning_lines(delta):
+    """One `checkpoint drift:` warning per drifted path (first 20)."""
+    lines = []
+    items = _drift_items(delta)
+    for path, prior, current in items[:AUDIT_COPY_DRIFT_LINES]:
+        lines.append(
+            f"checkpoint drift: {path} (checkpoint "
+            f"{prior[:12] if prior else 'absent'}, live "
+            f"{current[:12] if current else 'absent'}); run doctor --live "
+            "to rebaseline"
+        )
+    if len(items) > AUDIT_COPY_DRIFT_LINES:
+        lines.append(
+            f"... and {len(items) - AUDIT_COPY_DRIFT_LINES} more checkpoint "
+            "drift paths; run doctor --live to rebaseline"
+        )
+    return lines
+
+
+def record_copy_audit_drift(paths, state_live, witness, delta):
+    """Section 04 4.9 item 10: drift a passing copy audit saw becomes one
+    live receipt, never a rebaseline. Returns warning lines."""
+    moved = (
+        "checkpoint drift seen on the copy was not recorded: the checkpoint "
+        "moved during the audit; run doctor again"
+    )
+    live_witness = load_sealed_audit_witness(paths)
+    if (
+        live_witness is None
+        or live_witness.get("witness_hash") != witness.get("witness_hash")
+    ):
+        return [moved]
+    for path, _prior, current in _drift_items(delta):
+        live = _file_sha256_or_none(paths.root / path)
+        if live != current:
+            return [moved]
+    bounded = {
+        section: list(delta.get(section) or ())[:AUDIT_DRIFT_DELTA_CAP]
+        for section in ("changed", "added", "deleted")
+    }
+    newest = list_audit_drift_receipts(paths)[-1:]
+    if newest:
+        try:
+            existing = read_json_strict(newest[0], newest[0].name)
+        except (BimriError, OSError, UnicodeError):
+            existing = None
+        if (
+            isinstance(existing, dict)
+            and existing.get("delta") == bounded
+            and existing.get("prior_witness_hash") == witness.get("witness_hash")
+            and validate_audit_drift_receipt(paths, newest[0], existing) is None
+        ):
+            return []
+    reasons = [
+        f"copy audit found checkpoint drift: {path} (checkpoint "
+        f"{prior or 'absent'}, live {current or 'absent'})"
+        for path, prior, current in _drift_items(delta)
+    ]
+    try:
+        receipt = write_audit_drift_receipt(
+            paths,
+            reasons,
+            prior_witness=live_witness,
+            state=state_live,
+            delta=delta,
+        )
+    except (BimriError, OSError, UnicodeError, ValueError, TypeError) as exc:
+        return [f"checkpoint drift could not be recorded: {exc}"]
+    if receipt is None:
+        return [
+            "checkpoint drift could not be recorded: the drift receipt could "
+            "not be durably written"
+        ]
+    return []
+
+
+def audit_copy_confirmable_findings(governance_issues):
+    """[(issue, kind, record id)] for per-record storage findings."""
+    findings = []
+    for issue in governance_issues:
+        match = AUDIT_COPY_FINDING_RE.match(issue)
+        if match is None:
+            continue
+        findings.append((issue, match.group(1), match.group(2)))
+    return findings[:AUDIT_COPY_CONFIRM_LIMIT]
+
+
+def run_compact_save_tickets(paths):
+    """Ticket compaction (D2.7) on a PASSED doctor (section 05 L5).
+
+    Runs under the doctor's lock after the verdict (copy path) or after
+    build_index (live path). Quiet when it succeeds; a compaction that
+    stops is a warning, never a failed audit: every ticket it did not
+    reach is still a valid JSON ticket and the next compaction resumes.
+    """
+    try:
+        compact_save_tickets(paths)
+    except (BimriError, OSError, UnicodeError, ValueError) as exc:
+        return [f"save ticket compaction stopped: {exc}"]
+    return []
+
+
+def doctor_finish_open_tickets(paths, state):
+    """D3.4.2 R1 / Decisions 12: doctor is a writer, so an admitted
+    ticket-only save is finished before capture and audit, under the
+    doctor's own lock. Skipped beside a wedged save (R0c). Returns the
+    notices doctor prints as warnings; ``state`` is updated in place."""
+    if getattr(paths, "wedged_save", None):
+        return []
+    return finish_open_save_tickets(paths, state, strict=False)
+
+
+def doctor_wedged_save_error(paths):
+    """The D3.4.4 R0c line when a save marker could not be finished."""
+    wedged = getattr(paths, "wedged_save", None)
+    if not wedged:
+        return None
+    return wedged["line"]
+
+
+def _print_lines(label, lines):
+    print(label)
+    for line in lines:
+        print(f"  - {line}")
+
+
+def doctor_live_audit(paths, state, sync_error=None, extra_errors=()):
+    """Today's in-lock full audit (doctor --live, and the seeding path)."""
+    _, governance_issues = governance_snapshot(
+        paths,
+        state,
+        use_witness=False,
+        audit_blocked=True,
+        recover_blocked=True,
+    )
+    if sync_error:
+        governance_issues.insert(
+            0, "generated view recovery failed: " + sync_error
+        )
+    errors, warnings = doctor_errors(
+        paths, state, governance_issues=governance_issues
+    )
+    # save_doctor_findings already names a wedged save under its marker.
+    errors = [item for item in extra_errors if item not in errors] + errors
+    if not errors:
+        build_index(paths, state)
+        warnings = list(warnings) + run_compact_save_tickets(paths)
+    return errors, warnings
+
+
+def doctor_copy_audit(paths, copy_paths, receipt, read_only=False):
+    """Audit a captured copy with the live lock released.
+
+    Returns (errors, warnings, governance_issues, index_text, drift).
+    Nothing is written anywhere: not the copy's witness, not live.
+    """
+    errors = []
+    warnings = []
+    issues = []
+    index_text = None
+    with diagnostic_read_scope(copy_paths):
+        try:
+            state_copy, errors, warnings, issues = read_only_store_audit(
+                copy_paths,
+                allow_recoverable_applying=receipt["marker_present"],
+            )
         except (BimriError, OSError, UnicodeError) as exc:
+            state_copy = None
             errors = [str(exc)]
             warnings = []
-    else:
-        with engine_lock(paths):
-            state = load_or_initialize(paths)
-            # Doctor proves the store from authority even when a matching
-            # derived witness exists.
-            sync_error = None
-            try:
+            issues = []
+        if not errors and not read_only:
+            index_text, _count = build_index_text(copy_paths, state_copy)
+    drift_witness, drift_delta = copy_audit_drift(copy_paths)
+    errors = [map_audit_copy_text(item, copy_paths, paths) for item in errors]
+    warnings = [
+        map_audit_copy_text(item, copy_paths, paths) for item in warnings
+    ]
+    issues = [map_audit_copy_text(item, copy_paths, paths) for item in issues]
+    return errors, warnings, issues, index_text, (drift_witness, drift_delta)
+
+
+def cmd_doctor(paths, read_only=False, live=False, budget_ms=None):
+    if read_only and live:
+        raise BimriError("doctor --live cannot be combined with --read-only.")
+    budget_ms = validate_audit_copy_budget(budget_ms)
+    if read_only:
+        return doctor_read_only(paths, budget_ms)
+    return doctor_writable(paths, live, budget_ms)
+
+
+def doctor_read_only(paths, budget_ms):
+    """Copy audit under existing_store_lock; writes nothing anywhere.
+
+    A live marker is not reconciled (section 05 3.7, L20): the copy keeps
+    it, the audit treats its applying record as recoverable, and the first
+    warning names the transition.
+    """
+    label = "BIMRI doctor (read-only)"
+    leftovers = []
+    try:
+        with existing_store_lock(paths):
+            leftovers = remove_leftover_audit_copies(paths)
+            copy_paths, pending = capture_audit_copy(paths, budget_ms)
+    except BimriBusy:
+        raise
+    except AuditCopyDeferred as exc:
+        print(f"{label}: DEFERRED ({exc.describe()}; {newest_verdict_clause(paths)})")
+        return 3
+    except (BimriError, OSError, UnicodeError) as exc:
+        _print_lines(f"{label}: FAILED", [str(exc)])
+        return 1
+    try:
+        try:
+            receipt = complete_audit_copy(paths, copy_paths, pending)
+        except AuditCopyDeferred as exc:
+            print(
+                f"{label}: DEFERRED ({exc.describe()}; "
+                f"{newest_verdict_clause(paths)})"
+            )
+            return 3
+        errors, warnings, _issues, _index, drift = doctor_copy_audit(
+            paths, copy_paths, receipt, read_only=True
+        )
+    finally:
+        release_audit_copy(copy_paths, pending)
+    if errors:
+        _print_lines(f"{label}: FAILED", errors)
+        return 1
+    if drift[1]:
+        warnings.extend(copy_drift_warning_lines(drift[1]))
+    warnings.extend(leftovers)
+    if any(line.startswith("unfinished applying decision ") for line in warnings):
+        _print_lines(f"{label}: COMPLETION REQUIRED", warnings)
+        return 1
+    _print_lines(
+        f"{label}: PASSED as of V{receipt['head_revision']:06d} epoch "
+        f"{receipt['audit_epoch']} (copy captured in "
+        f"{receipt['lock_held_ms']} ms, {receipt['files']:,} files)",
+        warnings,
+    )
+    return 0
+
+
+def doctor_writable(paths, live, budget_ms):
+    leftovers = []
+    deferred = None
+    copy_paths = pending = None
+    with engine_lock(paths):
+        lock_started = time.perf_counter()
+        leftovers = remove_leftover_audit_copies(paths)
+        state = load_or_initialize(paths, audit_when_cold=False)
+        take_live = (
+            live
+            or paths.cold_load_deferred
+            or paths.validated_audit_witness is None
+            or bool(load_audit_blocked_issues(paths))
+        )
+        if take_live and paths.cold_load_deferred:
+            state = complete_cold_load(paths, state)
+        save_notices = doctor_finish_open_tickets(paths, state)
+        wedge_error = doctor_wedged_save_error(paths)
+        sync_error = None
+        try:
+            if load_live_save_marker(paths) is None:
+                # A live save marker is never published around (D3.4.1).
                 sync_generated_view(paths, state)
-            except (BimriError, OSError, UnicodeError) as exc:
-                sync_error = str(exc)
-            _, governance_issues = governance_snapshot(
+        except (BimriError, OSError, UnicodeError) as exc:
+            sync_error = str(exc)
+        if not take_live and (
+            sync_error is not None
+            or wedge_error is not None
+            or load_valid_audit_witness(paths, state) is None
+        ):
+            take_live = True
+        if take_live:
+            if not live:
+                print(AUDIT_COPY_NO_CHECKPOINT_LINE)
+            errors, warnings = doctor_live_audit(
                 paths,
                 state,
-                use_witness=False,
-                audit_blocked=True,
-                recover_blocked=True,
+                sync_error=sync_error,
+                extra_errors=[wedge_error] if wedge_error else (),
             )
-            if sync_error:
-                governance_issues.insert(
-                    0, "generated view recovery failed: " + sync_error
+            held_s = time.perf_counter() - lock_started
+        else:
+            try:
+                copy_paths, pending = capture_audit_copy(paths, budget_ms)
+            except AuditCopyDeferred as exc:
+                deferred = exc
+            except AuditCopyRefused as exc:
+                # An entry the copy cannot reproduce safely (a redirected or
+                # non-file entry in a witness root, a redirected run log, or
+                # a link this platform cannot mirror). The store is audited
+                # live on the spot and the result is the live audit's own,
+                # exactly as doctor --live on the same bytes: a witness-root
+                # or run-log refusal is the live audit's own finding there
+                # (FAILED, condemned, live verdict; section 05 L3), anything
+                # else passes or fails on its merits. The refusal stays a
+                # warning, so a PASSED line still says why it ran live.
+                take_live = True
+                errors, warnings = doctor_live_audit(
+                    paths, state, sync_error=sync_error,
                 )
-            errors, warnings = doctor_errors(
-                paths, state, governance_issues=governance_issues
+                warnings = [
+                    f"audit copy not captured ({str(exc).rstrip('.')}); "
+                    "audited live under lock"
+                ] + list(warnings)
+                held_s = time.perf_counter() - lock_started
+    if deferred is not None:
+        print(
+            f"BIMRI doctor: DEFERRED ({deferred.describe()}; "
+            f"{newest_verdict_clause(paths)})"
+        )
+        return 3
+    if take_live:
+        if errors:
+            _print_lines("BIMRI doctor: FAILED", errors)
+            return 1
+        if any(line.startswith("unfinished applying decision ") for line in warnings):
+            _print_lines("BIMRI doctor: COMPLETION REQUIRED", list(save_notices) + warnings + leftovers)
+            return 1
+        _print_lines(
+            f"BIMRI doctor: PASSED (live audit held the lock {held_s:.1f} s)",
+            list(save_notices) + list(warnings) + leftovers,
+        )
+        return 0
+    try:
+        try:
+            receipt = complete_audit_copy(paths, copy_paths, pending)
+        except AuditCopyDeferred as exc:
+            print(
+                f"BIMRI doctor: DEFERRED ({exc.describe()}; "
+                f"{newest_verdict_clause(paths)})"
             )
-            if not errors:
-                build_index(paths, state)
+            return 3
+        errors, warnings, issues, index_text, drift = doctor_copy_audit(
+            paths, copy_paths, receipt
+        )
+        copy_manifest = copy_paths.full_audit_manifest
+    finally:
+        release_audit_copy(copy_paths, pending)
     if errors:
-        label = "BIMRI doctor (read-only)" if read_only else "BIMRI doctor"
-        print(f"{label}: FAILED")
-        for error in errors:
-            print(f"  - {error}")
+        return doctor_copy_negative(paths, receipt, errors, issues, copy_manifest)
+    if any(line.startswith("unfinished applying decision ") for line in warnings):
+        _print_lines("BIMRI doctor: COMPLETION REQUIRED at capture", warnings)
         return 1
-    label = "BIMRI doctor (read-only)" if read_only else "BIMRI doctor"
-    print(f"{label}: PASSED")
-    for warning in warnings:
-        print(f"  - {warning}")
+    return doctor_copy_positive(
+        paths, receipt, list(save_notices) + warnings + leftovers, index_text,
+        copy_manifest, drift
+    )
+
+
+def doctor_copy_positive(paths, receipt, warnings, index_text, copy_manifest,
+                         drift):
+    """Section 05 3.4: a passing copy writes a copy verdict, never a witness."""
+    warnings = list(warnings)
+    drift_witness, drift_delta = drift
+    with engine_lock(paths):
+        unchanged = audit_copy_live_state_and_hot_match(paths, receipt)
+        write_audit_verdict(
+            paths,
+            "copy",
+            "passed",
+            [],
+            copy_capture_ms=receipt["lock_held_ms"],
+            head_revision=receipt["head_revision"],
+            head_hash=receipt["head_hash"],
+            audit_epoch=receipt["audit_epoch"],
+            manifest_hash=(
+                audit_witness_digest(copy_manifest)
+                if copy_manifest is not None else None
+            ),
+        )
+        if unchanged and index_text is not None:
+            atomic_write_text(paths.index, index_text)
+        else:
+            warnings.append(
+                "index not rewritten: the store changed during the audit"
+            )
+        if drift_delta:
+            try:
+                state_live = load_live_state_for_recheck(paths)
+            except (BimriError, OSError, UnicodeError) as exc:
+                warnings.append(f"checkpoint drift could not be recorded: {exc}")
+            else:
+                warnings.extend(
+                    record_copy_audit_drift(
+                        paths, state_live, drift_witness, drift_delta
+                    )
+                )
+            warnings.extend(copy_drift_warning_lines(drift_delta))
+        warnings.extend(run_compact_save_tickets(paths))
+    _print_lines(
+        f"BIMRI doctor: PASSED as of V{receipt['head_revision']:06d} epoch "
+        f"{receipt['audit_epoch']} (copy captured in "
+        f"{receipt['lock_held_ms']} ms, {receipt['files']:,} files)",
+        warnings,
+    )
     return 0
+
+
+def _condemnable(issues, blocked):
+    return any(
+        issue not in blocked
+        and not issue.startswith(PRIOR_EVIDENCE_INVALID_PREFIX)
+        for issue in issues
+    )
+
+
+def audit_copy_unfinished_operation_note(paths):
+    """The line a re-check prints instead of recording, when a writer that
+    ran during the audit crashed and left its transition marker."""
+    if not os.path.lexists(str(paths.audit_transition)):
+        return None
+    detail = ""
+    with contextlib.suppress(
+        BimriError, OSError, UnicodeError, ValueError, TypeError, KeyError
+    ):
+        marker = load_audit_transition(paths)
+        if marker is not None:
+            detail = (
+                f" ({marker['operation']} {marker.get('run_id') or ''}".rstrip()
+                + ")"
+            )
+    return (
+        f"nothing was recorded: an operation{detail} was left unfinished "
+        "during the audit; the next writable command reconciles the "
+        "unfinished operation; run doctor again"
+    )
+
+
+def doctor_copy_negative(paths, receipt, errors, issues, copy_manifest):
+    """Section 05 3.5: a failing copy is re-checked against live bytes.
+
+    The re-check loads live state the cheap way and never reconciles. A
+    transition marker left by a writer that crashed during the audit makes
+    any epoch advance here unreconcilable (reconcile_audit_transition
+    requires the marker's own epoch), so with a marker present confirmed
+    findings are printed but nothing is condemned or recorded: the next
+    writable command finishes the operation and the next doctor records.
+    """
+    verdict_fields = dict(
+        copy_capture_ms=receipt["lock_held_ms"],
+        head_revision=receipt["head_revision"],
+        head_hash=receipt["head_hash"],
+        audit_epoch=receipt["audit_epoch"],
+        manifest_hash=(
+            audit_witness_digest(copy_manifest)
+            if copy_manifest is not None else None
+        ),
+    )
+    unfinished = None
+    with engine_lock(paths):
+        state_live = load_live_state_for_recheck(paths)
+        blocked = set(load_audit_blocked_issues(paths))
+        unfinished = audit_copy_unfinished_operation_note(paths)
+        if unfinished is None and audit_copy_live_matches(
+            paths, receipt, copy_manifest=copy_manifest
+        ):
+            # Equal bytes make the copy's findings live findings. Condemn
+            # with the live audit's own filter; doctor_errors-only and
+            # evidence-only findings record a failed verdict and condemn
+            # nothing, exactly as doctor --live on the same bytes.
+            if _condemnable(issues, blocked):
+                condemn_audit_checkpoint(paths, state_live)
+            # Section 05 1.5 / 06 1.2: status lists a failed verdict's
+            # issues only at the state's epoch, which a condemnation just
+            # advanced; the live audit writes its verdict the same way.
+            verdict_fields["audit_epoch"] = state_audit_epoch(state_live)
+            write_audit_verdict(
+                paths, "copy", "failed", errors, **verdict_fields
+            )
+            confirmed = list(errors)
+            unconfirmed = 0
+        else:
+            findings = audit_copy_confirmable_findings(issues)
+            live_issues = set()
+            if findings:
+                only = {}
+                for _issue, kind, record_id in findings:
+                    only.setdefault(kind, set()).add(record_id)
+                try:
+                    live_issues = set(
+                        authority_storage_issues(
+                            paths,
+                            state_live,
+                            allow_recoverable_applying=unfinished is not None,
+                            only=only,
+                        )
+                    )
+                except (BimriError, OSError, UnicodeError):
+                    live_issues = set()
+            confirmed_issues = [
+                issue for issue, _kind, _id in findings if issue in live_issues
+            ]
+            confirmed = [
+                error for error in errors
+                if any(error.endswith(issue) for issue in confirmed_issues)
+            ]
+            unconfirmed = len(errors) - len(confirmed)
+            if not confirmed:
+                print(
+                    "BIMRI doctor: SUPERSEDED (the store changed during the "
+                    f"audit; {len(errors)} findings not confirmed; run doctor "
+                    "again, or doctor --live to audit under the lock)"
+                )
+                return 3
+            if unfinished is None:
+                if _condemnable(confirmed_issues, blocked):
+                    condemn_audit_checkpoint(paths, state_live)
+                verdict_fields["audit_epoch"] = state_audit_epoch(state_live)
+                write_audit_verdict(
+                    paths, "copy", "failed", confirmed, **verdict_fields
+                )
+    lines = list(confirmed)
+    if unconfirmed:
+        lines.append(
+            f"{unconfirmed} further findings not confirmed: the store changed "
+            "during the audit; run doctor again"
+        )
+    if unfinished is not None:
+        lines.append(unfinished)
+    _print_lines("BIMRI doctor: FAILED", lines)
+    return 1
+
+
+def audit_copy_read(paths, reader, budget_ms=None):
+    """Run reader(copy_paths, receipt) on a captured copy (full-check reads).
+
+    The capture is taken under existing_store_lock; the read runs with the
+    lock released. Nothing is published, condemned or reconciled (D5.3.3).
+    """
+    with existing_store_lock(paths):
+        copy_paths, pending = capture_audit_copy(
+            paths, AUDIT_COPY_BUDGET_MS if budget_ms is None else budget_ms
+        )
+    try:
+        receipt = complete_audit_copy(paths, copy_paths, pending)
+        try:
+            return reader(copy_paths, receipt)
+        except BimriError as exc:
+            raise BimriError(map_audit_copy_text(exc, copy_paths, paths)) from exc
+    finally:
+        release_audit_copy(copy_paths, pending)
+
+
+def print_audit_copy_read_deferral(exc):
+    print(
+        f"BIMRI: DEFERRED ({exc.describe()}; retry when the store is quiet)",
+        file=sys.stderr,
+    )
+    return 3
 
 
 AGENT_BLOCK_START = "<!-- BIMRI:START -->"
@@ -14909,7 +25059,9 @@ def code_update_receipt_identity(manifest):
         ("5.0.3", V5_0_2_VERSION),
         (V5_1_0_ENGINE_VERSION, MEMORY_FORMAT_VERSION),
         (V5_1_1_ENGINE_VERSION, MEMORY_FORMAT_VERSION),
-        (ENGINE_VERSION, MEMORY_FORMAT_VERSION),
+        (V5_1_2_ENGINE_VERSION, MEMORY_FORMAT_VERSION),
+        (ENGINE_VERSION, PRIOR_STATE_FORMAT_VERSION),
+        (ENGINE_VERSION, STATE_FORMAT_VERSION),
     }:
         raise BimriError(
             "code-update receipt has an unsupported release identity."
@@ -15070,7 +25222,9 @@ def _validate_retryable_rollback_manifest(
     return manifest
 
 
-def _prepare_code_update_backup(paths, policy, backup_root, protected):
+def _prepare_code_update_backup(
+    paths, policy, backup_root, protected, memory_format=MEMORY_FORMAT_VERSION
+):
     if not backup_root.exists():
         policy.mkdir(backup_root)
     transaction_name = (
@@ -15114,7 +25268,7 @@ def _prepare_code_update_backup(paths, policy, backup_root, protected):
     }
     manifest = {
         "engine_release": ENGINE_VERSION,
-        "memory_format": MEMORY_FORMAT_VERSION,
+        "memory_format": memory_format,
         "mode": "code-only-update",
         "created_at": now_iso(),
         "target": str(paths.root),
@@ -15250,7 +25404,10 @@ def _recover_prepared_code_updates(paths, policy, backup_root):
                 activated_state = read_json_strict(
                     paths.state, "interrupted activated state"
                 )
-                if activated_state.get("bimri_version") != MEMORY_FORMAT_VERSION:
+                if (
+                    activated_state.get("bimri_version")
+                    not in READABLE_STATE_VERSIONS
+                ):
                     raise BimriError(
                         "interrupted authority activation left an unknown state."
                     )
@@ -15344,7 +25501,9 @@ def _stage_code_update(
     claude_block = (
         "@AGENTS.md\n\n"
         "Use BIMRI-PROTOCOL.md for the full memory protocol. "
-        "BIMRI shared memory is engine-managed. Read the host-only "
+        "BIMRI shared memory is engine-managed. A chat reads with "
+        "`start` and remembers with `save`; runs are for deliberate "
+        "multi-step work. Read the host-only "
         "argument prefix from `.bimri/runtime.local.json`. Merge the "
         "rendered `.bimri/hooks.claude.local.json` snippet into "
         "`.claude/settings.local.json` manually."
@@ -15406,7 +25565,7 @@ def _install_staged_code_update(
 
 def prepare_v5_1_authority_activation(paths, source_version, source_bytes):
     """Build a state-only activation while preserving the accepted head bytes."""
-    if source_version == MEMORY_FORMAT_VERSION:
+    if source_version in READABLE_STATE_VERSIONS:
         return None
     if source_version != V5_0_2_VERSION:
         raise BimriError(
@@ -15518,7 +25677,7 @@ def cmd_code_only_update(
         recovered_version = recovered_state.get("bimri_version")
         if recovered_version != source_version:
             if (
-                source_version == MEMORY_FORMAT_VERSION
+                source_version == PRIOR_STATE_FORMAT_VERSION
                 and recovered_version == V5_0_2_VERSION
             ):
                 source_version = recovered_version
@@ -15545,7 +25704,18 @@ def cmd_code_only_update(
                 "protected memory: " + "; ".join(pre_audit_differences)
             )
         backup_dir, manifest = _prepare_code_update_backup(
-            paths, policy, backup_root, before
+            paths,
+            policy,
+            backup_root,
+            before,
+            # The receipt names the state format the update found, so a
+            # same-format update of a v5.1.0 or v5.2.0 store records that
+            # exact identity; a v5.0.2 activation targets v5.1.0.
+            memory_format=(
+                source_version
+                if source_version in READABLE_STATE_VERSIONS
+                else MEMORY_FORMAT_VERSION
+            ),
         )
         source_state_bytes = paths.state.read_bytes()
         state_backup_path = backup_dir / f"state-v{source_version}-exact.json"
@@ -15556,7 +25726,7 @@ def cmd_code_only_update(
             # at an older memory format is activated (v5.1.2).
             "mode": (
                 "code-only-update"
-                if source_version == MEMORY_FORMAT_VERSION
+                if source_version in READABLE_STATE_VERSIONS
                 else "lossless-authority-activation"
             ),
             "source_memory_format": source_version,
@@ -15743,7 +25913,7 @@ def cmd_code_only_update(
     head_revision = manifest["accepted_head_revision_after"]
     head_hash = manifest["accepted_head_hash_after"]
     print(f"BIMRI {ENGINE_VERSION} installed.")
-    if source_version == MEMORY_FORMAT_VERSION:
+    if source_version in READABLE_STATE_VERSIONS:
         print(f"Existing authority store v{source_version} verified.")
     else:
         print(
@@ -15780,13 +25950,16 @@ def cmd_install(source_paths, target, quiescent=False):
     if target_paths.state.exists() or path_is_redirected(target_paths.state):
         raw_state = read_json_strict(target_paths.state, "target state.json")
         source_version = raw_state.get("bimri_version")
-        if source_version in COMPATIBLE_ARTIFACT_VERSIONS:
+        if source_version in (
+            COMPATIBLE_ARTIFACT_VERSIONS | set(READABLE_STATE_VERSIONS)
+        ):
             # Every existing v5 store shares one handoff precondition. Apply it
             # before routing by source version so the v5.0/v5.0.1 upgrade
-            # route cannot bypass the attestation the v5.0.2/v5.1.0 route
-            # requires. v4 and older keep their own writer-quiescence checks.
+            # route cannot bypass the attestation the v5.0.2/v5.1.0/v5.2.0
+            # route requires. v4 and older keep their own writer-quiescence
+            # checks.
             require_quiescent_v5_handoff(quiescent, source_version)
-        if source_version in {V5_0_2_VERSION, MEMORY_FORMAT_VERSION}:
+        if source_version in {V5_0_2_VERSION, *READABLE_STATE_VERSIONS}:
             return cmd_code_only_update(
                 source_paths,
                 target_paths,
@@ -15857,7 +26030,9 @@ def cmd_install(source_paths, target, quiescent=False):
             claude_block = (
                 "@AGENTS.md\n\n"
                 "Use BIMRI-PROTOCOL.md for the full memory protocol. "
-                "BIMRI shared memory is engine-managed. Read the host-only "
+                "BIMRI shared memory is engine-managed. A chat reads with "
+                "`start` and remembers with `save`; runs are for deliberate "
+                "multi-step work. Read the host-only "
                 "argument prefix from `.bimri/runtime.local.json`. Merge the "
                 "rendered `.bimri/hooks.claude.local.json` snippet into "
                 "`.claude/settings.local.json` manually."
@@ -16048,7 +26223,18 @@ def build_parser():
 
     start = sub.add_parser("start")
     start.add_argument("--actor", default="agent")
+    # Accepted and ignored on the read brief (D1.1); maps a legacy run with
+    # --open-run.
     start.add_argument("--session")
+    start.add_argument(
+        "--open-run",
+        action="store_true",
+        dest="open_run",
+        help="open a legacy run for deliberate multi-step work",
+    )
+    start.add_argument(
+        "--json", action="store_true", help="print the read brief as one object"
+    )
 
     journal = sub.add_parser("journal")
     journal.add_argument("--run", required=True)
@@ -16057,6 +26243,7 @@ def build_parser():
 
     propose = sub.add_parser("propose")
     propose.add_argument("--run", required=True)
+    propose.add_argument("--settles")
     propose.add_argument("--operation", choices=sorted(OPERATIONS), default="set")
     propose.add_argument(
         "--new-subject",
@@ -16083,6 +26270,40 @@ def build_parser():
     propose.add_argument("--evidence")
     propose.add_argument("--falsifier")
 
+    save = sub.add_parser("save")
+    save.add_argument("--request", required=True)
+    save.add_argument("--observed", required=True)
+    save.add_argument("--key", required=True)
+    save.add_argument("--actor", default="agent")
+    save.add_argument("--operation", choices=sorted(OPERATIONS), default="set")
+    save.add_argument("--new-subject", action="store_true")
+    save.add_argument("--tier", type=int, choices=(1, 2, 3))
+    save.add_argument("--target")
+    save.add_argument("--kind", choices=sorted(TIER1_KINDS))
+    save.add_argument("--importance", type=int, choices=range(1, 6))
+    save.add_argument("--status", choices=sorted(TIER2_STATUSES))
+    save.add_argument(
+        "--trust", choices=sorted(AUTHORABLE_TRUSTS), default="working"
+    )
+    save.add_argument("--source", choices=SAVE_SOURCES, default="agent")
+    save.add_argument("--tags")
+    save.add_argument("--text")
+    save.add_argument("--rationale")
+    save.add_argument("--confidence", choices=sorted(PATTERN_CONFIDENCE))
+    save.add_argument("--observations", type=int)
+    save.add_argument("--evidence")
+    save.add_argument("--falsifier")
+    save.add_argument("--settles")
+    save.add_argument("--json", action="store_true")
+
+    recover_save = sub.add_parser("recover-save")
+    recover_save.add_argument("request_id")
+    recover_mode = recover_save.add_mutually_exclusive_group(required=True)
+    recover_mode.add_argument("--cancel", action="store_true")
+    recover_mode.add_argument("--rebuild", action="store_true")
+    recover_save.add_argument("--summary", required=True)
+    recover_save.add_argument("--human-approved", action="store_true")
+
     sync = sub.add_parser("sync")
     sync.add_argument("--run", required=True)
 
@@ -16094,11 +26315,20 @@ def build_parser():
     close.add_argument("--summary")
 
     recover = sub.add_parser("recover-run")
-    recover.add_argument("--run", required=True)
+    recover.add_argument("--run", action="append")
+    recover.add_argument("--all-orphans", action="store_true")
+    recover.add_argument("--abandon", action="store_true")
+    recover.add_argument("--dry-run", action="store_true")
+    recover.add_argument("--human-approved", action="store_true")
     recover.add_argument(
         "--outcome", choices=sorted(OUTCOMES), default="partial"
     )
     recover.add_argument("--summary", required=True)
+
+    dismiss = sub.add_parser("dismiss-held")
+    dismiss.add_argument("proposal_id")
+    dismiss.add_argument("--summary", required=True)
+    dismiss.add_argument("--human-approved", action="store_true")
 
     resolve = sub.add_parser("resolve")
     resolve.add_argument("conflict_id")
@@ -16121,32 +26351,50 @@ def build_parser():
     review.add_argument("--all", action="store_true", dest="show_all")
     review.add_argument("--offset", type=int, default=0)
     review.add_argument("--limit", type=int, default=20)
+    review.add_argument("--budget-ms", type=parse_audit_copy_budget, default=None)
 
     recall = sub.add_parser("recall")
     recall_group = recall.add_mutually_exclusive_group(required=True)
     recall_group.add_argument("--key")
     recall_group.add_argument("--query")
     recall.add_argument("--history", action="store_true")
+    recall.add_argument("--current", action="store_true",
+                        help="match words and saved tags in current accepted subjects only")
+    recall.add_argument("--audit", action="store_true")
     recall.add_argument("--limit", type=int, default=20)
     recall.add_argument("--json", action="store_true")
 
     get_memory = sub.add_parser("get")
     get_memory.add_argument("--key", required=True)
     get_memory.add_argument("--history", action="store_true")
+    get_memory.add_argument("--audit", action="store_true")
     get_memory.add_argument("--limit", type=int, default=20)
     get_memory.add_argument("--json", action="store_true")
 
     search = sub.add_parser("search")
     search.add_argument("--query", required=True)
+    search.add_argument("--audit", action="store_true")
     search.add_argument("--limit", type=int, default=20)
     search.add_argument("--json", action="store_true")
 
-    sub.add_parser("status")
+    cold = sub.add_parser("cold")
+    cold.add_argument("--limit", type=int, default=COLD_LIMIT_DEFAULT)
+    cold.add_argument("--prefix")
+    cold.add_argument("--json", action="store_true")
+
+    status = sub.add_parser("status")
+    status.add_argument("--runs", action="store_true")
     doctor = sub.add_parser("doctor")
-    doctor.add_argument("--read-only", action="store_true")
+    doctor_mode = doctor.add_mutually_exclusive_group()
+    doctor_mode.add_argument("--read-only", action="store_true")
+    doctor_mode.add_argument("--live", action="store_true")
+    doctor.add_argument("--budget-ms", type=parse_audit_copy_budget, default=None)
     sub.add_parser("validate")
     sub.add_parser("index")
-    sub.add_parser("maintain")
+    maintain = sub.add_parser("maintain")
+    maintain.add_argument("--review-core", action="store_true",
+                          help="preview permanent entries, their size, and exact policy duplicates")
+    maintain.add_argument("--compare", action="append", default=[], metavar="FILE")
     sub.add_parser("migrate")
     sub.add_parser("hook-start")
     sub.add_parser("hook-close")
@@ -16184,6 +26432,32 @@ def reconfigure_console_streams():
             pass
 
 
+def join_dash_option_values(argv, options=("--request",)):
+    """Keep a value that begins with one dash bound to its option.
+
+    argparse would read `--request -lead` as a missing value; the save
+    grammar must refuse such an id with its own message (D2.1), so the
+    value is passed through as `--request=-lead`.
+    """
+    joined = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        following = argv[index + 1] if index + 1 < len(argv) else None
+        if (
+            token in options
+            and isinstance(following, str)
+            and following.startswith("-")
+            and not following.startswith("--")
+        ):
+            joined.append(f"{token}={following}")
+            index += 2
+            continue
+        joined.append(token)
+        index += 1
+    return joined
+
+
 def main(argv=None):
     reconfigure_console_streams()
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -16201,18 +26475,41 @@ def main(argv=None):
         )
         return 0
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(join_dash_option_values(argv))
+    if (
+        args.command == "start"
+        and getattr(args, "open_run", False)
+        and getattr(args, "json", False)
+    ):
+        parser.error("--json is only available on the read brief")
     try:
         source_root = Path(__file__).resolve().parent
         root = Path(args.root).resolve() if args.root else source_root
         paths = Paths(root)
         command = args.command or "status"
         if command == "start":
-            cmd_start(paths, args.actor, args.session)
+            cmd_start(
+                paths,
+                args.actor,
+                args.session,
+                open_run=args.open_run,
+                output="json" if args.json else "tsv",
+            )
         elif command == "journal":
             cmd_journal(paths, args.run, args.text, args.importance)
         elif command == "propose":
             cmd_propose(paths, args)
+        elif command == "save":
+            return cmd_save(paths, args)
+        elif command == "recover-save":
+            return cmd_recover_save(
+                paths,
+                args.request_id,
+                cancel=args.cancel,
+                rebuild=args.rebuild,
+                summary=args.summary,
+                human_approved=args.human_approved,
+            )
         elif command == "sync":
             cmd_sync(paths, args.run)
         elif command == "close":
@@ -16222,8 +26519,11 @@ def main(argv=None):
             )
         elif command == "recover-run":
             cmd_recover_run(
-                paths, args.run, args.outcome, args.summary
+                paths, args.run, args.outcome, args.summary, args.abandon,
+                args.all_orphans, args.dry_run, args.human_approved,
             )
+        elif command == "dismiss-held":
+            cmd_dismiss_held(paths, args.proposal_id, args.summary, args.human_approved)
         elif command == "resolve":
             cmd_resolve(
                 paths,
@@ -16253,15 +26553,20 @@ def main(argv=None):
                 show_all=args.show_all,
                 offset=args.offset,
                 limit=args.limit,
+                budget_ms=args.budget_ms,
             )
         elif command == "recall":
+            if args.history and args.current:
+                raise BimriError("--history and --current select different recall scopes.")
             return cmd_recall(
                 paths,
                 key=args.key,
                 query=args.query,
                 history=(args.history if args.key is not None else True),
+                current=args.current,
                 limit=args.limit,
                 output="json" if args.json else "tsv",
+                audit=args.audit,
             )
         elif command == "get":
             return cmd_recall(
@@ -16270,6 +26575,7 @@ def main(argv=None):
                 history=args.history,
                 limit=args.limit,
                 output="json" if args.json else "tsv",
+                audit=args.audit,
             )
         elif command == "search":
             return cmd_recall(
@@ -16278,11 +26584,24 @@ def main(argv=None):
                 history=True,
                 limit=args.limit,
                 output="json" if args.json else "tsv",
+                audit=args.audit,
+            )
+        elif command == "cold":
+            return cmd_cold(
+                paths,
+                limit=args.limit,
+                prefix=args.prefix,
+                output="json" if args.json else "tsv",
             )
         elif command == "status":
-            return cmd_status(paths)
+            return cmd_status(paths, runs=getattr(args, "runs", False))
         elif command == "doctor":
-            return cmd_doctor(paths, read_only=args.read_only)
+            return cmd_doctor(
+                paths,
+                read_only=args.read_only,
+                live=args.live,
+                budget_ms=args.budget_ms,
+            )
         elif command == "validate":
             return cmd_doctor(paths)
         elif command == "index":
@@ -16293,7 +26612,12 @@ def main(argv=None):
                 count = build_index(paths, state)
             print(f"BIMRI: index rebuilt with {count} rows.")
         elif command == "maintain":
-            cmd_maintain(paths)
+            if args.review_core:
+                cmd_review_core(paths, args.compare)
+            elif args.compare:
+                raise BimriError("--compare requires --review-core.")
+            else:
+                cmd_maintain(paths)
         elif command == "migrate":
             with engine_lock(paths):
                 state = load_or_initialize(paths)
@@ -16317,31 +26641,24 @@ def main(argv=None):
             for warning in migration_warnings:
                 print(f"Repair warning: {warning}")
         elif command == "hook-start":
-            payload, diagnosis = hook_payload_diagnosed()
-            session = hook_session_identity(payload)
-            if session is None:
-                # A run without a stable identity can never be closed by the
-                # matching SessionEnd hook, so refuse before any mutation.
-                # SessionStart hooks never block on a non-zero exit: the
-                # session opens without a brief and the wrapper records the
-                # exit code for the operator.
-                raise BimriError(
-                    "hook-start opened no run: "
-                    + (
-                        diagnosis
-                        or "the payload carries no session_id or transcript_path"
-                    )
-                    + ". [hook-identity-missing]"
-                )
-            cmd_start(paths, "claude-code", session)
+            # D1.14: any payload (empty, invalid, no identity) gets the read
+            # brief, and nothing is opened. Stdin is still drained so a
+            # broken payload never blocks the hook.
+            hook_payload_diagnosed()
+            cmd_start(paths, "claude-code")
         elif command == "hook-close":
             payload = hook_payload()
+            if paths.state.is_symlink() or not paths.state.exists():
+                # D1.15: no store, nothing to close. Return before any lock
+                # or layout so a close never creates a folder or waits.
+                return 0
             cmd_close(
                 paths, actor="claude-code",
                 session=hook_session_identity(payload),
                 outcome="partial",
                 summary=hook_close_summary(payload.get("reason", "ended")),
                 allow_unmapped=True,
+                from_hook=True,
             )
         elif command == "install":
             return cmd_install(

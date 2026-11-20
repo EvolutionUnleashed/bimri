@@ -156,7 +156,9 @@ class BimriCliTest(unittest.TestCase):
         return result
 
     def start(self, actor="test-agent", root=None):
-        result = self.cli("start", "--actor", actor, root=root)
+        # From build step 4 a plain start is the read brief and opens
+        # nothing (D1.1); the run these tests drive is the legacy lane.
+        result = self.cli("start", "--open-run", "--actor", actor, root=root)
         match = re.search(r"=== BIMRI BRIEF (R\d{6})", result.stdout)
         self.assertIsNotNone(match, result.stdout)
         return match.group(1)
@@ -291,6 +293,51 @@ class BimriCliTest(unittest.TestCase):
         target = root or self.root
         return json.loads((target / ".bimri" / "state.json").read_text("utf-8"))
 
+    def status_and_read_only_doctor(self, root=None):
+        """v5.2 (D5.1, D5.2): ``status`` no longer audits history.
+
+        It still holds the lock, heals the view and prints its short report,
+        exiting 1 only for a recovery condition already recorded on disk; the
+        damage the 5.1.x status found by auditing is now reported, with the
+        same issue text, by ``doctor --read-only`` (rc 1), which writes
+        nothing. Returns (status, doctor).
+        """
+        status = self.cli("status", root=root, check=False)
+        self.assertIn(status.returncode, (0, 1), status.stdout + status.stderr)
+        self.assertRegex(status.stdout, r"(?m)^BIMRI engine v5\.2\.0 \| ")
+        doctor = self.cli("doctor", "--read-only", root=root, check=False)
+        self.assertEqual(doctor.returncode, 1, doctor.stdout + doctor.stderr)
+        self.assertIn("BIMRI doctor (read-only): FAILED", doctor.stdout)
+        return status, doctor
+
+    def assert_open_conflicts(self, expected, root=None):
+        """Open conflicts by the engine's own scan, and status's short line.
+
+        v5.2 status counts from the checkpoint's facts generation and prints
+        ``?`` without a valid checkpoint (section 05 L1); the engine's
+        conflict scan is the authority for the number itself.
+        """
+        spec = importlib.util.spec_from_file_location(
+            "bimri_open_conflicts_test", ENGINE
+        )
+        engine = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(engine)
+        target = root or self.root
+        conflicts, issues = engine.scan_open_conflicts(
+            engine.Paths(target), self.state(root=target)
+        )
+        self.assertEqual(issues, [])
+        self.assertEqual(len(conflicts), expected)
+        status = self.cli("status", root=target)
+        match = re.search(
+            r"^Open conflicts: (\d+|\?) \|", status.stdout, re.MULTILINE
+        )
+        self.assertIsNotNone(match, status.stdout)
+        if match.group(1) == "?":
+            self.assertIn("Checkpoint: unproven; run doctor", status.stdout)
+        else:
+            self.assertEqual(int(match.group(1)), expected)
+
     def decision(self, proposal_id, root=None):
         target = root or self.root
         path = target / ".bimri" / "decisions" / f"{proposal_id}.json"
@@ -353,7 +400,7 @@ class BimriCliTest(unittest.TestCase):
             "engine_path": engine_path,
             "host_bound": True,
             "python_executable": python_executable,
-            "version": "5.1.2",
+            "version": "5.2.0",
         })
 
         template = json.loads(
@@ -393,9 +440,52 @@ class BimriCliTest(unittest.TestCase):
         ).encode("utf-8")
 
     def test_24_processes_start_with_unique_durable_run_handles(self):
+        # v5.2 (D1.1, gate 1): 24 concurrent plain starts are 24 read briefs
+        # that open nothing; the legacy lane (--open-run) keeps the unique
+        # durable handles below.
+        def read(number):
+            return self.cli(
+                "start",
+                "--actor",
+                f"reader-{number:02d}",
+                check=False,
+                timeout=45,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=24) as executor:
+            briefs = list(executor.map(read, range(24)))
+        self.assertEqual(
+            [item for item in briefs if item.returncode != 0],
+            [],
+            "\n\n".join(
+                f"stdout:\n{item.stdout}\nstderr:\n{item.stderr}"
+                for item in briefs if item.returncode != 0
+            ),
+        )
+        tokens = set()
+        for brief in briefs:
+            self.assertTrue(
+                brief.stdout.startswith("=== BIMRI BRIEF read | "), brief.stdout
+            )
+            self.assertNotIn("BIMRI RUN HANDLE", brief.stdout)
+            tokens.add(
+                re.search(r"(?m)^Observed: (\S+)$", brief.stdout).group(1)
+            )
+        state = self.state()
+        self.assertEqual(
+            tokens, {f"V000000:head:{state['head_hash']}"}
+        )
+        self.assertEqual(state["run_count"], 0)
+        self.assertEqual(state["active_runs"], {})
+        self.assertEqual(state["session_runs"], {})
+        self.assertEqual(
+            list((self.root / ".bimri" / "log").glob("R*.md")), []
+        )
+
         def launch(number):
             return self.cli(
                 "start",
+                "--open-run",
                 "--actor",
                 f"agent-{number:02d}",
                 check=False,
@@ -464,9 +554,15 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(set(self.state()["active_runs"]), {second})
 
     def test_unknown_hook_close_session_never_closes_singleton_run(self):
+        # v5.2 (D1.14): hook-start opens nothing; a session-mapped legacy run
+        # is opened deliberately under the hook's actor (D1.15 drains it).
         started = self.cli(
-            "hook-start",
-            input_text=json.dumps({"session_id": "known-session"}),
+            "start",
+            "--open-run",
+            "--actor",
+            "claude-code",
+            "--session",
+            "known-session",
         )
         match = re.search(r"=== BIMRI BRIEF (R\d{6})", started.stdout)
         self.assertIsNotNone(match, started.stdout)
@@ -555,9 +651,23 @@ class BimriCliTest(unittest.TestCase):
             "--summary",
             "Finished safely.",
         )
+        # v5.2: status no longer reads run logs (D5.1); the outcome is read
+        # from the closed run's own log.
         status = self.cli("status")
-        self.assertIn("Outcomes: success=1", status.stdout)
-        self.assertNotIn("fail=", status.stdout)
+        self.assertNotIn("Outcomes:", status.stdout)
+        log_text = (
+            self.root / ".bimri" / "log" / f"{run_id}.md"
+        ).read_text(encoding="utf-8")
+        # Control records anchor at line start; the journal's quoted
+        # `[OUTCOME:fail]` token is data and never counts as an outcome.
+        self.assertEqual(
+            re.findall(
+                r"^\[OUTCOME:(success|partial|overflow|fail)\]",
+                log_text,
+                re.MULTILINE,
+            ),
+            ["success"],
+        )
 
     def test_concurrent_independent_proposals_merge_without_conflict(self):
         first = self.start("codex")
@@ -899,7 +1009,7 @@ class BimriCliTest(unittest.TestCase):
         receipt = proposal["preflight_receipt"]
         self.assertEqual(proposal["bimri_version"], "5.1.0")
         self.assertEqual(proposal["base_revision"], state["head_revision"])
-        self.assertEqual(receipt["engine_release"], "5.1.2")
+        self.assertEqual(receipt["engine_release"], "5.2.0")
         self.assertEqual(receipt["observed_head_revision"], state["head_revision"])
         self.assertEqual(receipt["observed_head_hash"], state["head_hash"])
         self.assertEqual(receipt["observed_key_hash"], "absent")
@@ -1243,7 +1353,7 @@ class BimriCliTest(unittest.TestCase):
 
     def test_start_is_quiet_and_review_renders_one_time_concurrent_choice(self):
         first = self.start("quiet-first")
-        second_start = self.cli("start", "--actor", "quiet-second")
+        second_start = self.cli("start", "--open-run", "--actor", "quiet-second")
         second = re.search(
             r"=== BIMRI BRIEF (R\d{6})", second_start.stdout
         ).group(1)
@@ -1278,10 +1388,16 @@ class BimriCliTest(unittest.TestCase):
         self.assertNotIn("MEMORY CONFLICT", repeated.stdout)
         self.assertIn("new concurrent conflicts 0", repeated.stdout)
 
-        later_start = self.cli("start", "--actor", "quiet-third")
-        self.assertNotIn("HUMAN DECISION NEEDED", later_start.stdout)
-        self.assertNotIn(conflict_id, later_start.stdout)
-        self.assertNotIn("quiet.subject", later_start.stdout)
+        # Both brief forms stay quiet (the read brief's cold line is a
+        # count, never keys).
+        for later_arguments in (
+            ("start", "--actor", "quiet-third"),
+            ("start", "--open-run", "--actor", "quiet-third"),
+        ):
+            later_start = self.cli(*later_arguments)
+            self.assertNotIn("HUMAN DECISION NEEDED", later_start.stdout)
+            self.assertNotIn(conflict_id, later_start.stdout)
+            self.assertNotIn("quiet.subject", later_start.stdout)
 
         review = self.cli("review")
         self.assertIn("Actionable concurrent conflicts: 1", review.stdout)
@@ -1414,9 +1530,13 @@ class BimriCliTest(unittest.TestCase):
         self.cli("sync", "--run", later)
         satisfying_revision = self.state()["head_revision"]
 
+        # v5.2: the review classification left status (D5.2); review
+        # carries the same counts.
         status = self.cli("status")
-        self.assertIn("Actionable concurrent conflicts: 0", status.stdout)
-        self.assertIn("Satisfied historical candidates: 1", status.stdout)
+        self.assertNotIn("Satisfied historical candidates", status.stdout)
+        counts_review = self.cli("review")
+        self.assertIn("Actionable concurrent conflicts: 0", counts_review.stdout)
+        self.assertIn("Satisfied historical candidates: 1", counts_review.stdout)
         review = self.cli("review", "--all")
         self.assertIn("SATISFIED HISTORICAL CANDIDATE", review.stdout)
         self.assertIn(
@@ -1865,11 +1985,10 @@ class BimriCliTest(unittest.TestCase):
         head_before = self.state()["head_revision"]
         hot_before = self.hot()
 
-        status = self.cli("status", check=False)
-        self.assertEqual(status.returncode, 1)
+        _status, doctor = self.status_and_read_only_doctor()
         self.assertIn(
             "proposal preflight key hash does not match proposal base hash",
-            status.stdout,
+            doctor.stdout,
         )
         blocked = self.cli("sync", "--run", stale_run, check=False)
         self.assertEqual(blocked.returncode, 2)
@@ -3541,7 +3660,21 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual((self.root / "bimri.md").read_bytes(), canonical_hot)
         state_before_start = self.state()
 
-        degraded = self.cli("start", "--actor", "degraded-agent")
+        # v5.2 (D1.1, D8.3): a plain start is the read brief. It never
+        # audits, so it reports the discarded checkpoint exactly as status
+        # does below and allocates nothing: no degraded run is opened by
+        # start. Only the legacy lane (--open-run) opens the degraded run.
+        read_brief = self.cli("start", "--actor", "degraded-reader")
+        self.assertTrue(
+            read_brief.stdout.startswith("=== BIMRI BRIEF read | "),
+            read_brief.stdout,
+        )
+        self.assertNotIn("BIMRI RUN HANDLE", read_brief.stdout)
+        self.assertIn("Checkpoint: unproven; run doctor", read_brief.stdout)
+        self.assertEqual(self.state(), state_before_start)
+        self.assertEqual((self.root / "bimri.md").read_bytes(), canonical_hot)
+
+        degraded = self.cli("start", "--open-run", "--actor", "degraded-agent")
         self.assertEqual(degraded.returncode, 0)
         self.assertIn("AUTHORITY RECOVERY NEEDED", degraded.stdout)
         self.assertIn(
@@ -3565,9 +3698,15 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(len(manual_recovery), 1)
         self.assertEqual(manual_recovery[0].read_bytes(), direct_edit)
 
+        # v5.2 (D5.1, D5.2): status never audits. The sync that met the
+        # corrupt conflict discarded the checkpoint, so status reports it as
+        # unproven and points at doctor, which names the damaged record.
         status = self.cli("status", check=False)
-        self.assertEqual(status.returncode, 1)
-        self.assertIn("AUTHORITY RECOVERY NEEDED", status.stdout)
+        self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+        self.assertIn("Checkpoint: unproven; run doctor", status.stdout)
+        read_only = self.cli("doctor", "--read-only", check=False)
+        self.assertEqual(read_only.returncode, 1)
+        self.assertIn(f"{conflict_id}.json", read_only.stdout)
         doctor = self.cli("doctor", check=False)
         self.assertEqual(doctor.returncode, 1)
         self.assertIn(f"{conflict_id}.json", doctor.stdout)
@@ -3746,9 +3885,8 @@ class BimriCliTest(unittest.TestCase):
             json.dumps(forged, indent=2, sort_keys=True) + "\n"
         ).encode("utf-8")
         decision_path.write_bytes(forged_bytes)
-        status = self.cli("status", root=semantic_root, check=False)
-        self.assertEqual(status.returncode, 1)
-        self.assertIn("beyond the current canonical head", status.stdout)
+        _status, doctor = self.status_and_read_only_doctor(root=semantic_root)
+        self.assertIn("beyond the current canonical head", doctor.stdout)
         quarantined = self.cli(
             "quarantine-authority",
             "--kind",
@@ -3785,13 +3923,21 @@ class BimriCliTest(unittest.TestCase):
             json.dumps(orphan, indent=2, sort_keys=True) + "\n"
         ).encode("utf-8")
         orphan_path.write_bytes(orphan_bytes)
+        orphan_doctor = self.cli("doctor", root=orphan_root, check=False)
+        self.assertEqual(orphan_doctor.returncode, 1)
+        self.assertIn(f"resolution {orphan_id}", orphan_doctor.stdout)
+        # v5.2 (D5.2): status does not audit, but it reports the recorded
+        # condemnation (sealed witness below the state's epoch), exit 1.
         orphan_status = self.cli("status", root=orphan_root, check=False)
         self.assertEqual(orphan_status.returncode, 1)
+        self.assertIn("AUTHORITY RECOVERY NEEDED", orphan_status.stdout)
+        self.assertIn("audit checkpoint condemned at epoch", orphan_status.stdout)
         self.assertIn(f"resolution {orphan_id}", orphan_status.stdout)
-        # Owner-ruled 2026-09-02: once a full-audit boundary (status above)
+        # Owner-ruled 2026-09-02: once a full-audit boundary (doctor above)
         # has condemned the store, the checkpoint no longer shields the warm
-        # path. Start re-proves the store and prints the recovery banner,
-        # exactly as v5.1.0 did and as BIMRI-PROTOCOL 9.5 requires.
+        # path. The read brief prints the recovery banner from the recorded
+        # condemnation and its failed verdict, without re-auditing (v5.2,
+        # section 06 1.2), as BIMRI-PROTOCOL 9.5 requires.
         warm_start = self.cli("start", "--actor", "recovery", root=orphan_root)
         self.assertIn("AUTHORITY RECOVERY NEEDED", warm_start.stdout)
         self.assertIn(f"resolution {orphan_id}", warm_start.stdout)
@@ -3991,9 +4137,9 @@ class BimriCliTest(unittest.TestCase):
             self.skipTest(f"symbolic links unavailable: {exc}")
         reviewed_target = os.readlink(conflict_path)
 
-        unhealthy = self.cli("status", check=False)
-        self.assertEqual(unhealthy.returncode, 1)
-        self.assertIn("cannot be a symbolic link", unhealthy.stdout)
+        _status, unhealthy = self.status_and_read_only_doctor()
+        self.assertIn(conflict_id, unhealthy.stdout)
+        self.assertRegex(unhealthy.stdout, r"symbolic link|refused redirected path")
         quarantined = self.cli(
             "quarantine-authority",
             "--kind",
@@ -4218,10 +4364,14 @@ class BimriCliTest(unittest.TestCase):
             / "resolutions"
             / f"{conflict_id}.json"
         ).write_text("{}\n", "utf-8")
+        # v5.2 (D5.1): status no longer audits; doctor --read-only finds the
+        # forgery, and status reports the condemnation the failed writer and
+        # doctor recorded, with the failed verdict's issues (D5.2).
         for command in (
             ("sync", "--run", resolution_run),
-            ("status",),
+            ("doctor", "--read-only"),
             ("doctor",),
+            ("status",),
         ):
             with self.subTest(forgery="resolution", command=command):
                 result = self.cli(*command, root=resolution_root, check=False)
@@ -4327,10 +4477,13 @@ class BimriCliTest(unittest.TestCase):
             json.dumps(forged, indent=2, sort_keys=True) + "\n",
             "utf-8",
         )
+        # v5.2 (D5.1): doctor --read-only finds the forgery; status reports
+        # the recorded condemnation with the failed verdict's issues (D5.2).
         for command in (
             ("sync", "--run", resolved_run),
-            ("status",),
+            ("doctor", "--read-only"),
             ("doctor",),
+            ("status",),
         ):
             failed = self.cli(*command, root=resolved_root, check=False)
             self.assertNotEqual(failed.returncode, 0)
@@ -4431,11 +4584,12 @@ class BimriCliTest(unittest.TestCase):
                     ).encode("utf-8")
                 )
                 if resolution_status == "failed":
-                    status = self.cli("status", root=root, check=False)
-                    self.assertEqual(status.returncode, 1)
+                    # v5.2 (D5.1): status reports the checkpoint's facts and
+                    # never audits; the planted failed resolution is found
+                    # by doctor --read-only, with the same text.
+                    status, doctor = self.status_and_read_only_doctor(root=root)
                     self.assertIn("Open conflicts: 1", status.stdout)
-                    self.assertIn("AUTHORITY RECOVERY NEEDED", status.stdout)
-                    self.assertIn("explicit retry", status.stdout)
+                    self.assertIn("explicit retry", doctor.stdout)
                     blocked = self.cli(
                         "sync",
                         "--run",
@@ -4509,10 +4663,7 @@ class BimriCliTest(unittest.TestCase):
                     first_conflict["current_hash"],
                 )
                 expected_open = 1 if resolution_status == "failed" else 2
-                self.assertIn(
-                    f"Open conflicts: {expected_open}",
-                    self.cli("status", root=root).stdout,
-                )
+                self.assert_open_conflicts(expected_open, root=root)
 
     def test_impossible_touch_and_close_bases_are_quarantine_recoverable(self):
         for operation in ("touch", "close"):
@@ -4572,13 +4723,11 @@ class BimriCliTest(unittest.TestCase):
                 proposal_path.write_bytes(forged_bytes)
 
                 head_before = self.state(root=root)["head_revision"]
-                status = self.cli("status", root=root, check=False)
-                self.assertEqual(status.returncode, 1)
-                self.assertIn("AUTHORITY RECOVERY NEEDED", status.stdout)
-                self.assertIn(proposal_id, status.stdout)
+                _status, doctor = self.status_and_read_only_doctor(root=root)
+                self.assertIn(proposal_id, doctor.stdout)
                 self.assertIn(
                     "proposal preflight revision does not match proposal base revision",
-                    status.stdout,
+                    doctor.stdout,
                 )
                 blocked = self.cli(
                     "sync", "--run", attacker, root=root, check=False
@@ -4704,7 +4853,8 @@ class BimriCliTest(unittest.TestCase):
                     ).encode("utf-8")
                 )
                 head_before = self.state(root=root)["head_revision"]
-                status = self.cli("status", root=root, check=False)
+                # v5.2 (D5.1): the audit that status ran is doctor's now.
+                _status, status = self.status_and_read_only_doctor(root=root)
                 attempted = self.cli(
                     "resolve",
                     conflict_id,
@@ -4811,9 +4961,9 @@ class BimriCliTest(unittest.TestCase):
         )
         self.assertEqual(proposed.returncode, 2)
         self.assertIn("base revision V000000 is missing or unsafe", proposed.stderr)
-        status = self.cli("status", check=False)
-        self.assertEqual(status.returncode, 1)
-        self.assertIn("missing or unsafe revision V000000", status.stdout)
+        _status, doctor = self.status_and_read_only_doctor()
+        self.assertIn("V000000", doctor.stdout)
+        self.assertRegex(doctor.stdout, r"missing or unsafe revision|refused redirected path")
         self.assertEqual(external.read_bytes(), base.read_bytes())
         self.assertEqual(self.state()["head_revision"], 1)
 
@@ -5207,7 +5357,9 @@ class BimriCliTest(unittest.TestCase):
         first = self.cli("migrate")
         self.assertIn("complete at memory format v5.1.0", first.stdout)
         state = self.state()
-        self.assertEqual(state["bimri_version"], "5.1.0")
+        # v5.2.0: a migration creates a new store, born at state format
+        # v5.2.0; its authority (memory) format stays v5.1.0.
+        self.assertEqual(state["bimri_version"], "5.2.0")
         self.assertEqual(state["project_id"], "legacy-project")
         self.assertEqual(state["run_count"], 3)
         self.assertEqual(
@@ -5468,7 +5620,9 @@ class BimriCliTest(unittest.TestCase):
             0,
             portable_start.stdout + portable_start.stderr,
         )
-        self.assertRegex(portable_start.stdout, r"=== BIMRI BRIEF R\d{6}")
+        # v5.2 (D1.1): the installed engine's default start is the read
+        # brief; it still initializes its own folder, never the cwd.
+        self.assertRegex(portable_start.stdout, r"=== BIMRI BRIEF read \| ")
         self.assertTrue((target / ".bimri" / "state.json").is_file())
         self.assertFalse((elsewhere / ".bimri").exists())
         self.assertFalse((elsewhere / "bimri.md").exists())
@@ -5585,6 +5739,11 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(len(manifests), 1)
         manifest = json.loads(manifests[0].read_text("utf-8"))
         self.assertEqual(manifest["status"], "installed-recovery-required")
+        # INSTALL.md: status stays nonzero for automation. v5.2 status does
+        # not audit; it reports the condemnation the install recorded (D5.2).
+        recorded = self.cli("status", root=target, check=False)
+        self.assertEqual(recorded.returncode, 1, recorded.stdout)
+        self.assertIn("audit checkpoint condemned at epoch", recorded.stdout)
 
         quarantined = self.cli(
             "quarantine-authority",
@@ -6001,8 +6160,10 @@ class BimriCliTest(unittest.TestCase):
         root_temp.write_text("temporary data\n", "utf-8")
         nested_temp.write_text("temporary data\n", "utf-8")
 
-        doctor = self.cli("doctor")
-        self.assertIn("BIMRI doctor: PASSED", doctor.stdout)
+        doctor = self.cli("doctor", check=False)
+        self.assertEqual(doctor.returncode, 1, doctor.stdout + doctor.stderr)
+        self.assertIn("BIMRI doctor: COMPLETION REQUIRED", doctor.stdout)
+        self.assertIn(f"sync --run {run_id}", doctor.stdout)
         self.assertIn(
             f"unfinished applying decision {proposal_id}",
             doctor.stdout,
@@ -6105,6 +6266,7 @@ class BimriCliTest(unittest.TestCase):
         started = self.worker(
             "index_failure",
             "start",
+            "--open-run",
             "--actor",
             "index-start",
             root=start_root,
@@ -6294,7 +6456,13 @@ class BimriCliTest(unittest.TestCase):
         first_doctor = self.cli("doctor")
         doctor_index_one = index_path.read_bytes()
         second_doctor = self.cli("doctor")
-        self.assertEqual(first_doctor.stdout, second_doctor.stdout)
+        # v5.2 (build step 8): the copy audit's PASSED line reports the
+        # measured capture time, the one clause allowed to differ.
+        capture_time = re.compile(r"copy captured in \d+ ms")
+        self.assertEqual(
+            capture_time.sub("copy captured in <n> ms", first_doctor.stdout),
+            capture_time.sub("copy captured in <n> ms", second_doctor.stdout),
+        )
         self.assertIn("BIMRI doctor: PASSED", first_doctor.stdout)
         self.assertEqual(doctor_index_one, index_path.read_bytes())
         self.assertEqual(state_one, (self.root / ".bimri" / "state.json").read_bytes())
@@ -7073,7 +7241,8 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(
             (bdir / "revisions" / "V000000.md").read_bytes(), revision_before
         )
-        self.assertEqual(self.state()["bimri_version"], "5.1.0")
+        # The resumed v4 migration creates a new store at state v5.2.0.
+        self.assertEqual(self.state()["bimri_version"], "5.2.0")
         self.assertIn("BIMRI doctor: PASSED", self.cli("doctor").stdout)
 
     def test_v4_historical_conversion_keeps_v000000_and_normalizes_active_head(self):
@@ -7290,6 +7459,7 @@ class BimriCliTest(unittest.TestCase):
                 sys.executable,
                 str(target / "bimri-engine.py"),
                 "start",
+                "--open-run",
                 "--actor",
                 "rebind-test",
             ],
@@ -7780,7 +7950,9 @@ class BimriCliTest(unittest.TestCase):
 
         self.assertEqual(self.decision(proposal_id)["outcome"], "accepted")
         self.assertIn("[K:upgrade.pending]", self.hot())
-        self.assertEqual(self.state()["bimri_version"], "5.1.0")
+        # The sync is the first authority write: the writer gate moves the
+        # upgraded v5.1.0 state to v5.2.0 (artifacts stay v5.1.0).
+        self.assertEqual(self.state()["bimri_version"], "5.2.0")
         self.assertIn("BIMRI doctor: PASSED", self.cli("doctor").stdout)
 
     def test_installer_migrates_long_legacy_claim_with_receipt_and_repair_path(self):
@@ -7922,7 +8094,8 @@ class BimriCliTest(unittest.TestCase):
             resumed.stdout,
         )
         state = self.state()
-        self.assertEqual(state["bimri_version"], "5.1.0")
+        # A legacy migration creates a new store at state v5.2.0.
+        self.assertEqual(state["bimri_version"], "5.2.0")
         self.assertEqual(state["head_revision"], 1)
         normalized = (revisions / "V000001.md").read_bytes()
         self.assertEqual((self.root / "bimri.md").read_bytes(), normalized)
@@ -7970,8 +8143,7 @@ class BimriCliTest(unittest.TestCase):
 
     def test_missing_authority_records_use_absence_stubs_and_restore(self):
         def recover_missing(root, kind, record_id, path, valid_bytes):
-            unhealthy = self.cli("status", root=root, check=False)
-            self.assertEqual(unhealthy.returncode, 1)
+            _status, unhealthy = self.status_and_read_only_doctor(root=root)
             self.assertIn(record_id, unhealthy.stdout + unhealthy.stderr)
 
             quarantined = self.cli(
@@ -8156,8 +8328,7 @@ class BimriCliTest(unittest.TestCase):
         )
         first_path.unlink()
 
-        blocked = self.cli("status", check=False)
-        self.assertEqual(blocked.returncode, 1)
+        _status, blocked = self.status_and_read_only_doctor()
         self.assertIn(
             f"proposal {first} is missing despite its durable reference",
             blocked.stdout,
@@ -8196,8 +8367,7 @@ class BimriCliTest(unittest.TestCase):
 
         # A durably processed proposal cannot silently recreate missing
         # authority, even while its writer is active and its log is safe.
-        active = self.cli("status", check=False)
-        self.assertEqual(active.returncode, 1, active.stdout + active.stderr)
+        _status, active = self.status_and_read_only_doctor()
         self.assertIn(
             f"decision {candidate} is missing after its proposal was "
             "durably processed",
@@ -8213,12 +8383,14 @@ class BimriCliTest(unittest.TestCase):
             saved_log.replace(log_path)
             self.skipTest(f"symbolic links unavailable: {exc}")
 
-        unsafe = self.cli("status", check=False)
+        # v5.2: status never reads a run log (D5.1); doctor does.
+        unsafe = self.cli("doctor", "--read-only", check=False)
         self.assertNotEqual(unsafe.returncode, 0)
         unsafe_output = unsafe.stdout + unsafe.stderr
         self.assertTrue(
             f"candidate {candidate} has no safe decision record" in unsafe_output
-            or "run log cannot be a symbolic link" in unsafe_output,
+            or "run log cannot be a symbolic link" in unsafe_output
+            or f"run log is missing or unsafe: {run_id}.md" in unsafe_output,
             unsafe_output,
         )
         log_path.unlink()
@@ -8267,8 +8439,7 @@ class BimriCliTest(unittest.TestCase):
         )
         decision_path.unlink()
 
-        inactive = self.cli("status", check=False)
-        self.assertEqual(inactive.returncode, 1)
+        _status, inactive = self.status_and_read_only_doctor()
         self.assertIn(
             f"candidate {candidate} has no safe decision record",
             inactive.stdout + inactive.stderr,
@@ -8449,22 +8620,25 @@ class BimriCliTest(unittest.TestCase):
         (
             self.root / ".bimri" / "decisions" / f"{proposal_id}.json"
         ).unlink()
-        status = self.cli("status", check=False)
-        self.assertEqual(status.returncode, 1)
+        _status, doctor = self.status_and_read_only_doctor()
         self.assertIn(
             f"decision {proposal_id} is missing after its proposal was "
             "durably processed",
-            status.stdout,
+            doctor.stdout,
         )
 
     def test_engine_release_is_separate_from_memory_format(self):
         self.cli("migrate")
         state = self.state()
-        self.assertEqual(state["bimri_version"], "5.1.0")
+        # Engine 5.2.0, state format 5.2.0 (a new store), memory format
+        # 5.1.0, hot grammar 5.0.2: four separate identities.
+        self.assertEqual(state["bimri_version"], "5.2.0")
         self.assertIn("<!-- BIMRI v5.0.2 |", self.hot())
         status = self.cli("status")
+        # v5.2 status header (D5.1) names the live state version too.
         self.assertIn(
-            "BIMRI engine v5.1.2 | memory format v5.1.0 | revision V000000",
+            "BIMRI engine v5.2.0 | memory format v5.1.0 | state v5.2.0 | "
+            "revision V000000",
             status.stdout,
         )
 
@@ -8784,8 +8958,9 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(candidate.returncode, 0, candidate_stderr)
         self.assertIn("Memory preservation: PASSED", candidate_stdout)
         self.assertEqual(old_waiter.returncode, 2, old_stdout + old_stderr)
+        # The store was created by this engine at state format v5.2.0.
         self.assertIn(
-            "unsupported BIMRI state version: 5.1.0",
+            "unsupported BIMRI state version: 5.2.0",
             old_stdout + old_stderr,
         )
         self.assertNotIn("BIMRI RUN HANDLE:", old_stdout)
@@ -8843,15 +9018,17 @@ class BimriCliTest(unittest.TestCase):
             timeout=60,
         )
 
-        self.assertIn("BIMRI 5.1.2 installed.", result.stdout)
-        self.assertIn("Existing authority store v5.1.0 verified", result.stdout)
+        self.assertIn("BIMRI 5.2.0 installed.", result.stdout)
+        # migrate + sync: a v5.2.0 state (new store, then an authority
+        # write); a byte-identical code-only update keeps it at v5.2.0.
+        self.assertIn("Existing authority store v5.2.0 verified", result.stdout)
         self.assertIn("Memory preservation: PASSED", result.stdout)
         self.assertEqual(protected_tree_snapshot(self.root), before)
-        self.assertEqual(self.state()["bimri_version"], "5.1.0")
+        self.assertEqual(self.state()["bimri_version"], "5.2.0")
         runtime = json.loads(
             (bdir / "runtime.local.json").read_text("utf-8")
         )
-        self.assertEqual(runtime["version"], "5.1.2")
+        self.assertEqual(runtime["version"], "5.2.0")
         manifests = list(
             (self.root / ".bimri-update-backups").glob(
                 "*/install-manifest.json"
@@ -8859,12 +9036,12 @@ class BimriCliTest(unittest.TestCase):
         )
         self.assertEqual(len(manifests), 1)
         manifest = json.loads(manifests[0].read_text("utf-8"))
-        self.assertEqual(manifest["engine_release"], "5.1.2")
-        self.assertEqual(manifest["memory_format"], "5.1.0")
+        self.assertEqual(manifest["engine_release"], "5.2.0")
+        self.assertEqual(manifest["memory_format"], "5.2.0")
         # v5.1.2: a same-format update keeps the stricter code-only-update
         # label, which binds the before and after tree and state digests.
         self.assertEqual(manifest["mode"], "code-only-update")
-        self.assertEqual(manifest["source_memory_format"], "5.1.0")
+        self.assertEqual(manifest["source_memory_format"], "5.2.0")
         self.assertFalse(manifest["state_activated"])
         self.assertEqual(manifest["before_state_sha256"], manifest["after_state_sha256"])
         self.assertEqual(manifest["before_tree_digest"], manifest["after_tree_digest"])
@@ -9063,10 +9240,10 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(
             state["head_hash"], fixture_manifest["accepted_head_hash"]
         )
-        activated_audit = self.cli("doctor", "--read-only")
-        self.assertIn(
-            "BIMRI doctor (read-only): PASSED", activated_audit.stdout
-        )
+        activated_audit = self.cli("doctor", "--read-only", check=False)
+        self.assertEqual(activated_audit.returncode, 1, activated_audit.stdout + activated_audit.stderr)
+        self.assertIn("BIMRI doctor (read-only): COMPLETION REQUIRED", activated_audit.stdout)
+        self.assertIn("sync --run R000011", activated_audit.stdout)
 
     def test_code_update_caught_failure_rolls_back_authorized_files_only(self):
         self.cli("migrate")

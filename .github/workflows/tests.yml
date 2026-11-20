@@ -14,9 +14,9 @@ concurrency:
 
 jobs:
   test:
-    # Windows 3.8 can take about 29 minutes for the full crash/recovery suite,
-    # leaving no reliable room for the benchmark step under the old ceiling.
-    timeout-minutes: 60
+    # The 5.2 suite includes thousand-save soaks, interrupted-write matrices
+    # and two-install rehearsals before the benchmark. Hosted jobs run serially.
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -31,7 +31,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Compile Python sources
-        run: python -m py_compile bimri-engine.py tests/test_bimri_engine.py tests/test_v503_release.py tests/test_v510_lifecycle.py tests/test_v511_performance.py tests/test_v512_defects.py tests/test_windows_atomic_replace.py tests/crash_worker.py
+        run: python -m compileall -q bimri-engine.py tests
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
       - name: Benchmark smoke with canonical gates

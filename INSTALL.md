@@ -70,12 +70,10 @@ two paths to its ignore rules explicitly.
    artifact somewhere outside the project. For a v5 target, that snapshot MUST
    include `bimri.md` plus the entire `.bimri/` tree. The lock serializes
    commands; it cannot fence an already-loaded old process waiting to write
-   after the installer exits. For a v5.1.0 or v5.1.1 store taking v5.1.2, that
-   complete external snapshot is the only rollback after the first v5.1.2
-   proposal is staged: v5.1.2 accepts receipts stamped v5.1.0, v5.1.1 and
-   v5.1.2, but an older engine rejects the newer proposal receipt. A store the
-   new engine has only started and closed, with no v5.1.2 proposal, remains
-   readable by the older engine.
+   after the installer exits. After the first 5.2 authority write, the 5.1.2
+   engine refuses the store. Restore the complete external snapshot and the
+   previous engine to roll back. Installation and ordinary reads leave a
+   5.1.0 state readable by 5.1.2.
 3. If Claude Cowork Global Instructions contain a v1-v3 BIMRI block, ask
    the owner to disable or remove it before installation. Those instructions
    directly rewrite the old hot-memory file and must not run alongside v5.
@@ -127,13 +125,11 @@ two paths to its ignore rules explicitly.
 7. Run `<verified-python> bimri-engine.py doctor --read-only` from the updated
    target when you need to repeat the non-mutating audit. Use normal
    `doctor` only when repair-capable validation is intended, with one
-   exception: after an engine update of a v5.1.x store, run normal `doctor`
-   once from the updated target before any agent session. The new engine
-   binds its audit checkpoint to authority policy version `5.1.2-authority-1`,
-   so the checkpoint the previous engine wrote is a cache miss; that first
-   `doctor` re-proves the store with one full audit, about 35 seconds on a
-   700-run store, and seeds the new checkpoint so the first `hook-start` does
-   not pay for it inside its 90-second timeout.
+   exception: after updating a v5.1.x store, run normal `doctor` once from
+   the updated target. This full audit establishes the first checkpoint
+   under `5.2.0-authority-1`. Allow time for the populated store to be
+   checked. If doctor reports an interrupted legacy operation, use its named
+   run and recovery instruction under that run owner's authority.
 8. Confirm the installer wrote both local binding records above; never commit
    them.
 9. Report only:
@@ -266,24 +262,19 @@ duplicates.
 
 The installed hook commands use argv form with the exact verified Python
 executable and the project-relative engine path. Inspect them with `/hooks`,
-then execute a real smoke test: invoke `hook-start` with a unique synthetic
-Claude session ID and require non-empty output containing `BIMRI RUN HANDLE`
-and `=== BIMRI BRIEF`; invoke `hook-close` with the same ID and require a normal
-close; then run `doctor`. A zero-output hook is a failed hook even if its
-process reports success. Confirm that the synthetic run is closed before
-reporting the installation complete.
+then execute a real smoke test: invoke `hook-start` with any payload (a
+synthetic Claude session ID is fine) and require non-empty output containing
+`=== BIMRI BRIEF read` and `=== END BRIEF ===` and no `BIMRI RUN HANDLE` line;
+invoke `hook-close` with the same payload and require exit 0 with empty
+output; then run `doctor` and require `PASSED`. A zero-output `hook-start` is a
+failed hook even if its process reports success. There is no run to confirm
+closed.
 
-`hook-start` opens a run only when Claude's payload carries a `session_id` or
-`transcript_path`. A payload with neither, including empty, invalid or
-non-object stdin, is refused with exit 2 and a message ending in
-`[hook-identity-missing]`, and nothing is created; a run opened under an
-invented identity could never be closed by its `SessionEnd` hook. Claude Code
-does not block a session on a `SessionStart` hook exit code, so such a session
-opens without a brief and the explicit `start --actor` command in `AGENTS.md`
-still applies. An automatic `hook-close` for an unknown or already-unmapped
-session is a successful no-op, and the `SessionEnd` reason it records is
-flattened to one line and bounded so it cannot fail the close. The explicit
-`close` command remains strict so operator mistakes are still visible.
+`hook-start` prints the read brief for any payload and opens nothing.
+`hook-close` closes a legacy run mapped to that session only when nothing in it
+is left undecided, never applies a staged proposal, and is otherwise a
+successful no-op; the reason Claude supplies is flattened and bounded. The
+explicit `close` command remains strict so operator mistakes are still visible.
 
 The root `hooks-example.json` remains a portable placeholder template. Never
 paste its unresolved placeholder into Claude settings; use only the local

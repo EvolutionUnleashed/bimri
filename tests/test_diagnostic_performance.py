@@ -36,7 +36,7 @@ class DiagnosticPerformanceTest(unittest.TestCase):
 
     def start(self, actor):
         return re.search(r"BIMRI RUN HANDLE: (R\d+)", self.cli(
-            "start", "--actor", actor
+            "start", "--open-run", "--actor", actor
         )).group(1)
 
     def propose(self, run, text):
@@ -72,11 +72,21 @@ class DiagnosticPerformanceTest(unittest.TestCase):
 
     def test_cached_reports_equal_uncached_full_audit(self):
         self.contested_store()
-        for command in ("review", "status"):
+        # v5.2 status no longer audits (D5.1), so the cache comparison is
+        # review's alone; status must leave the checkpoint bytes untouched.
+        witness = self.root / ".bimri" / "audit-witness.json"
+        for command in ("review",):
             with self.subTest(command=command):
+                witness_before = witness.read_bytes()
                 uncached = self.report(command, cached=False)
                 cached = self.report(command)
                 self.assertEqual(cached, uncached)
+                # v5.2 (build step 8): review audits a captured copy
+                # inside diagnostic_read_scope and never publishes.
+                self.assertEqual(witness.read_bytes(), witness_before)
+        witness_bytes = self.paths.audit_witness.read_bytes()
+        self.assertEqual(self.report("status"), self.report("status"))
+        self.assertEqual(self.paths.audit_witness.read_bytes(), witness_bytes)
 
     def test_historical_revisions_validated_once_per_report(self):
         self.contested_store()
@@ -108,7 +118,9 @@ class DiagnosticPerformanceTest(unittest.TestCase):
         satisfying, _ = fixture.start("cold-report-satisfying")
         fixture.apply_set(satisfying, key, candidate_text)
         self.assertIn(key, fixture.cold_current())
-        for command in ("review", "status"):
+        # Satisfied historical candidates are review's distinction only;
+        # v5.2 status counts the facts generation's held list (D5.1).
+        for command in ("review",):
             with self.subTest(command=command):
                 uncached = self.report(command, cached=False)
                 cached = self.report(command)
@@ -124,12 +136,18 @@ class DiagnosticPerformanceTest(unittest.TestCase):
         # Intentional adversarial corruption in this disposable test store.
         path.write_text(json.dumps(proposal), encoding="utf-8")
         self.assertIn("AUTHORITY RECOVERY NEEDED", self.report("review"))
+        # v5.2 (build step 3, D4.5): a checkpoint-scoped write re-validates
+        # the records it depends on, so the write that must refuse is the
+        # one whose run holds the corrupted proposal (the other run's sync
+        # depends on none of it; the deep audit, as review shows, does).
+        corrupted_run = proposal_id.split("-Q", 1)[0]
         result = subprocess.run(
             [sys.executable, str(ENGINE), "--root", str(self.root),
-             "sync", "--run", first],
+             "sync", "--run", corrupted_run],
             capture_output=True, text=True, encoding="utf-8", timeout=60,
         )
         self.assertNotEqual(result.returncode, 0)
+        del first
 
     def test_cached_entries_cannot_be_changed_by_the_reader(self):
         self.contested_store()
@@ -152,6 +170,13 @@ class DiagnosticPerformanceTest(unittest.TestCase):
             with self.assertRaisesRegex(self.engine.BimriError, "authority writes"):
                 with self.engine.diagnostic_read_scope(self.paths):
                     self.engine.begin_authority_write(self.paths, state)
+            # v5.2 (build step 3): the checkpoint-scoped write boundary
+            # refuses a diagnostic scope before it reads any evidence.
+            with self.assertRaisesRegex(self.engine.BimriError, "authority writes"):
+                with self.engine.diagnostic_read_scope(self.paths):
+                    self.engine.begin_scoped_authority_write(
+                        self.paths, state, "propose"
+                    )
         self.assertIsNone(self.paths.diagnostic_read_cache)
 
 

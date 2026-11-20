@@ -107,7 +107,8 @@ def run_start_with_blocked_state(engine_path, root):
     engine.os = OsView(os.name, replace)
     try:
         result = engine.main([
-            "--root", str(root), "start", "--actor", "blocked-state-writer",
+            "--root", str(root), "start", "--open-run",
+            "--actor", "blocked-state-writer",
         ])
     finally:
         if held is not None:

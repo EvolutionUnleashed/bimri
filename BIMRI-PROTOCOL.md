@@ -1,4 +1,4 @@
-# BIMRI Protocol Release v5.1.0
+# BIMRI Protocol Release v5.2.0
 
 Brief Interaction Memory and Retrieval Intelligence.
 
@@ -6,11 +6,9 @@ This document is the normative protocol for a portable, human-governed BIMRI
 memory folder. `AGENTS.md` is the short runtime adapter. `bimri-engine.py` is
 the reference implementation.
 
-The reference engine is v5.1.2. The mutable state and new authority-record
-format remain v5.1.0, and the readable `bimri.md` line grammar and header remain
-v5.0.2 because v5.1 changes subject lifecycle and residency rather than the
-visible line syntax. Frozen v5.0-v5.0.2 artifacts retain their original version
-and are validated against their original contract.
+The reference engine is v5.2.0. The mutable state supports v5.1.0 and v5.2.0.
+New authority records retain the v5.1.0 format and the generated Markdown
+retains the v5.0.2 grammar. Frozen artifacts keep their original contracts.
 
 The words MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY describe interoperability
 requirements.
@@ -130,9 +128,15 @@ policy checkpoint eligible for current reads; the new policy still requires
 a full semantic audit. Current-only
 reads may validate the checkpoint, accepted head, current state, and one
 selected cold binding without traversing historical authority.
-Authority-changing writes (`propose`, `sync`, authority `close`, `resolve`) and
-explicit audit, `status`, review, search, historical retrieval, `index`,
-`maintain` and `migrate` perform the full check. The checkpoint is a derived
+A valid checkpoint certifies the protected records, run facts and current state the last full
+audit proved, as of its head and epoch, plus a chain of declared, verified engine writes since.
+An ordinary write re-validates only the records it depends on, records every protected path it
+writes, and publishes the successor checkpoint from the prior inventory plus those paths.
+Damage to a record no write depends on is caught when that record is next used or by the deep
+audit, which condemns on failure. A write never adopts a changed byte it did not verify.
+
+Ordinary search checks the checkpoint. Historical reads and explicitly
+audited search can capture a copy for full verification. The checkpoint is a derived
 cache: divergence from it is a cache miss that forces the full semantic audit,
 never a stored verdict of its own. When that audit passes over divergence the
 engine cannot attribute to its own recorded operation, it first durably
@@ -310,13 +314,17 @@ the human to approve the same statement a second time.
 
 ### 7.1 Start
 
-An agent requests an isolated run:
+A plain start returns the accepted-head observation and the read brief.
+It MUST NOT allocate a run, append a log, or map a session. A cold read
+reports the checkpoint condition. If it finds an admitted, incomplete save,
+it may finish the existing operation. An agent explicitly opens a legacy
+run to journal or stage proposals:
 
 ```text
-<verified-python> bimri-engine.py start --actor <lowercase-agent-slug>
+<verified-python> bimri-engine.py start --open-run --actor <lowercase-agent-slug>
 ```
 
-Under the engine lock, `start` MUST:
+Under the engine lock, `start --open-run` MUST:
 
 1. validate or initialize the folder;
 2. synchronize the generated view to the accepted head revision;
@@ -335,7 +343,7 @@ recovery warnings because those indicate that shared writes are unsafe.
 run handle is already durable and the non-authoritative index can be rebuilt
 independently with `index` or as part of scheduled maintenance.
 
-`--session <opaque-session-id>` MAY bind a harness session to a run. Starting
+On the explicit legacy lane, `--session <opaque-session-id>` MAY bind a harness session to a run. Starting
 the same actor and session resumes its active run instead of allocating a
 second one.
 
@@ -409,8 +417,8 @@ An admitted proposal binds `base_revision` to that current accepted head and
 `base_hash` to the exact keyed line hash, or literal `absent`. It MAY also
 carry one backward-readable `preflight_receipt` containing the engine release
 that created it, accepted-head revision and hash, and observed key hash. The
-v5.1.2 engine writes this receipt on every new proposal and stamps v5.1.2; it
-accepts v5.1.0, v5.1.1 and v5.1.2 receipts. An older engine rejects a receipt
+v5.2.0 engine stamps new receipts with its own release. It accepts v5.1.0,
+v5.1.1, v5.1.2 and v5.2.0 receipts. An older engine rejects a receipt
 stamped by a newer release: v5.1.1 rejects v5.1.2-authored receipts and v5.1.0
 rejects both v5.1.1 and v5.1.2. When present, the receipt MUST validate against
 the named immutable revision before the proposal may create a new concurrent
@@ -501,11 +509,31 @@ owner explicitly authorizes recovery. An agent records that authorization with:
   --summary "Owner confirmed this orphaned run should close."
 ```
 
-`--run` and `--summary` are required. `--outcome` MAY select any normal close
-outcome and defaults to `partial`. `recover-run` uses the normal proposal-sync
-and close semantics. It MUST NOT be invoked merely because a run appears old.
+Recovering a named legacy run applies its pending proposals by default.
+`--abandon --dry-run` lists the undecided proposals without changing the
+store. With the owner's explicit `--human-approved` attestation, `--abandon`
+records an immutable abandoned decision for each undecided proposal and closes
+that run without changing accepted memory. An applying decision must finish
+before abandonment. Each selected run has a separate durable operation.
+`--all-orphans` is accepted only with `--abandon`. Age alone cannot authorize
+cleanup.
+
+A proposal or save can link a held candidate through `--settles ID` when the
+keys match. An accepted or unchanged decision with the required authority
+creates an immutable settlement under `.bimri/settlements/`. Owner dismissal
+uses `dismiss-held ID --human-approved --summary SUM`. The original held
+decision remains available in history. Repeating an owner dismissal reports
+the existing settlement.
 
 ## 8. Commit Protocol
+
+A request id is recognised while its ticket is in `open/` or `done/` or in
+the receipts of this or the previous month; a retry outside that window is
+a new request and yields `unchanged` or `stale`, never a second effect.
+Finished save tickets stay in `.bimri/saves/done/` for seven days. `maintain`
+and a successful writable `doctor` copy older tickets into monthly receipts
+before removing the individual files. A retry prefers the individual ticket
+while both copies exist.
 
 All shared mutations MUST occur inside one short exclusive engine-lock
 section. A conforming commit performs these steps:
@@ -593,6 +621,21 @@ A later changed hash for the proposal's own key can create a conflict only
 when the immutable preflight receipt and accepted authority prove genuine
 cross-run overlap. Same-run evolution, a run already stale at proposal time,
 capacity, validation, and policy refusal are not owner conflicts.
+
+State format and the rollback window (v5.2.0 reference engine). Authority
+artifacts keep the v5.1.0 memory format; `state.json` carries the state
+format. A new store is created at state format v5.2.0. An existing v5.1.0
+state moves to v5.2.0 in the same durable state write that advances the
+audit epoch at the start of its first authority transition, and never moves
+back. An authority write that takes no new transition (degraded proposal
+staging, a write while unsettled records withhold the checkpoint, or a retry
+under a retained transition marker) moves it in its own state write before
+its first effect. A v5.1.2 engine refuses a v5.2.0 state with
+`unsupported BIMRI state version: 5.2.0` before any state, log or authority
+write. A store that 5.2.0 has only read, started, journaled or
+lifecycle-closed stays 5.1.0 and readable by 5.1.2; the first authority write
+(save, propose, sync, authority close, resolve, recover-run --abandon,
+recover-save, dismiss-held, a Tier 3 cooling) is one-way.
 
 ## 9. Conflicts
 
@@ -794,11 +837,13 @@ concurrency.
 A malformed, unsafe, or semantically invalid canonical proposal, decision,
 conflict, or resolution MUST pause every canonical shared-memory write,
 including otherwise unrelated keys. The generated `bimri.md` view MUST still
-be healed from the accepted head. `start` MAY create a legitimate degraded run
-and MUST print `AUTHORITY RECOVERY NEEDED`; `status` MUST print the full
-read-only report and return nonzero. Journaling and immutable proposal staging
-MAY continue, but sync, close, resolution, maintenance, and other canonical
-commits MUST remain blocked.
+be healed from the accepted head. The read brief opens nothing, so no
+degraded run is opened by `start`; it MUST print `AUTHORITY RECOVERY NEEDED`
+once the condition is recorded, and only a deliberate legacy
+`start --open-run` MAY create a legitimate degraded run. `status` MUST print
+the full read-only report and return nonzero. Journaling and immutable proposal
+staging MAY continue, but sync, close, resolution, maintenance, and other
+canonical commits MUST remain blocked.
 
 Recovery is an explicit owner-governed operation:
 
@@ -850,11 +895,11 @@ an otherwise valid proposal.
 
 The 49,152-byte generated-view ceiling is enforced because every hot entry is
 injected into agent context. Before an incoming effect crosses it, the engine
-MUST cool deterministic eligible Tier 2 subjects until the effect fits. Tier 1
+MUST cool eligible Tier 2 or Tier 3 subjects deterministically until the effect fits. Tier 1
 MUST NOT be cooled automatically. Cooling preserves the exact current
 generation in an exact keyed archive record and MUST be reversible through an explicit
 future `set` or `touch`, which rehydrates the subject while applying the normal
-keyed operation. If no eligible Tier 2 subject exists, the submitted
+keyed operation. If no eligible generation can make room, the submitted
 intent remains durable without changing current truth.
 
 The target allocation is roughly 3,000 tokens for Tier 1, 6,000 for Tier 2,
@@ -866,8 +911,9 @@ logs, revisions, cooled archive records, decisions, resolutions, archives, and b
 relevant use, importance, semantic status, and deterministic key ordering. It
 does not change residency or ask the owner to curate routine ageing. The same
 ordering drives admission-time pressure cooling among existing residents under
-the engine lock. The incoming Tier 2 generation is cooled only when existing
-eligible residents cannot make it fit. Global run count MUST NOT accelerate
+the engine lock. An incoming Tier 2 or Tier 3 generation with a lower
+retention score than the next eligible resident cools first. Ties cool the
+resident first. Global run count MUST NOT accelerate
 ageing because unrelated concurrent agent starts are not evidence that a
 subject became stale. Pressure maintenance changes residency only, raises no
 owner conflict, and never hard-deletes memory. Closed entries leave current
@@ -956,9 +1002,17 @@ candidate hashes, resolution authority and revision effects, quarantine
 evidence, restore receipts, manual-edit evidence, active-run logs, pointer
 containment, and index shape.
 
-The reference engine performs a full protected-tree audit before an
-authority-changing write and for explicit doctor, review, task-language search,
-and historical retrieval. When intact prior path-and-hash evidence disagrees
+A valid checkpoint certifies the protected records, run facts and current state the last full
+audit proved, as of its head and epoch, plus a chain of declared, verified engine writes since.
+An ordinary write re-validates only the records it depends on, records every protected path it
+writes, and publishes the successor checkpoint from the prior inventory plus those paths.
+Damage to a record no write depends on is caught when that record is next used or by the deep
+audit, which condemns on failure. A write never adopts a changed byte it did not verify.
+
+`doctor` and `review` normally audit a captured copy. A deferred capture or
+superseded verdict returns exit code 3. A positive copy does not become the
+live checkpoint. `doctor --live` explicitly takes the full audit under lock.
+When intact prior path-and-hash evidence disagrees
 with that audit, the engine MUST NOT silently bless the new bytes: it MUST
 re-prove the complete semantic authority graph, and only a passing proof may
 adopt the new inventory as its baseline. Recording a durable, validated
@@ -1125,20 +1179,16 @@ Claude Code MAY use `hook-start` and `hook-close` from the rendered
 settings. An installing agent that enables hooks MUST merge only the BIMRI
 entries into machine-local `.claude/settings.local.json`, preserve unrelated
 settings and hooks, and replace prior BIMRI entries instead of duplicating
-them. It MUST inspect the merged hooks, invoke start and close with one
-synthetic session ID, require their expected non-empty output, confirm that run
-closed, and run `doctor`. Shared `.claude/settings.json` MUST NOT contain the
-machine-specific absolute interpreter.
+them. It MUST inspect the merged hooks, invoke start and close with a
+synthetic session ID, require a read brief on start and exit zero with empty
+output on unmapped close, and run `doctor`. Shared `.claude/settings.json`
+MUST NOT contain the machine-specific absolute interpreter.
 
-A hook session ID maps to one run, so the close hook closes only its own
-session. A start hook whose payload carries no stable session identity MUST
-NOT open a run under an invented identity; the reference engine exits 2 with a
-message ending in `[hook-identity-missing]` and creates nothing, and the
-session opens without a brief because the harness does not block on that exit
-code. A close hook for an unmapped session MUST be a successful no-op and
-MUST NOT close a singleton run by inference, and the harness-supplied end
-reason MUST be flattened and bounded before it is recorded so that it cannot
-fail the close. Explicit `close` remains strict.
+The start hook returns the read brief with or without a session identity.
+A close hook for an unmapped session MUST be a successful no-op. A close
+hook for an explicitly mapped legacy run MAY close that run only when its
+staged work is already decided. The harness-supplied end reason is flattened
+and bounded before recording. Explicit `close` remains strict.
 Hooks are adapters; they do not change the memory format. The Claude
 adapter is optional. Any local agent that follows the universal instructions
 and uses the engine MAY share the same memory within the lock-domain boundary.

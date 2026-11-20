@@ -83,7 +83,7 @@ class V512DefectsTest(unittest.TestCase):
         return result
 
     def start(self, actor, root=None):
-        result = self.cli("start", "--actor", actor, root=root)
+        result = self.cli("start", "--open-run", "--actor", actor, root=root)
         match = RUN_RE.search(result.stdout)
         self.assertIsNotNone(match, result.stdout)
         return match.group(1)
@@ -332,24 +332,45 @@ class V512DefectsTest(unittest.TestCase):
                 meta["started_at"] = stamp(30)
 
         self.edit_state(age_all)
-        fresh = self.cli("start", "--actor", "fresh")
+        # The read brief names the same bounded line and opens nothing.
+        read = self.cli("start", "--actor", "reader")
+        self.assertEqual(
+            self.orphan_line(read.stdout),
+            "ORPHAN CANDIDATES (never auto-closed): 8 runs inactive over 24h; "
+            "newest " + ", ".join(runs[-5:]) + "; full list: status --runs",
+        )
+        self.assertEqual(set(self.state()["active_runs"]), set(runs))
+        fresh = self.cli("start", "--open-run", "--actor", "fresh")
         line = self.orphan_line(fresh.stdout)
         self.assertEqual(
             line,
             "ORPHAN CANDIDATES (never auto-closed): 8 runs inactive over 24h; "
-            "newest " + ", ".join(runs[-5:]) + "; full list: status",
+            "newest " + ", ".join(runs[-5:]) + "; full list: status --runs",
         )
+        # v5.2 (D1.6, Decisions 16): plain status prints only the count;
+        # the full list moved to status --runs, one row per run.
         status = self.cli("status")
+        self.assertIn("Legacy active runs: 9 (list them: status --runs)", status.stdout)
+        listed = self.cli("status", "--runs")
+        listed_ids = {
+            line.split("	", 1)[0]
+            for line in listed.stdout.splitlines()
+            if "	" in line
+        }
         for run_id in runs:
-            self.assertIn(run_id, status.stdout)
+            self.assertIn(run_id, listed_ids)
         self.assertEqual(
             set(self.state()["active_runs"]),
             set(runs) | {RUN_RE.search(fresh.stdout).group(1)},
         )
 
-    # ---- lifecycle: hook-start refuses a payload with no identity (L3) -------
+    # ---- lifecycle: hook-start prints the read brief for any payload (L3) ----
+    # v5.2 (D1.14): the [hook-identity-missing] refusal is retired. A
+    # SessionStart hook opens nothing, so it needs no identity; every
+    # payload gets the read brief and exit 0, and a close hook with no
+    # mapping is a successful no-op.
 
-    def test_hook_start_refuses_payload_without_identity(self):
+    def test_hook_start_prints_read_brief_for_payload_without_identity(self):
         cases = {
             "empty": "",
             "invalid": "not json",
@@ -360,23 +381,32 @@ class V512DefectsTest(unittest.TestCase):
         }
         for label, payload in cases.items():
             result = self.cli("hook-start", input_text=payload, check=False)
-            self.assertEqual(result.returncode, 2, label)
-            self.assertEqual(result.stdout, "", label)
+            self.assertEqual(result.returncode, 0, (label, result.stderr))
             self.assertTrue(
-                result.stderr.rstrip().endswith("[hook-identity-missing]"),
-                (label, result.stderr),
+                result.stdout.startswith("=== BIMRI BRIEF read | "),
+                (label, result.stdout),
             )
-            self.assertIn("hook-start opened no run", result.stderr, label)
-            # Nothing was created: not even the store.
-            self.assertFalse(self.root.exists(), label)
+            self.assertIn("=== END BRIEF ===", result.stdout, label)
+            self.assertNotIn("BIMRI RUN HANDLE", result.stdout, label)
+            self.assertEqual(result.stderr, "", label)
+            self.assertNotIn("[hook-identity-missing]", result.stderr, label)
+            # A missing store is still initialized (D1.1); nothing is opened.
+            self.assertTrue((self.root / ".bimri" / "state.json").is_file())
+            self.assertEqual(self.state()["active_runs"], {}, label)
         for label, payload in cases.items():
             closed = self.cli("hook-close", input_text=payload, check=False)
             self.assertEqual(closed.returncode, 0, label)
             self.assertEqual(closed.stdout, "", label)
-        self.assertEqual(self.state()["active_runs"], {})
+        state = self.state()
+        self.assertEqual(state["active_runs"], {})
+        self.assertEqual(state["session_runs"], {})
+        self.assertEqual(state["run_count"], 0)
 
     def test_well_formed_hook_pair_still_round_trips(self):
-        started = self.cli(
+        # v5.2: a well-formed SessionStart payload gets the read brief and
+        # opens nothing; the pair round-trips only with a legacy run opened
+        # deliberately under the hook's actor and session (D1.15).
+        brief = self.cli(
             "hook-start",
             input_text=json.dumps({
                 "session_id": "sess-1",
@@ -385,15 +415,29 @@ class V512DefectsTest(unittest.TestCase):
                 "source": "startup",
             }),
         )
+        self.assertTrue(brief.stdout.startswith("=== BIMRI BRIEF read | "))
+        self.assertIsNone(RUN_RE.search(brief.stdout), brief.stdout)
+        self.assertEqual(self.state()["active_runs"], {})
+        started = self.cli(
+            "start", "--open-run", "--actor", "claude-code",
+            "--session", "sess-1",
+        )
         run_id = RUN_RE.search(started.stdout).group(1)
         resumed = self.cli(
+            "start", "--open-run", "--actor", "claude-code",
+            "--session", "sess-1",
+        )
+        self.assertIn("Resumed existing run handle", resumed.stdout)
+        self.assertIn(run_id, resumed.stdout)
+        reread = self.cli(
             "hook-start",
             input_text=json.dumps({"session_id": "sess-1", "source": "resume"}),
         )
-        self.assertIn("Resumed existing run handle", resumed.stdout)
+        self.assertNotIn("Resumed existing run handle", reread.stdout)
+        self.assertIsNone(RUN_RE.search(reread.stdout), reread.stdout)
         transcript_only = self.cli(
-            "hook-start",
-            input_text=json.dumps({"transcript_path": "C:/x/sess-9.jsonl"}),
+            "start", "--open-run", "--actor", "claude-code",
+            "--session", "C:/x/sess-9.jsonl",
         )
         second_run = RUN_RE.search(transcript_only.stdout).group(1)
         self.assertNotEqual(second_run, run_id)
@@ -426,7 +470,8 @@ class V512DefectsTest(unittest.TestCase):
         ):
             session = f"reason-{label}"
             started = self.cli(
-                "hook-start", input_text=json.dumps({"session_id": session})
+                "start", "--open-run", "--actor", "claude-code",
+                "--session", session,
             )
             run_id = RUN_RE.search(started.stdout).group(1)
             closed = self.cli(
@@ -483,18 +528,54 @@ class V512DefectsTest(unittest.TestCase):
             "pattern": self.proposal(pattern)["pattern_id"],
         }
 
+    def assert_warm_equals_audit(self, arguments, result):
+        """v5.2: a query runs warm by default; --audit takes the full path.
+
+        Both must print the same bytes and exit the same way. The warm leg
+        is re-run under the warm-search seam (section 06 4.5), which fails on
+        any fall-through to the full audit, so the comparison is warm against
+        full rather than full against full.
+        """
+        if arguments[0] != "search" and "--query" not in arguments:
+            return
+        warm = subprocess.run(
+            [sys.executable, str(REPOSITORY / "tests" / "crash_worker.py"),
+             str(ENGINE), "warm_search_forbid_full_audit", str(self.root),
+             *map(str, arguments)],
+            text=True, capture_output=True, timeout=120, encoding="utf-8",
+        )
+        self.assertEqual(
+            (warm.returncode, warm.stdout),
+            (result.returncode, result.stdout),
+            f"warm search differs for {arguments!r}: {warm.stderr}",
+        )
+        audited = self.cli(*arguments, "--audit", check=False)
+        self.assertEqual(
+            (audited.returncode, audited.stdout),
+            (result.returncode, result.stdout),
+            f"warm and --audit differ for {arguments!r}: {audited.stderr}",
+        )
+
     def tsv(self, *arguments, check=True):
         result = self.cli(*arguments, check=check)
         self.assertNotIn("{", result.stdout)
+        self.assert_warm_equals_audit(arguments, result)
         return result
 
     def json_out(self, *arguments, expect=0):
         result = self.cli(*arguments, check=False)
         self.assertEqual(result.returncode, expect, result.stdout + result.stderr)
+        self.assert_warm_equals_audit(arguments, result)
         lines = result.stdout.splitlines()
         self.assertEqual(len(lines), 1, result.stdout)
         payload = json.loads(lines[0])
-        self.assertEqual(set(payload), {"matches", "total", "omitted"})
+        # v5.2.0 (D1.3): an exact-key lookup also carries the subject's
+        # version token; a query search carries the original three keys.
+        exact_key = "--key" in arguments
+        self.assertEqual(
+            set(payload),
+            {"matches", "total", "omitted"} | ({"token"} if exact_key else set()),
+        )
         for record in payload["matches"]:
             self.assertTrue(
                 {"location", "key", "id", "reason", "trust", "source", "text"}
@@ -556,8 +637,19 @@ class V512DefectsTest(unittest.TestCase):
         ids = self.seed_three_tiers()
         run = ids["run"]
 
+        # v5.2.0 (D1.3): a current HOT/COLD record carries its version
+        # token, and the payload repeats the subject's token at top level.
+        token_re = r"^V\d{6}:hot:[0-9a-f]{64}$"
+
+        def pop_token(payload):
+            token = payload["matches"][0].pop("token")
+            self.assertRegex(token, token_re)
+            self.assertEqual(payload["token"], token)
+            return token
+
         fact = self.json_out("get", "--key", "pricing.class-ticket", "--json")
         self.assertEqual((fact["total"], fact["omitted"]), (1, 0))
+        pop_token(fact)
         self.assertEqual(fact["matches"], [{
             "location": "HOT", "key": "pricing.class-ticket",
             "id": ids["fact"], "reason": "current", "trust": "confirmed",
@@ -567,6 +659,7 @@ class V512DefectsTest(unittest.TestCase):
         }])
 
         step = self.json_out("get", "--key", "launch.next-step", "--json")
+        pop_token(step)
         self.assertEqual(step["matches"], [{
             "location": "HOT", "key": "launch.next-step", "id": ids["step"],
             "reason": "current", "trust": "working", "source": "agent",
@@ -579,6 +672,7 @@ class V512DefectsTest(unittest.TestCase):
         pattern = self.json_out(
             "get", "--key", "pattern.sweep-double-fire", "--json"
         )
+        pattern_token = pop_token(pattern)
         self.assertEqual(pattern["matches"], [{
             "location": "HOT", "key": "pattern.sweep-double-fire",
             "id": ids["pattern"], "reason": "current", "trust": "",
@@ -587,13 +681,13 @@ class V512DefectsTest(unittest.TestCase):
             "evidence": [ids["journal"]], "falsifier": self.T3_FALSIFIER,
         }])
 
-        # recall and search project the same records as get.
-        self.assertEqual(
-            self.json_out(
-                "recall", "--key", "pattern.sweep-double-fire", "--history", "--json"
-            )["matches"],
-            pattern["matches"],
+        # recall and search project the same records as get (an exact-key
+        # recall carries the same token; a query search carries none).
+        recalled = self.json_out(
+            "recall", "--key", "pattern.sweep-double-fire", "--history", "--json"
         )
+        self.assertEqual(pop_token(recalled), pattern_token)
+        self.assertEqual(recalled["matches"], pattern["matches"])
         self.assertEqual(
             self.json_out("search", "--query", "idempotency", "--json")["matches"],
             pattern["matches"],
@@ -731,7 +825,9 @@ class V512DefectsTest(unittest.TestCase):
         same_format = self.manifests(self.root)
         self.assertEqual(len(same_format), 1)
         self.assertEqual(same_format[0]["mode"], "code-only-update")
-        self.assertEqual(same_format[0]["source_memory_format"], "5.1.0")
+        # v5.2.0: a store created by this engine is born at state format
+        # v5.2.0, and a same-format update records the format it found.
+        self.assertEqual(same_format[0]["source_memory_format"], "5.2.0")
         self.assertFalse(same_format[0]["state_activated"])
         self.assertEqual(same_format[0]["status"], "installed")
 
@@ -750,8 +846,10 @@ class V512DefectsTest(unittest.TestCase):
             ],
         )
         self.assertEqual({receipt["status"] for receipt in receipts}, {"installed"})
-        doctor = self.cli("doctor", "--read-only", root=activated)
-        self.assertIn("PASSED", doctor.stdout)
+        doctor = self.cli("doctor", "--read-only", root=activated, check=False)
+        self.assertEqual(doctor.returncode, 1, doctor.stdout + doctor.stderr)
+        self.assertIn("BIMRI doctor (read-only): COMPLETION REQUIRED", doctor.stdout)
+        self.assertIn("sync --run R000011", doctor.stdout)
 
     # ---- retrieval RT-8: a consumer that closes the pipe early ---------------
 
@@ -759,10 +857,17 @@ class V512DefectsTest(unittest.TestCase):
         for resumed in (False, True):
             for unbuffered in (False, True):
                 with self.subTest(resumed=resumed, unbuffered=unbuffered):
-                    payload = json.dumps({"session_id": f"pipe-{resumed}-{unbuffered}"})
+                    session = f"pipe-{resumed}-{unbuffered}"
+                    payload = json.dumps({"session_id": session})
                     run_id = None
                     if resumed:
-                        opened = self.cli("hook-start", input_text=payload)
+                        # v5.2: hook-start opens nothing (D1.14); the mapped
+                        # legacy run is opened under the hook's actor so the
+                        # SessionEnd hook finds it (D1.15).
+                        opened = self.cli(
+                            "start", "--open-run", "--actor", "claude-code",
+                            "--session", session,
+                        )
                         run_id = RUN_RE.search(opened.stdout).group(1)
                     # Deliver stdin only after closing the read end. This
                     # covers writes inside start as well as the shutdown flush.
@@ -781,12 +886,14 @@ class V512DefectsTest(unittest.TestCase):
                         self.assertEqual(proc.wait(timeout=120), 0, stderr)
                     self.assertEqual(stderr, "")
                     active = set(self.state()["active_runs"])
-                    self.assertEqual(len(active), 1)
+                    closed = self.cli("hook-close", input_text=payload)
                     if run_id is not None:
                         self.assertEqual(active, {run_id})
-                    run_id = active.pop()
-                    closed = self.cli("hook-close", input_text=payload)
-                    self.assertIn(f"run {run_id} closed", closed.stdout)
+                        self.assertIn(f"run {run_id} closed", closed.stdout)
+                    else:
+                        self.assertEqual(active, set())
+                        self.assertNotIn("closed", closed.stdout)
+                    self.assertEqual(self.state()["active_runs"], {})
 
     def test_real_output_failure_is_not_silenced(self):
         engine = load_engine_module("bimri_v512_output_failure")
@@ -832,26 +939,32 @@ class V512DefectsTest(unittest.TestCase):
             .read_text("utf-8")
         )
 
-    def test_engine_release_is_5_1_2_and_accepts_prior_patch_receipts(self):
+    def test_engine_release_is_5_2_0_and_accepts_prior_patch_receipts(self):
         run = self.start("release")
         proposal = self.propose(run, "release.key", "Receipt probe.", new_subject=True)
         self.cli("sync", "--run", run)
         status = self.cli("status")
+        # v5.2 status header (D5.1) names the live state version too.
         self.assertIn(
-            "BIMRI engine v5.1.2 | memory format v5.1.0 | revision V000001",
+            "BIMRI engine v5.2.0 | memory format v5.1.0 | state v5.2.0 | "
+            "revision V000001",
             status.stdout,
         )
-        self.assertEqual(self.state()["bimri_version"], "5.1.0")
+        # The state format moved; every authority artifact stays v5.1.0.
+        self.assertEqual(self.state()["bimri_version"], "5.2.0")
         self.assertIn("<!-- BIMRI v5.0.2 |", self.hot())
         record = self.proposal(proposal)
         self.assertEqual(record["bimri_version"], "5.1.0")
-        self.assertEqual(record["preflight_receipt"]["engine_release"], "5.1.2")
+        self.assertEqual(record["preflight_receipt"]["engine_release"], "5.2.0")
         witness = self.witness()
-        self.assertEqual(witness["engine_version"], "5.1.2")
-        self.assertEqual(witness["policy_version"], "5.1.2-authority-1")
+        self.assertEqual(witness["engine_version"], "5.2.0")
+        self.assertEqual(witness["policy_version"], "5.2.0-authority-1")
+        self.assertEqual(witness["memory_format_version"], "5.1.0")
 
         path = self.root / ".bimri" / "proposals" / f"{proposal}.json"
-        for release, accepted in (("5.1.1", True), ("5.1.0", True), ("5.1.3", False)):
+        for release, accepted in (
+            ("5.1.2", True), ("5.1.1", True), ("5.1.0", True), ("5.2.1", False),
+        ):
             with self.subTest(release=release):
                 record["preflight_receipt"]["engine_release"] = release
                 path.write_text(
@@ -872,15 +985,22 @@ class V512DefectsTest(unittest.TestCase):
                     self.assertIn("authority recovery is required", read.stderr)
 
     def test_stale_policy_checkpoint_reproves_once(self):
-        # A checkpoint a 5.1.1 engine published is still sealed but proves
-        # nothing about the separator rule; the first command re-audits and
-        # republishes under the new policy version.
+        # A schema-1 checkpoint a 5.1.2 engine published is still sealed but
+        # binds no facts generation; the first command re-audits and
+        # republishes a schema-2 checkpoint under the new policy version.
         run = self.start("policy")
         self.propose(run, "policy.key", "Checkpoint probe.", new_subject=True)
         self.cli("sync", "--run", run)
-        witness = self.witness()
-        witness["engine_version"] = "5.1.1"
-        witness["policy_version"] = "5.1.1-authority-1"
+        current = self.witness()
+        self.assertEqual(current["witness_schema"], 2)
+        witness = dict(current)
+        for field in (
+            "facts_hash", "audited_at", "audit_origin", "scoped_publications",
+        ):
+            witness.pop(field)
+        witness["witness_schema"] = 1
+        witness["engine_version"] = "5.1.2"
+        witness["policy_version"] = "5.1.2-authority-1"
         witness.pop("witness_hash")
         witness["witness_hash"] = _sha256_json(witness)
         path = self.root / ".bimri" / "audit-witness.json"
@@ -888,24 +1008,48 @@ class V512DefectsTest(unittest.TestCase):
         engine = load_engine_module("bimri_v512_policy")
         # A checkpoint from another engine or policy version is not a sealed
         # witness for this engine: the warm path reads it as absent, which is
-        # the cache miss that forces the one-time re-proof below.
+        # the cache miss that forces the one-time re-proof below. Both
+        # schema-1 pairs remain comparison evidence for markers and blocked
+        # records.
         self.assertIsNone(engine.load_sealed_audit_witness(engine.Paths(self.root)))
         self.assertIsNotNone(engine.load_sealed_audit_witness(
             engine.Paths(self.root), allow_prior_policy=True,
         ))
-        for version, policy in (("5.1.1", "unknown"), ("9.9.9", "5.1.1-authority-1")):
+        prior_5_1_1 = dict(
+            witness, engine_version="5.1.1", policy_version="5.1.1-authority-1"
+        )
+        prior_5_1_1.pop("witness_hash")
+        prior_5_1_1["witness_hash"] = _sha256_json(prior_5_1_1)
+        self.assertIsNotNone(engine.validate_sealed_audit_witness_record(
+            prior_5_1_1, allow_prior_policy=True,
+        ))
+        for version, policy in (
+            ("5.1.2", "unknown"),
+            ("5.1.1", "unknown"),
+            ("9.9.9", "5.1.2-authority-1"),
+        ):
             unsupported = dict(witness, engine_version=version, policy_version=policy)
             unsupported.pop("witness_hash")
             unsupported["witness_hash"] = _sha256_json(unsupported)
             self.assertIsNone(engine.validate_sealed_audit_witness_record(
                 unsupported, allow_prior_policy=True,
             ))
+        # A prior pair is never accepted in the schema-2 shape.
+        forged = dict(
+            current, engine_version="5.1.2", policy_version="5.1.2-authority-1"
+        )
+        forged.pop("witness_hash")
+        forged["witness_hash"] = _sha256_json(forged)
+        self.assertIsNone(engine.validate_sealed_audit_witness_record(
+            forged, allow_prior_policy=True,
+        ))
 
         served = self.cli("get", "--key", "policy.key")
         self.assertIn("Checkpoint probe.", served.stdout)
         republished = self.witness()
-        self.assertEqual(republished["engine_version"], "5.1.2")
-        self.assertEqual(republished["policy_version"], "5.1.2-authority-1")
+        self.assertEqual(republished["engine_version"], "5.2.0")
+        self.assertEqual(republished["policy_version"], "5.2.0-authority-1")
+        self.assertEqual(republished["witness_schema"], 2)
         started = self.cli("start", "--actor", "after-reprove")
         self.assertNotIn("AUTHORITY RECOVERY NEEDED", started.stdout)
         self.assertIn("PASSED", self.cli("doctor", "--read-only").stdout)
@@ -949,8 +1093,9 @@ class V512DefectsTest(unittest.TestCase):
 
     def assert_upgrade_reproved(self):
         self.assertFalse(self.root.joinpath(".bimri", "audit-transition.json").exists())
-        self.assertEqual(self.witness()["engine_version"], "5.1.2")
-        self.assertEqual(self.witness()["policy_version"], "5.1.2-authority-1")
+        self.assertEqual(self.witness()["engine_version"], "5.2.0")
+        self.assertEqual(self.witness()["policy_version"], "5.2.0-authority-1")
+        self.assertEqual(self.witness()["witness_schema"], 2)
         self.assertIn("PASSED", self.cli("doctor", "--read-only").stdout)
         self.assertEqual(list(self.root.joinpath(".bimri", "audit-drift").glob("*.json")), [])
 
@@ -1046,32 +1191,36 @@ class V512DefectsTest(unittest.TestCase):
         self.cli("migrate")
         self.install(self.root, "--quiescent")
         receipts = self.manifests(self.root)
+        # A store this engine created is born at state format v5.2.0; the
+        # receipt names the format the update found.
         self.assertEqual(
             [(receipt["engine_release"], receipt["memory_format"]) for receipt in receipts],
-            [("5.1.2", "5.1.0")],
+            [("5.2.0", "5.2.0")],
         )
         manifest_path = sorted(
             self.root.joinpath(".bimri-update-backups").glob("*/install-manifest.json")
         )[0]
         receipt = json.loads(manifest_path.read_text("utf-8"))
+        # A 5.1.1 receipt always named memory format 5.1.0.
         receipt["engine_release"] = "5.1.1"
+        receipt["memory_format"] = "5.1.0"
         manifest_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", "utf-8")
         repeated = self.install(self.root, "--quiescent")
-        self.assertIn("BIMRI 5.1.2 installed.", repeated.stdout)
+        self.assertIn("BIMRI 5.2.0 installed.", repeated.stdout)
         self.assertIn("Memory preservation: PASSED", repeated.stdout)
         self.assertEqual(
             sorted(
                 (receipt["engine_release"], receipt["memory_format"], receipt["status"])
                 for receipt in self.manifests(self.root)
             ),
-            [("5.1.1", "5.1.0", "installed"), ("5.1.2", "5.1.0", "installed")],
+            [("5.1.1", "5.1.0", "installed"), ("5.2.0", "5.2.0", "installed")],
         )
         receipt["engine_release"] = "9.9.9"
         manifest_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", "utf-8")
         refused = self.install(self.root, "--quiescent", check=False)
         self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
         self.assertIn("unsupported release identity", refused.stderr)
-        self.assertIn("BIMRI engine v5.1.2", self.cli("status").stdout)
+        self.assertIn("BIMRI engine v5.2.0", self.cli("status").stdout)
 
 
 def _sha256_json(value):

@@ -42,6 +42,10 @@ CANONICAL_GATES = {
     "propose_p50_ms": 6000.0,
     "sync_p50_ms": 6000.0,
     "close_p50_ms": 6000.0,
+    # v5.2 (gate 6): the one-command save at the propose ceiling for CI;
+    # the 1000 ms p95 gate runs on the reference machine against the
+    # live-store copy (--store <copy> --gate save_p95_ms=1000).
+    "save_p50_ms": 6000.0,
 }
 
 
@@ -86,8 +90,9 @@ def apply_gates(specification):
     comma-separated metric=max_ms pairs, for example
     --gate "warm_get_p50_ms=1000,start_p50_ms=2000,propose_p50_ms=3000".
     Known metrics: cold_first_read_ms plus <op>_p50_ms/<op>_p95_ms for
-    warm_get, start, journal, propose, sync, close. A non-finite measured
-    value or ceiling is a breach, never a bypass.
+    warm_get, start, legacy_start, journal, propose, sync, close, save and save_lock
+    (the lock hold the save reports in its --json lock_held_ms). A
+    non-finite measured value or ceiling is a breach, never a bypass.
     """
     if specification.strip() == "default":
         gates = dict(CANONICAL_GATES)
@@ -141,11 +146,66 @@ def pick_hot_key(root):
 
 
 def start_run(root, actor):
-    result = cli(root, "start", "--actor", actor)
+    # From v5.2 a plain start is the read brief and opens nothing (D1.1);
+    # the lifecycle loop measured here is the legacy lane.
+    result = cli(root, "start", "--open-run", "--actor", actor)
     for token in result.stdout.split():
         if token.startswith("R") and token[1:7].isdigit():
             return token[:7]
     raise SystemExit(f"could not parse run handle from: {result.stdout!r}")
+
+
+def absent_token(root, key):
+    """The version token of an absent key (get --json, exit 1 on a miss)."""
+    result = cli(root, "get", "--key", key, "--json", check=False)
+    if result.returncode not in (0, 1):
+        raise SystemExit(
+            f"benchmark get failed for {key}:\n{result.stdout}\n{result.stderr}"
+        )
+    payload = json.loads(result.stdout)
+    for match in payload.get("matches", []):
+        if match.get("key") == key and match.get("location") in ("HOT", "COLD"):
+            raise SystemExit(f"benchmark save key already exists: {key}")
+    return payload["token"]
+
+
+def first_free_save_index(root):
+    """The first bench.save.NNNNN index no earlier run of the benchmark used
+    (a --store copy may already carry some)."""
+    state = json.loads(
+        (Path(root) / ".bimri" / "state.json").read_text("utf-8")
+    )
+    hot = (Path(root) / "bimri.md").read_text("utf-8")
+    used = [
+        int(key.rsplit(".", 1)[1])
+        for key in state.get("cold_current", {})
+        if key.startswith("bench.save.") and key.rsplit(".", 1)[1].isdigit()
+    ]
+    for line in hot.splitlines():
+        if "[K:bench.save." in line:
+            suffix = line.split("[K:bench.save.", 1)[1].split("]", 1)[0]
+            if suffix.isdigit():
+                used.append(int(suffix))
+    return max(used + [-1]) + 1
+
+
+def timed_save(root, index):
+    """One warm save of a new subject: the absent token from get --json
+    (untimed), then the timed save. Returns (wall ms, lock_held_ms)."""
+    key = f"bench.save.{index:05d}"
+    token = absent_token(root, key)
+    began = time.perf_counter()
+    result = cli(
+        root, "save", "--request", f"bench-save-{index:05d}",
+        "--observed", token, "--key", key, "--new-subject", "--tier", "2",
+        "--text", f"Benchmark save subject {index}.",
+        "--source", "agent", "--trust", "working", "--json",
+    )
+    elapsed = (time.perf_counter() - began) * 1000.0
+    payload = json.loads(result.stdout.splitlines()[0])
+    if payload.get("result") != "accepted":
+        raise SystemExit(f"benchmark save was not accepted: {result.stdout}")
+    return elapsed, float(payload.get("lock_held_ms", float("nan")))
 
 
 def grow(root, runs):
@@ -226,11 +286,12 @@ def main():
     ]
     summarize("warm get --key", reads, metric="warm_get")
 
-    starts, journals, proposes, syncs, closes = [], [], [], [], []
+    starts, legacy_starts, journals, proposes, syncs, closes = [], [], [], [], [], []
     for index in range(arguments.samples):
+        starts.append(timed(root, "start", "--actor", "bench-reader"))
         began = time.perf_counter()
         run_id = start_run(root, f"bench-{index:03d}")
-        starts.append((time.perf_counter() - began) * 1000.0)
+        legacy_starts.append((time.perf_counter() - began) * 1000.0)
         journals.append(timed(
             root, "journal", "--run", run_id, "--importance", "3",
             "--text", f"benchmark journal {index}",
@@ -246,11 +307,22 @@ def main():
             root, "close", "--run", run_id, "--outcome", "success",
             "--summary", "benchmark run",
         ))
-    summarize("warm start", starts, metric="start")
+    summarize("warm start (read brief)", starts, metric="start")
+    summarize("legacy start --open-run", legacy_starts, metric="legacy_start")
     summarize("journal", journals, metric="journal")
     summarize("propose", proposes, metric="propose")
     summarize("sync", syncs, metric="sync")
     summarize("close (authority)", closes, metric="close")
+
+    # v5.2 gate 6: warm saves on distinct new keys, one command each.
+    saves, save_locks = [], []
+    first = first_free_save_index(root)
+    for index in range(first, first + arguments.samples):
+        elapsed, lock_ms = timed_save(root, index)
+        saves.append(elapsed)
+        save_locks.append(lock_ms)
+    summarize("save", saves, metric="save")
+    summarize("save lock held", save_locks, metric="save_lock")
     print(f"disposable copy retained at {workspace}")
     if arguments.gate:
         apply_gates(arguments.gate)

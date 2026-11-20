@@ -61,6 +61,27 @@ WITNESS_FIELDS = {
     "manifest_count",
     "proposal_runs",
     "witness_hash",
+    # v5.2.0 schema 2: the facts generation, the time of the last full
+    # audit, the origin of this publication and scoped publications since.
+    "facts_hash",
+    "audited_at",
+    "audit_origin",
+    "scoped_publications",
+}
+FACTS_FIELDS = {
+    "facts_schema",
+    "created_at",
+    "manifest_hash",
+    "run_facts",
+    "run_authority_hash",
+    "unsettled",
+    "applying_resolutions",
+    "open_conflicts",
+    "held",
+    "settled",
+    "writers_by_key",
+    "watermarks",
+    "facts_hash",
 }
 MANIFEST_FIELDS = {
     "manifest_schema",
@@ -78,6 +99,8 @@ BLOCKED_FIELDS = {
     "prior_witness_hash",
     "prior_manifest",
     "marker_hash",
+    # v5.2.0: a schema-2 prior checkpoint carries its facts inline.
+    "prior_facts",
 }
 TRANSITION_FIELDS = {
     "transition_schema",
@@ -166,7 +189,7 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         return result
 
     def start(self, actor="v511-test", root=None):
-        result = self.cli("start", "--actor", actor, root=root)
+        result = self.cli("start", "--open-run", "--actor", actor, root=root)
         match = RUN_RE.search(result.stdout)
         self.assertIsNotNone(match, result.stdout)
         return match.group(1)
@@ -280,16 +303,46 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
             self.assertEqual(record["manifest"], expected_manifest)
         return record
 
+    def assert_facts_generation(self, root, witness):
+        path = (
+            Path(root)
+            / MANIFEST_GENERATIONS_RELATIVE
+            / f"facts-{witness['facts_hash']}.json"
+        )
+        self.assertTrue(path.is_file(), f"missing facts generation: {path}")
+        record = json.loads(path.read_text("utf-8"))
+        self.assertEqual(set(record), FACTS_FIELDS)
+        self.assertEqual(record["facts_schema"], 1)
+        self.assertEqual(
+            record["facts_hash"], self.record_seal(record, "facts_hash")
+        )
+        self.assertEqual(record["facts_hash"], witness["facts_hash"])
+        self.assertEqual(record["manifest_hash"], witness["manifest_hash"])
+        self.assertEqual(
+            record["run_authority_hash"], witness["run_authority_hash"]
+        )
+        self.assertEqual(
+            record["run_authority_hash"], self.audit_digest(record["run_facts"])
+        )
+        self.assertEqual(record["created_at"], witness["created_at"])
+        return record
+
     def assert_steady_manifest_generation_bound(self, root=None):
         root = Path(root or self.root)
         witness = self.witness(root)
         directory = root / MANIFEST_GENERATIONS_RELATIVE
         generations = sorted(directory.glob("*.json"))
+        # One manifest generation and one facts generation, both named by
+        # the live checkpoint; nothing unreferenced survives a publication.
         self.assertEqual(
-            [path.name for path in generations],
-            [f"{witness['manifest_hash']}.json"],
+            sorted(path.name for path in generations),
+            sorted([
+                f"{witness['manifest_hash']}.json",
+                f"facts-{witness['facts_hash']}.json",
+            ]),
         )
         self.assert_manifest_generation(root, witness["manifest_hash"])
+        self.assert_facts_generation(root, witness)
         alias = self.manifest(root)
         self.assertEqual(alias["manifest_hash"], witness["manifest_hash"])
         self.assertEqual(alias["manifest_count"], witness["manifest_count"])
@@ -331,6 +384,16 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
             prior["witness_hash"], self.record_seal(prior, "witness_hash")
         )
         self.assertEqual(marker["prior_witness_hash"], prior["witness_hash"])
+        prior_facts = marker["prior_facts"]
+        self.assertEqual(set(prior_facts), FACTS_FIELDS)
+        self.assertEqual(prior_facts["facts_hash"], prior["facts_hash"])
+        self.assertEqual(
+            prior_facts["facts_hash"],
+            self.record_seal(prior_facts, "facts_hash"),
+        )
+        self.assertEqual(
+            prior_facts["run_authority_hash"], prior["run_authority_hash"]
+        )
         prior_manifest = marker["prior_manifest"]
         self.assertIsInstance(prior_manifest, list)
         self.assertEqual(
@@ -374,6 +437,29 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
             )
         return receipts
 
+    def assert_scoped_write_left_drift_to_doctor(
+        self, root, receipts_before, name
+    ):
+        """v5.2 D4.5: a scoped write receipts nothing for a path no write
+        depends on and never adopts it; the deep audit (default doctor, on a
+        copy) records one receipt naming it and leaves the witness alone."""
+        root = Path(root)
+        self.assertEqual(self.drift_receipts(root), receipts_before)
+        manifest = self.manifest(root)
+        self.assertNotIn(
+            name, " ".join(row["path"] for row in manifest["manifest"])
+        )
+        witness_before = self.witness_path(root).read_bytes()
+        audited = self.cli("doctor", root=root)
+        self.assertIn("BIMRI doctor: PASSED", audited.stdout)
+        self.assertIn("checkpoint drift:", audited.stdout)
+        self.assert_drift_receipt(
+            root,
+            pattern=r"copy audit found checkpoint drift.*" + re.escape(name),
+            minimum=len(receipts_before) + 1,
+        )
+        self.assertEqual(self.witness_path(root).read_bytes(), witness_before)
+
     def assert_no_audit_block(self, root=None):
         self.assertFalse(
             Path(root or self.root)
@@ -414,6 +500,8 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         )
         self.assertEqual(marker["prior_witness_hash"], prior["witness_hash"])
         self.assertEqual(marker["prior_manifest_hash"], prior["manifest_hash"])
+        self.assertEqual(prior["witness_schema"], 2)
+        self.assert_facts_generation(root, prior)
         self.assertIsInstance(marker["pre_write_state"], dict)
         self.assertEqual(
             marker["pre_write_state_hash"],
@@ -540,13 +628,29 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
 
     def test_witness_creation_schema_and_manifest_are_complete(self):
         self.seed_authority_graph()
+        # v5.2 (build step 3): the seed's writes publish checkpoint-scoped
+        # successors (D4.4), carrying the last full audit's time forward.
+        scoped = self.witness()
+        self.assertEqual(scoped["audit_origin"], "scoped")
+        self.assertGreaterEqual(scoped["scoped_publications"], 1)
+        self.assertLessEqual(scoped["audited_at"], scoped["created_at"])
+        self.assert_facts_generation(self.root, scoped)
+        # The live full audit publishes the full-origin checkpoint whose
+        # schema and inventory this test pins.
+        self.assertIn(
+            "BIMRI doctor: PASSED", self.cli("doctor", "--live").stdout
+        )
         witness = self.witness()
         manifest_record = self.manifest()
         state = self.state()
 
         self.assertEqual(set(witness), WITNESS_FIELDS)
         self.assertEqual(set(manifest_record), MANIFEST_FIELDS)
-        self.assertEqual(witness["witness_schema"], 1)
+        self.assertEqual(witness["witness_schema"], 2)
+        self.assertEqual(witness["audit_origin"], "full")
+        self.assertEqual(witness["scoped_publications"], 0)
+        self.assertEqual(witness["audited_at"], witness["created_at"])
+        self.assert_facts_generation(self.root, witness)
         self.assertEqual(manifest_record["manifest_schema"], 1)
         self.assertEqual(witness["head_revision"], state["head_revision"])
         self.assertEqual(witness["head_hash"], state["head_hash"])
@@ -677,9 +781,18 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
             encoding="utf-8",
         )
 
+        # v5.2 (D5.1): status counts only from a valid checkpoint's facts
+        # generation. The tampered witness is not one, so status prints `?`
+        # and points at doctor; the fiction authors nothing anywhere.
         status = self.cli("status", root=tampered_root)
+        self.assertIn("Open conflicts: ?", status.stdout)
+        self.assertIn("Held candidates: ?", status.stdout)
+        self.assertIn("Checkpoint: unproven; run doctor", status.stdout)
+        self.assertNotIn("phantom", status.stdout)
+        doctor = self.cli("doctor", "--read-only", root=tampered_root)
+        self.assertIn("BIMRI doctor (read-only): PASSED", doctor.stdout)
+        self.assertNotIn("phantom", doctor.stdout)
         review = self.cli("review", conflict_id, root=tampered_root)
-        self.assertIn("Open conflicts: 1", status.stdout)
         self.assertIn(conflict_id, review.stdout)
         held_read = self.cli(
             "get",
@@ -699,6 +812,12 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         )
         self.assertEqual(phantom_read.returncode, 1)
         self.assertIn("no memory matched", phantom_read.stdout.lower())
+        # v5.2 (D5.3.3, section 06 4.2): status, review and --history read
+        # without publishing, so the tampered witness is still on disk; the
+        # next doctor finds no valid checkpoint, audits live and replaces it.
+        self.assertEqual(self.witness(tampered_root), tampered)
+        rebuilt = self.cli("doctor", root=tampered_root)
+        self.assertIn("BIMRI doctor: PASSED", rebuilt.stdout)
         refreshed = self.witness(tampered_root)
         self.assertEqual(set(refreshed), WITNESS_FIELDS)
         self.assertNotIn("open_conflicts", refreshed)
@@ -756,10 +875,41 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
                 self.assertEqual(
                     self.witness_path(root).read_bytes(), witness_before
                 )
+                # v5.2 (build step 8): the default doctor audits a copy. It
+                # receipts the drift its copy saw and names doctor --live,
+                # but never rebaselines: the live witness bytes stay.
                 repaired = self.cli("doctor", root=root)
                 self.assertIn("BIMRI doctor: PASSED", repaired.stdout)
+                self.assertIn("checkpoint drift:", repaired.stdout)
+                receipts = self.assert_drift_receipt(
+                    root, pattern=r"copy audit found checkpoint drift"
+                )
+                self.assertIn(
+                    path.relative_to(root).as_posix(),
+                    " ".join(self.drift_reasons(root)),
+                )
+                self.assert_no_audit_block(root)
+                self.assertEqual(
+                    self.witness_path(root).read_bytes(), witness_before
+                )
+                verdict = json.loads(
+                    root.joinpath(".bimri", "audit-verdict.json")
+                    .read_text("utf-8")
+                )
+                self.assertEqual(
+                    (verdict["source"], verdict["status"]),
+                    ("copy", "passed"),
+                )
+                again = self.cli("doctor", root=root)
+                self.assertIn("BIMRI doctor: PASSED", again.stdout)
+                self.assertEqual(self.drift_receipts(root), receipts)
+                # Only the live audit adopts the drifted bytes, with its
+                # own rebaseline receipt.
+                rebaselined = self.cli("doctor", "--live", root=root)
+                self.assertIn("BIMRI doctor: PASSED", rebaselined.stdout)
                 self.assert_drift_receipt(
-                    root, pattern=r"inventory|differs"
+                    root, pattern=r"inventory|differs",
+                    minimum=len(receipts) + 1,
                 )
                 self.assert_no_audit_block(root)
                 self.assertNotEqual(
@@ -789,8 +939,17 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
                 self.assertTrue(added.is_file())
                 self.assert_drift_receipt(root, pattern=r"owner-extra|added")
                 self.assert_no_audit_block(root)
+                # v5.2 (build step 8): the copy audit never rebaselines.
+                self.assertEqual(
+                    self.witness_path(root).read_bytes(), witness_before
+                )
                 after = self.cli("get", "--key", "witness.seed", root=root)
                 self.assertIn("witness.seed", after.stdout)
+                rebaselined = self.cli("doctor", "--live", root=root)
+                self.assertIn("BIMRI doctor: PASSED", rebaselined.stdout)
+                self.assertNotEqual(
+                    self.witness_path(root).read_bytes(), witness_before
+                )
 
     def test_external_deletions_are_deferred_to_doctor(self):
         records = self.seed_authority_graph()
@@ -890,6 +1049,34 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
             ).read_text("utf-8")
         )
         self.assertEqual(decision["outcome"], "accepted")
+
+        # v5.2 (build step 3): a warm save opens its transition against the
+        # checkpoint as well (D4.1), so it replays no global graph either.
+        absent = self.cli(
+            "get", "--key", "checkpoint.save", "--json", check=False
+        )
+        self.assertEqual(absent.returncode, 1, absent.stderr)
+        saved = self.worker(
+            "valid_checkpoint_forbid_graph_replay",
+            "save",
+            "--request",
+            "checkpoint-save",
+            "--observed",
+            json.loads(absent.stdout)["token"],
+            "--key",
+            "checkpoint.save",
+            "--new-subject",
+            "--tier",
+            "2",
+            "--text",
+            "A valid checkpoint scopes the save's write guard.",
+            "--source",
+            "agent",
+            "--trust",
+            "working",
+        )
+        self.assertIn("BIMRI SAVE accepted", saved.stdout)
+        self.assertEqual(self.witness()["audit_origin"], "scoped")
 
         candidate_run = self.start("checkpoint-resolution-candidate")
         writer_run = self.start("checkpoint-resolution-writer")
@@ -1009,6 +1196,7 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         propose_before = set(
             propose_root.joinpath(".bimri", "proposals").glob("*.json")
         )
+        propose_receipts = self.drift_receipts(propose_root)
         propose_root.joinpath(
             ".bimri", "archive", "outside-propose.bin"
         ).write_bytes(b"out-of-engine protected addition\n")
@@ -1045,8 +1233,12 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
             self.witness_path(propose_root).read_bytes(), propose_witness
         )
         self.assert_no_audit_block(propose_root)
-        self.assert_drift_receipt(
-            propose_root, pattern=r"outside-propose|inventory"
+        # v5.2 (build step 3): the addition is in no dependency set of the
+        # checkpoint-scoped propose, so the write proceeds with no receipt
+        # and a scoped publication that never adopts it (D4.5); the deep
+        # audit catches it.
+        self.assert_scoped_write_left_drift_to_doctor(
+            propose_root, propose_receipts, "outside-propose"
         )
         after_read = self.cli(
             "get",
@@ -1066,6 +1258,7 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
             new_subject=True,
         )
         sync_witness = self.witness_path(sync_root).read_bytes()
+        sync_receipts = self.drift_receipts(sync_root)
         sync_root.joinpath(
             ".bimri", "archive", "outside-sync.bin"
         ).write_bytes(b"out-of-engine protected addition\n")
@@ -1080,8 +1273,8 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
             self.witness_path(sync_root).read_bytes(), sync_witness
         )
         self.assert_no_audit_block(sync_root)
-        self.assert_drift_receipt(
-            sync_root, pattern=r"outside-sync|inventory"
+        self.assert_scoped_write_left_drift_to_doctor(
+            sync_root, sync_receipts, "outside-sync"
         )
 
         resolve_root = self.clone_store("authority-write-resolve")
@@ -1112,6 +1305,7 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         )
         conflict_id = candidate_decision["conflict_id"]
         resolve_witness = self.witness_path(resolve_root).read_bytes()
+        resolve_receipts = self.drift_receipts(resolve_root)
         resolve_root.joinpath(
             ".bimri", "archive", "outside-resolve.bin"
         ).write_bytes(b"out-of-engine protected addition\n")
@@ -1133,8 +1327,8 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
             self.witness_path(resolve_root).read_bytes(), resolve_witness
         )
         self.assert_no_audit_block(resolve_root)
-        self.assert_drift_receipt(
-            resolve_root, pattern=r"outside-resolve|inventory"
+        self.assert_scoped_write_left_drift_to_doctor(
+            resolve_root, resolve_receipts, "outside-resolve"
         )
 
     def test_byte_drift_is_receipted_without_restoration_ceremony(self):
@@ -1185,9 +1379,13 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
             ".bimri", "archive", "outside-crash-window.bin"
         ).write_bytes(b"out-of-engine protected addition\n")
 
+        # v5.2 (build step 8): witness republication is the live audit's
+        # job, so this pins doctor --live (the default copy audit never
+        # reaches the witness replace).
         crashed = self.worker(
             "witness_crash_before_replace",
             "doctor",
+            "--live",
             check=False,
         )
 
@@ -1202,7 +1400,7 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
             pattern=r"outside-crash-window|inventory"
         )
 
-        repaired = self.cli("doctor")
+        repaired = self.cli("doctor", "--live")
         self.assertIn("BIMRI doctor: PASSED", repaired.stdout)
         self.assertNotEqual(self.witness_path().read_bytes(), witness_before)
         checkpoint = self.witness()
@@ -1228,6 +1426,15 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         corrupt_conflict = b"{blocked restore corruption"
         conflict_path.write_bytes(corrupt_conflict)
         run_id = next(iter(self.state(root)["active_runs"]))
+        # v5.2 (build step 3, D4.5): the resolved conflict is in no
+        # dependency set of the staging write, so a checkpoint-scoped
+        # propose would not see it; the deep audit finds and condemns it,
+        # and the staging below is then the degraded full-path write.
+        condemned = self.cli("doctor", root=root, check=False)
+        self.assertEqual(
+            condemned.returncode, 1, condemned.stdout + condemned.stderr
+        )
+        self.assertIn("BIMRI doctor: FAILED", condemned.stdout)
 
         staged = self.cli(
             "propose",
@@ -1501,7 +1708,7 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
 
                 self.assertIn("witness.seed", recalled.stdout)
                 repaired = self.witness(root)
-                self.assertEqual(repaired["witness_schema"], 1)
+                self.assertEqual(repaired["witness_schema"], 2)
                 self.assertNotEqual(self.witness_path(root).read_bytes(), payload)
 
     def test_missing_or_invalid_checkpoint_write_requires_graph_replay(self):
@@ -1509,16 +1716,32 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         for label, witness_bytes in (
             ("missing", None),
             ("invalid", b"{}\n"),
+            # v5.2 (build step 3): a valid witness whose facts evidence is
+            # missing fails the scoped write's preconditions (D4.1 S5), so
+            # the write replays the graph through the full audit too.
+            ("facts-missing", "facts"),
         ):
             with self.subTest(label=label):
                 root = self.clone_store(f"checkpoint-{label}-write")
+                run_id = next(iter(self.state(root)["active_runs"]))
                 if witness_bytes is None:
                     self.witness_path(root).unlink()
+                elif witness_bytes == "facts":
+                    # The store loads warm here (the witness itself is
+                    # valid), so the write runs on a run based at the head:
+                    # an older base would refuse earlier, in the legacy
+                    # preflight's own cold-base history read.
+                    run_id = self.start("facts-missing-writer", root=root)
+                    facts_hash = json.loads(
+                        self.witness_path(root).read_text("utf-8")
+                    )["facts_hash"]
+                    root.joinpath(
+                        ".bimri", "audit-manifests", f"facts-{facts_hash}.json"
+                    ).unlink()
                 else:
                     self.witness_path(root).write_bytes(witness_bytes)
                 damaged = root / records["decisions"].relative_to(self.root)
                 damaged.write_bytes(b"{broken authority decision")
-                run_id = next(iter(self.state(root)["active_runs"]))
                 proposals_before = set(
                     root.joinpath(".bimri", "proposals").glob("*.json")
                 )
@@ -1617,7 +1840,7 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         old_record = json.loads(old_path.read_text("utf-8"))
         self.assertEqual(old_record["bimri_version"], "5.1.0")
         self.assertEqual(
-            old_record["preflight_receipt"]["engine_release"], "5.1.2"
+            old_record["preflight_receipt"]["engine_release"], "5.2.0"
         )
         self.witness_path().unlink(missing_ok=True)
         old_record["preflight_receipt"]["engine_release"] = "5.1.0"
@@ -1631,7 +1854,9 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
 
         self.assertIn("BIMRI doctor (read-only): PASSED", audited.stdout)
         self.assertIn("patch.compatibility-old", recalled.stdout)
-        self.assertEqual(self.state()["bimri_version"], "5.1.0")
+        # v5.2.0: a store this engine creates is born at state format
+        # v5.2.0; the artifacts (and their receipts) stay v5.1.0.
+        self.assertEqual(self.state()["bimri_version"], "5.2.0")
 
         new_run = self.start("patch-compatibility-new")
         new_proposal = self.propose(
@@ -1647,7 +1872,7 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         )
         self.assertEqual(new_record["bimri_version"], "5.1.0")
         self.assertEqual(
-            new_record["preflight_receipt"]["engine_release"], "5.1.2"
+            new_record["preflight_receipt"]["engine_release"], "5.2.0"
         )
 
     def test_exact_current_parity_and_no_global_record_collection(self):
@@ -1706,6 +1931,7 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         crashed_start = self.worker(
             "witness_crash_before_replace",
             "start",
+            "--open-run",
             "--actor",
             "lifecycle-cutpoint-start",
             check=False,
@@ -1815,10 +2041,52 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
             "witness.seed",
         )
         self.assertIn("witness.seed", warm.stdout)
+        # v5.2: the cold listing stays on the checkpoint too (it iterates
+        # state.cold_current; exit 1 just means no cold subjects).
+        listed = self.worker(
+            "valid_witness_forbid_full_audit", "cold", check=False
+        )
+        self.assertIn(listed.returncode, (0, 1), listed.stdout + listed.stderr)
+        self.assertRegex(listed.stdout, r"BIMRI: (no|\d+) cold subjects")
+        # ...and reads no archive month or cold binding on the way.
+        unarchived = self.worker(
+            "cold_forbid_archive_reads", "cold", check=False
+        )
+        self.assertEqual(
+            (unarchived.returncode, unarchived.stdout),
+            (listed.returncode, listed.stdout),
+            unarchived.stderr,
+        )
+        # v5.2: a warm search reads M0 for its month-hash check, so it has
+        # its own seam (section 06 4.5) instead of the six-function one.
+        searched = self.worker(
+            "warm_search_forbid_full_audit",
+            "search",
+            "--query",
+            "stable current value",
+        )
+        self.assertIn("witness.seed", searched.stdout)
+        self.assertEqual(self.witness_path().read_bytes(), checkpoint_before_bytes)
 
+        # v5.2 (D1.1): the read brief runs warm under the same seam and
+        # leaves the checkpoint bytes alone; the legacy lane below still
+        # publishes a lifecycle checkpoint for its new run.
+        read_brief = self.worker(
+            "valid_witness_forbid_full_audit",
+            "start",
+            "--actor",
+            "witness-warm-reader",
+        )
+        self.assertTrue(
+            read_brief.stdout.startswith("=== BIMRI BRIEF read | "),
+            read_brief.stdout,
+        )
+        self.assertNotIn("Checkpoint:", read_brief.stdout)
+        self.assertEqual(self.witness_path().read_bytes(), checkpoint_before_bytes)
         started = self.worker(
             "valid_witness_forbid_full_audit",
             "start",
+            "--open-run",
             "--actor",
             "witness-warm-lifecycle",
         )
@@ -1865,10 +2133,16 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
             "manifest_count",
             "proposal_runs",
             "audit_epoch",
+            # v5.2.0: a lifecycle publication carries the facts generation,
+            # the last full-audit time and the scoped count unchanged.
+            "facts_hash",
+            "audited_at",
+            "scoped_publications",
         ):
             self.assertEqual(
                 checkpoint_after[field], checkpoint_before[field], field
             )
+        self.assertEqual(checkpoint_after["audit_origin"], "lifecycle")
         self.assertNotEqual(
             self.witness_path().read_bytes(), checkpoint_after_start_bytes
         )
@@ -1963,14 +2237,36 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         )
 
         advanced_root = self.clone_store("crash-window-advanced")
-        writer = self.start("crash-window-head-writer", root=advanced_root)
-        self.apply_set(
-            writer,
-            "crash-window.unrelated",
-            "Unrelated commit advances the accepted head.",
-            root=advanced_root,
-            new_subject=True,
+        # v5.2 (build step 3): the unrelated commit is a checkpoint-scoped
+        # save; its scoped publication carries the unlogged run's fact
+        # forward untouched, so the forged base advance still reaches the
+        # full replay below.
+        absent = self.cli(
+            "get", "--key", "crash-window.unrelated", "--json",
+            root=advanced_root, check=False,
         )
+        self.assertEqual(absent.returncode, 1, absent.stderr)
+        saved = self.cli(
+            "save",
+            "--request",
+            "crash-window-unrelated",
+            "--observed",
+            json.loads(absent.stdout)["token"],
+            "--key",
+            "crash-window.unrelated",
+            "--new-subject",
+            "--tier",
+            "2",
+            "--text",
+            "Unrelated commit advances the accepted head.",
+            "--source",
+            "agent",
+            "--trust",
+            "working",
+            root=advanced_root,
+        )
+        self.assertIn("BIMRI SAVE accepted", saved.stdout)
+        self.assertEqual(self.witness(advanced_root)["audit_origin"], "scoped")
         advanced_witness = self.witness_path(advanced_root).read_bytes()
         state_path = advanced_root / ".bimri" / "state.json"
         state = json.loads(state_path.read_text("utf-8"))
@@ -2143,7 +2439,7 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
 
         recovered = self.cli("get", "--key", "witness.seed")
         self.assertIn("witness.seed", recovered.stdout)
-        self.assertEqual(self.witness()["witness_schema"], 1)
+        self.assertEqual(self.witness()["witness_schema"], 2)
 
     def test_commit_crash_with_later_drift_recovers_and_receipts(self):
         seed_run = self.start("commit-cutpoint-seed")
@@ -2206,10 +2502,33 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         self.assertIn("commit-cutpoint.current", recovered.stdout)
         self.assertFalse(self.root.joinpath(TRANSITION_RELATIVE).exists())
         self.assert_no_audit_block()
+        self.assertTrue(unrelated.is_file())
+        # v5.2.0 scoped recovery (D3.4.3): the declared sync rehashes only
+        # its own declared and dependency paths, so drift on a path no
+        # declared write touched is not examined at recovery. It is never
+        # adopted either: the republished checkpoint carries no row for it.
+        republished = self.witness()
+        generation = json.loads(
+            self.root.joinpath(
+                MANIFEST_GENERATIONS_RELATIVE,
+                f"{republished['manifest_hash']}.json",
+            ).read_text("utf-8")
+        )
+        self.assertNotIn(
+            ".bimri/archive/post-commit-crash-drift.bin",
+            {row["path"] for row in generation["manifest"]},
+        )
+        # The next full audit sees it as checkpoint drift (a cache miss,
+        # never a latch) and the writable doctor receipts it before it
+        # rebaselines.
+        audited = self.cli("doctor", "--read-only")
+        self.assertIn("PASSED", audited.stdout)
+        self.assertIn("post-commit-crash-drift", audited.stdout)
+        repaired = self.cli("doctor")
+        self.assertIn("BIMRI doctor: PASSED", repaired.stdout)
         self.assert_drift_receipt(
             pattern=r"post-commit-crash-drift|inventory"
         )
-        self.assertTrue(unrelated.is_file())
         audited = self.cli("doctor", "--read-only")
         self.assertIn("PASSED", audited.stdout)
         self.assertIn("unexplained-drift receipt", audited.stdout)
@@ -2508,8 +2827,20 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         warmed = self.cli("get", "--key", "archive-scope.stable")
         self.assertIn("archive-scope.stable", warmed.stdout)
         self.assertFalse(self.root.joinpath(TRANSITION_RELATIVE).exists())
-        audited = self.cli("doctor", "--read-only")
-        self.assertIn("PASSED", audited.stdout)
+        # v5.2 (D6.4): the forged line is not a memory entry, so the deep
+        # audit is no longer blind to it. Crash recovery and the exact read
+        # above stay tolerant (the row is preserved, nothing blocks), and
+        # doctor names the row by month and line instead of passing.
+        audited = self.cli("doctor", "--read-only", check=False)
+        self.assertNotEqual(audited.returncode, 0, audited.stdout)
+        forged_line = archive_path.read_text("utf-8").splitlines().index(
+            forged_append.rstrip("\n")
+        ) + 1
+        self.assertIn(
+            f"archive authority/recovery corruption in {archive_path.name}:"
+            f"{forged_line}: archived line is not a valid memory entry.",
+            audited.stdout,
+        )
 
     def test_commit_recovery_completes_across_unrelated_closed_run_fact(self):
         unrelated_run = self.start("run-fact-scope-unrelated")
@@ -2829,8 +3160,14 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         self.assertEqual(self.witness_path().read_bytes(), witness_before)
         self.assertEqual(self.drift_receipts(), [])
 
+        # v5.2 (build step 8): --history audits a copy and never publishes
+        # or receipts; doctor --live is what rebaselines.
         history = self.cli("recall", "--key", "witness.seed", "--history")
         self.assertIn("witness.seed", history.stdout)
+        self.assertEqual(self.witness_path().read_bytes(), witness_before)
+        self.assertEqual(self.drift_receipts(), [])
+        rebaselined = self.cli("doctor", "--live")
+        self.assertIn("BIMRI doctor: PASSED", rebaselined.stdout)
         self.assert_drift_receipt(pattern=r"drift-pair-probe|inventory")
         self.assertNotEqual(self.witness_path().read_bytes(), witness_before)
 
@@ -2966,7 +3303,8 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         edited.write_bytes(edited.read_bytes() + b"\n")
         current_hash = hashlib.sha256(edited.read_bytes()).hexdigest()
 
-        repaired = self.cli("doctor")
+        # v5.2 (build step 8): the rebaseline receipt is the live audit's.
+        repaired = self.cli("doctor", "--live")
         self.assertIn("BIMRI doctor: PASSED", repaired.stdout)
         receipts = self.assert_drift_receipt()
         record = json.loads(receipts[-1].read_text("utf-8"))
@@ -2999,7 +3337,9 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         self.assertFalse(sink.exists())
         sink.write_text("obstruction\n", encoding="utf-8")
 
-        blocked = self.cli("doctor", check=False)
+        # v5.2 (build step 8): the rc 1 sink refusal belongs to the live
+        # rebaseline; a copy audit's drift receipt is a warning only.
+        blocked = self.cli("doctor", "--live", check=False)
         self.assertEqual(
             blocked.returncode, 1, blocked.stdout + blocked.stderr
         )
@@ -3009,7 +3349,7 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         self.assertEqual(self.witness_path().read_bytes(), witness_before)
 
         sink.unlink()
-        repaired = self.cli("doctor")
+        repaired = self.cli("doctor", "--live")
         self.assertIn("BIMRI doctor: PASSED", repaired.stdout)
         self.assert_drift_receipt(pattern=r"sink-probe|inventory")
         self.assertNotEqual(self.witness_path().read_bytes(), witness_before)
@@ -3019,7 +3359,7 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         self.root.joinpath(".bimri", "archive", "seal-probe.bin").write_bytes(
             b"drift for a receipt\n"
         )
-        self.cli("doctor")
+        self.cli("doctor", "--live")
         receipt_path = self.drift_receipts()[-1]
         record = json.loads(receipt_path.read_text("utf-8"))
         record["reasons"] = ["forged reason the doctor must never trust"]
@@ -3042,7 +3382,7 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         for index in range(2001):
             archive.joinpath(f"mass-{index:04d}.bin").write_bytes(b"x\n")
 
-        repaired = self.cli("doctor")
+        repaired = self.cli("doctor", "--live")
         self.assertIn("BIMRI doctor: PASSED", repaired.stdout)
         self.assertIn("truncated", repaired.stdout)
         record = json.loads(self.drift_receipts()[-1].read_text("utf-8"))
@@ -3081,7 +3421,7 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
             b"drift before the crash\n"
         )
         crashed = self.worker(
-            "witness_crash_before_replace", "doctor", check=False
+            "witness_crash_before_replace", "doctor", "--live", check=False
         )
         self.assertEqual(
             crashed.returncode, 110, crashed.stdout + crashed.stderr
@@ -3095,7 +3435,7 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
             encoding="utf-8",
         )
 
-        repaired = self.cli("doctor")
+        repaired = self.cli("doctor", "--live")
         self.assertIn("BIMRI doctor: PASSED", repaired.stdout)
         self.assertIn("failed validation", repaired.stdout)
         receipts = self.drift_receipts()
@@ -3116,7 +3456,9 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
             ".bimri", "archive", "null-delta-probe.bin"
         ).write_bytes(b"drift with no prior evidence\n")
 
-        blocked = self.cli("doctor", check=False)
+        # v5.2 (build step 8): a live-rebaseline refusal, pinned on the
+        # live path.
+        blocked = self.cli("doctor", "--live", check=False)
         self.assertEqual(
             blocked.returncode, 1, blocked.stdout + blocked.stderr
         )
@@ -3144,7 +3486,7 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
             ".bimri", "archive", "million-probe.bin"
         ).write_bytes(b"drift at the sequence boundary\n")
 
-        repaired = self.cli("doctor")
+        repaired = self.cli("doctor", "--live")
         self.assertIn("BIMRI doctor: PASSED", repaired.stdout)
         receipts = self.drift_receipts()
         self.assertEqual(len(receipts), 1)
@@ -3417,9 +3759,31 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         served = self.cli("get", "--key", "witness.seed", root=root)
         self.assertIn("witness.seed", served.stdout)
 
+    def _damage_staged_dependency(self, root, seed_target, seed_original, run_id):
+        """v5.2 (build step 3, D4.5): a checkpoint-scoped write audits only
+        the records it depends on, so the damage that must stop it sits in
+        its dependency set: the seed proposal is restored and the run's own
+        staged proposal (frozen into the write's scope) is broken instead.
+        Damage no write depends on is the deep audit's (doctor) to catch."""
+        seed_target.write_bytes(seed_original)
+        staged = self.propose(
+            run_id,
+            f"staged.{run_id.lower()}",
+            "Staged while healthy.",
+            root=root,
+            new_subject=True,
+        )
+        target = root / ".bimri" / "proposals" / f"{staged}.json"
+        original = target.read_bytes()
+        target.write_bytes(b"{broken authority json")
+        return target, original
+
     def test_failed_sync_audit_condemns_the_checkpoint(self):
         root, target, original = self._damaged_clone("condemned-by-sync")
         run_id = self.start("warm-sync", root=root)
+        target, original = self._damage_staged_dependency(
+            root, target, original, run_id
+        )
         witness_before = self.witness_path(root).read_bytes()
         refused = self.cli("sync", "--run", run_id, root=root, check=False)
         self.assert_authority_write_rejects_external_drift(refused)
@@ -3442,7 +3806,11 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
             root=root,
             new_subject=True,
         )
-        target.write_bytes(b"{broken authority json")
+        # v5.2 (build step 3, D4.5): break a record the close depends on
+        # (a second staged proposal of the same run), not unrelated history.
+        target, original = self._damage_staged_dependency(
+            root, target, original, run_id
+        )
         witness_before = self.witness_path(root).read_bytes()
         refused = self.cli(
             "close", "--run", run_id, "--summary", "across damage",
@@ -3477,6 +3845,11 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         )
         self.assertEqual(decision["outcome"], "contested")
         conflict_id = decision["conflict_id"]
+        # v5.2 (build step 3, D4.5): break a record the resolve depends on
+        # (a candidate of the conflict being resolved), not unrelated
+        # history, which only the deep audit (doctor) is required to catch.
+        target = root / ".bimri" / "proposals" / f"{candidate}.json"
+        original = target.read_bytes()
         target.write_bytes(b"{broken authority json")
         witness_before = self.witness_path(root).read_bytes()
         refused = self.cli(
@@ -3498,10 +3871,13 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         # Once the engine has proved the store damaged, no later warm
         # command may republish a checkpoint over it (BIMRI-PROTOCOL 9.5:
         # close stays blocked).
-        root, _target, _original = self._damaged_clone(
+        root, target, original = self._damaged_clone(
             "no-republish-after-refusal"
         )
         run_id = self.start("warm-plain", root=root)
+        # v5.2 (build step 3, D4.5): the damage sits in the sync's
+        # dependency set so the write boundary itself refuses.
+        self._damage_staged_dependency(root, target, original, run_id)
         refused = self.cli("sync", "--run", run_id, root=root, check=False)
         self.assertEqual(refused.returncode, 2)
         closed = self.cli(

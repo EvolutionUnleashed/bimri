@@ -54,7 +54,7 @@ class V510ReleaseContractTest(unittest.TestCase):
         return result
 
     def start(self, actor="gate", root=None):
-        result = self.cli("start", "--actor", actor, root=root)
+        result = self.cli("start", "--open-run", "--actor", actor, root=root)
         match = RUN_RE.search(result.stdout)
         self.assertIsNotNone(match, result.stdout)
         return match.group(1), result
@@ -141,9 +141,11 @@ class V510ReleaseContractTest(unittest.TestCase):
         self.start()
         status = self.cli("status")
 
-        self.assertIn("BIMRI engine v5.1.2", status.stdout)
+        self.assertIn("BIMRI engine v5.2.0", status.stdout)
         self.assertIn("memory format v5.1.0", status.stdout)
-        self.assertEqual(self.state()["bimri_version"], "5.1.0")
+        # v5.2.0: a store this engine creates is born at state format
+        # v5.2.0; the authority (memory) format stays v5.1.0.
+        self.assertEqual(self.state()["bimri_version"], "5.2.0")
         self.assertIn(
             "<!-- BIMRI v5.0.2 | Generated view.",
             (self.root / "bimri.md").read_text("utf-8"),
@@ -223,8 +225,12 @@ class V510ReleaseContractTest(unittest.TestCase):
         self.assertEqual(self.state()["conflict_count"], 0)
         self.assertEqual(self.conflict_files(), [])
         _run, later_start = self.start("later")
-        self.assertNotIn("HUMAN DECISION NEEDED", later_start.stdout)
-        self.assertNotIn("MEMORY CONFLICT", later_start.stdout)
+        # v5.2: the quiet-brief rule holds for both start forms.
+        read_brief = self.cli("start", "--actor", "later-reader")
+        self.assertTrue(read_brief.stdout.startswith("=== BIMRI BRIEF read | "))
+        for brief in (later_start, read_brief):
+            self.assertNotIn("HUMAN DECISION NEEDED", brief.stdout)
+            self.assertNotIn("MEMORY CONFLICT", brief.stdout)
 
     def test_concurrent_exact_effect_is_noop_but_incompatibility_notifies_once(self):
         identical_root = self.root / "identical"
@@ -324,11 +330,12 @@ class V510ReleaseContractTest(unittest.TestCase):
             root=REPOSITORY,
             timeout=60,
         )
-        self.assertIn("BIMRI 5.1.2 installed.", installed.stdout)
-        self.assertIn("Existing authority store v5.1.0 verified", installed.stdout)
+        self.assertIn("BIMRI 5.2.0 installed.", installed.stdout)
+        # The target was created by this engine, so it is a v5.2.0 state.
+        self.assertIn("Existing authority store v5.2.0 verified", installed.stdout)
         self.assertIn("Memory preservation: PASSED", installed.stdout)
         self.assertEqual(self.authority_snapshot(target), before)
-        self.assertEqual(self.state(target)["bimri_version"], "5.1.0")
+        self.assertEqual(self.state(target)["bimri_version"], "5.2.0")
 
         installed_engine = target / "bimri-engine.py"
         second_audit = self.cli(
@@ -347,9 +354,11 @@ class V510ReleaseContractTest(unittest.TestCase):
         )
         self.assertEqual(len(manifests), 1)
         prior_patch_receipt = json.loads(manifests[0].read_text("utf-8"))
-        self.assertEqual(prior_patch_receipt["engine_release"], "5.1.2")
-        self.assertEqual(prior_patch_receipt["memory_format"], "5.1.0")
+        self.assertEqual(prior_patch_receipt["engine_release"], "5.2.0")
+        self.assertEqual(prior_patch_receipt["memory_format"], "5.2.0")
+        # A 5.1.0 receipt always named memory format 5.1.0.
         prior_patch_receipt["engine_release"] = "5.1.0"
+        prior_patch_receipt["memory_format"] = "5.1.0"
         manifests[0].write_text(
             json.dumps(prior_patch_receipt, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
@@ -363,7 +372,7 @@ class V510ReleaseContractTest(unittest.TestCase):
             root=REPOSITORY,
             timeout=60,
         )
-        self.assertIn("BIMRI 5.1.2 installed.", repeated.stdout)
+        self.assertIn("BIMRI 5.2.0 installed.", repeated.stdout)
         receipts = [
             json.loads(path.read_text("utf-8"))
             for path in target.joinpath(".bimri-update-backups").glob(
@@ -378,7 +387,7 @@ class V510ReleaseContractTest(unittest.TestCase):
             },
         )
         self.assertIn(
-            ("5.1.2", "5.1.0"),
+            ("5.2.0", "5.2.0"),
             {
                 (receipt["engine_release"], receipt["memory_format"])
                 for receipt in receipts

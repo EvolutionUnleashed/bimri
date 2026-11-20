@@ -3,22 +3,36 @@
 This file records the public BIMRI architecture history. Historical instruction
 files are preserved under [`legacy/`](legacy/) and are not current installers.
 
-## Unreleased
+## 5.2.0
 
-- `review` and `status` reuse validated historical dependencies within one
-  locked report and index accepted writers by subject. This removes repeated
-  revision, proposal and archive validation during historical satisfaction
-  checks. Every report still performs the full governance audit; the temporary
-  cache is discarded before releasing the lock and is refused by authority
-  writes. Output, authority formats and write-time validation are unchanged.
-  These commands still hold the exclusive store lock for their audit, so this
-  optimization does not establish a bounded session-start latency guarantee.
-- Atomic text and byte writes now retry brief Windows access-denied or sharing
-  failures while replacing a file. They retry the same flushed temporary file
-  at most six times, with 0.63 seconds of total requested sleep per replacement.
-  Existing preflight, locking, integrity checks and caller warning behavior are
-  unchanged. Persistent failures still propagate to the caller; other errors
-  and non-Windows writes do not gain retries.
+- Starting a chat reads accepted memory. The explicit `start --open-run` mode
+  keeps the legacy journal/proposal workflow available.
+- `save` binds a correction to the subject version the agent actually saw.
+  A durable request ID lets a fresh process retry the same operation and
+  recover its result. Use the same ID and intent for a retry.
+- `cold` lists current subjects outside the startup brief. Retention gives
+  owner-confirmed information priority. Patterns can move into cold storage.
+- `recover-run --abandon --dry-run` previews stranded proposals. The
+  owner can explicitly discard them, adopt a held change through `--settles`,
+  or dismiss it. Each decision preserves the original evidence.
+- Routine status reads the current checkpoint. A full diagnostic captures a
+  consistent copy. Exit code 3 reports a deferred capture or an outdated result.
+- This version incorporates the Windows atomic-replacement retry and the
+  resolution check for old, concurrent closes already present on public main.
+
+- New stores use state format 5.2.0. Existing stores retain state format
+  5.1.0 through installation and ordinary reads. Their first authority write
+  advances the format. The 5.1.2 engine then refuses that store. Restore a
+  complete pre-write backup to roll back. Authority records keep format 5.1.0.
+- The checkpoint records the last full audit, the accepted manifest and the
+  facts used by warm reads. Declared writes verify the current head and
+  their dependencies. A full diagnostic also checks unrelated history.
+- Maintenance compacts old finished save tickets into monthly receipts.
+  Replaying a retained receipt returns the original operation's observation
+  token and decision, including after a later correction.
+- `recall --query ... --current --json` finds accepted hot and cold subjects
+  containing the requested terms. `maintain --review-core` shows the size
+  and provenance of each permanent rule and can compare it with a policy file.
 
 ## 5.1.2
 

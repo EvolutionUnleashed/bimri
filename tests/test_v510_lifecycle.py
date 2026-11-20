@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -60,11 +61,37 @@ class V510LifecycleTest(unittest.TestCase):
             )
         return result
 
+    def assert_legacy_completion_required(self, run_id, root, engine=None):
+        report = self.cli("doctor", "--read-only", root=root, engine=engine, check=False)
+        self.assertEqual(report.returncode, 1, report.stdout + report.stderr)
+        self.assertIn("BIMRI doctor (read-only): COMPLETION REQUIRED", report.stdout)
+        self.assertIn(f"sync --run {run_id}", report.stdout)
+
     def start(self, actor="lifecycle", root=None):
-        result = self.cli("start", "--actor", actor, root=root)
+        # From build step 4 a plain start is the read brief and opens
+        # nothing (D1.1); these tests drive the legacy lane.
+        result = self.cli("start", "--open-run", "--actor", actor, root=root)
         match = RUN_RE.search(result.stdout)
         self.assertIsNotNone(match, result.stdout)
         return match.group(1), result
+
+    def with_read_brief(self, started, actor, root=None):
+        """Join a legacy start's output with a read brief on the same store.
+
+        v5.2: brief-quietness assertions re-run against both start forms;
+        every assertNotIn on the result covers the run brief and the read
+        brief (whose cold line is a count, never keys).
+        """
+        read = self.cli("start", "--actor", actor, root=root)
+        self.assertTrue(
+            read.stdout.startswith("=== BIMRI BRIEF read | "), read.stdout
+        )
+        self.assertNotIn("BIMRI RUN HANDLE", read.stdout)
+        return types.SimpleNamespace(
+            stdout=started.stdout + read.stdout,
+            stderr=started.stderr + read.stderr,
+            returncode=started.returncode or read.returncode,
+        )
 
     def propose_set(
         self,
@@ -240,6 +267,58 @@ class V510LifecycleTest(unittest.TestCase):
         self.assertIn(key, self.cold_current(root))
         return old_text, new_text
 
+    def propose_pattern(
+        self, run_id, key, text, *, confidence="established",
+        observations=3, falsifier="A counterexample appears.",
+        new_subject=False, root=None, check=True,
+    ):
+        arguments = [
+            "propose", "--run", run_id, "--operation", "set", "--tier", "3",
+            "--key", key, "--text", text, "--confidence", confidence,
+            "--observations", str(observations), "--falsifier", falsifier,
+            "--source", "agent", "--trust", "working",
+        ]
+        if new_subject:
+            arguments.append("--new-subject")
+        return self.cli(*arguments, root=root, check=check)
+
+    def seed_cold_pattern(self, root, key="cold.pattern-subject"):
+        """v5.2.0: cool one Tier 3 pattern whose only evidence run is old."""
+        pattern_run, _ = self.start("cold-pattern-create", root=root)
+        pattern_text = "Old cold pattern value. " + "p" * 360
+        self.propose_pattern(
+            pattern_run, key, pattern_text, new_subject=True, root=root
+        )
+        self.cli("sync", "--run", pattern_run, root=root)
+        state = self.state(root)
+        state["run_dates"][pattern_run] = (
+            dt.date.today() - dt.timedelta(days=30)
+        ).isoformat()
+        Path(root).joinpath(".bimri", "state.json").write_text(
+            json.dumps(state, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        current_bytes = len(self.hot_text(root).encode("utf-8"))
+        self.update_state(root=root, hot_max_bytes=current_bytes + 32)
+        pressure_run, _ = self.start("cold-pattern-pressure", root=root)
+        self.apply_set(
+            pressure_run,
+            key + "-pressure",
+            "Fresh owner context displaces the old pattern. " + "f" * 150,
+            root=root,
+            new_subject=True,
+            importance=3,
+        )
+        cold = self.cold_current(root)
+        self.assertIn(key, cold)
+        self.assertEqual(cold[key]["tier"], 3)
+        self.assertRegex(cold[key]["entry_id"], r"^P\d{4}$")
+        self.assertTrue(cold[key]["raw_line"].startswith(
+            "[" + cold[key]["entry_id"] + "] [K:" + key + "]"
+        ))
+        self.assertNotIn(key + "-pressure", cold)
+        return pattern_run, pattern_text
+
     @staticmethod
     def protected_snapshot(root):
         """Record pre-existing memory bytes without following links."""
@@ -333,7 +412,9 @@ class V510LifecycleTest(unittest.TestCase):
         self.assertIn(original, history.stdout)
         self.assertIn(replacement, history.stdout)
         self.assertEqual(self.current_count(key), 1)
-        self.assertEqual(self.state()["bimri_version"], "5.1.0")
+        # v5.2.0: the state format is 5.2.0 (a new store, and after any
+        # authority write); every authority artifact stays 5.1.0.
+        self.assertEqual(self.state()["bimri_version"], "5.2.0")
 
     def test_exact_key_updates_are_count_neutral_and_history_is_recoverable(self):
         create_run, _ = self.start("stable-key-create")
@@ -420,6 +501,7 @@ class V510LifecycleTest(unittest.TestCase):
         self.assertIn("held", status.stdout.lower())
 
         _later, started = self.start("admission-later")
+        started = self.with_read_brief(started, "admission-later")
         self.assertNotIn(proposal["proposal_id"], started.stdout + started.stderr)
         self.assertNotIn("PENDING REVIEW", (started.stdout + started.stderr).upper())
 
@@ -632,6 +714,7 @@ class V510LifecycleTest(unittest.TestCase):
         self.assertIn("Held candidates: 1", self.cli("status").stdout)
 
         _later, started = self.start("protected-pressure-later")
+        started = self.with_read_brief(started, "protected-pressure-later")
         output = started.stdout + started.stderr
         self.assertNotIn(proposal["proposal_id"], output)
         self.assertNotIn("PENDING REVIEW", output.upper())
@@ -1015,8 +1098,29 @@ class V510LifecycleTest(unittest.TestCase):
         doctor = self.cli("doctor", "--read-only")
         self.assertIn("PASSED", doctor.stdout)
         _later, restarted = self.start("cold-touch-restart")
+        restarted = self.with_read_brief(restarted, "cold-touch-restart")
         self.assertNotIn("PENDING REVIEW", restarted.stdout.upper())
+        self.assertNotIn(key, restarted.stdout)
         self.assertEqual(self.cold_current()[key]["raw_line"], after["raw_line"])
+
+        # v5.2.0 Tier 3 case: a cold pattern is never touchable.
+        pattern_root = self.root / "cold-pattern-touch"
+        pattern_key = "delivery.cold-touch-pattern"
+        self.seed_cold_pattern(pattern_root, key=pattern_key)
+        pattern_before = dict(self.cold_current(pattern_root)[pattern_key])
+        pattern_touch_run, _ = self.start(
+            "cold-pattern-touch", root=pattern_root
+        )
+        refused = self.cli(
+            "propose", "--run", pattern_touch_run, "--operation", "touch",
+            "--key", pattern_key, "--source", "user", "--trust", "confirmed",
+            root=pattern_root, check=False,
+        )
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("only Tier 2 entries can be touched", refused.stderr)
+        self.assertEqual(
+            self.cold_current(pattern_root)[pattern_key], pattern_before
+        )
 
     def test_cold_current_compatible_writes_resolve_as_noops(self):
         redundant_root = self.root / "redundant-set"
@@ -1143,6 +1247,68 @@ class V510LifecycleTest(unittest.TestCase):
             self.cli("doctor", "--read-only", root=touch_root).stdout,
         )
         self.start("cold-touch-noop-restart", root=touch_root)
+
+        # v5.2.0 Tier 3 case: a cold pattern record validates, recalls COLD,
+        # a redundant pattern set is a noop, and a changed one rehydrates
+        # under its own pattern ID without advancing the pattern counter.
+        pattern_root = self.root / "compatible-pattern"
+        pattern_key = "cold.noop-pattern"
+        _pattern_run, pattern_text = self.seed_cold_pattern(
+            pattern_root, key=pattern_key
+        )
+        pattern_cold = dict(self.cold_current(pattern_root)[pattern_key])
+        self.assertIn(
+            "COLD",
+            self.cli("recall", "--key", pattern_key, root=pattern_root).stdout,
+        )
+        self.assertIn(
+            "PASSED",
+            self.cli("doctor", "--read-only", root=pattern_root).stdout,
+        )
+        pattern_noop_run, _ = self.start(
+            "cold-pattern-noop", root=pattern_root
+        )
+        redundant_pattern = self.propose_pattern(
+            pattern_noop_run, pattern_key, pattern_text, root=pattern_root
+        )
+        redundant_pattern_id = re.search(
+            r"R\d{6}-Q\d{3}", redundant_pattern.stdout
+        ).group(0)
+        self.cli("sync", "--run", pattern_noop_run, root=pattern_root)
+        self.assertEqual(
+            self.decision(redundant_pattern_id, pattern_root)["outcome"],
+            "noop",
+        )
+        self.assertEqual(
+            self.cold_current(pattern_root)[pattern_key], pattern_cold
+        )
+        pattern_count = self.state(pattern_root)["pattern_count"]
+        self.update_state(root=pattern_root, hot_max_bytes=49152)
+        rehydrate_run, _ = self.start(
+            "cold-pattern-rehydrate", root=pattern_root
+        )
+        self.propose_pattern(
+            rehydrate_run, pattern_key, "Rehydrated pattern value.",
+            observations=4, root=pattern_root,
+        )
+        self.cli("sync", "--run", rehydrate_run, root=pattern_root)
+        self.assertNotIn(pattern_key, self.cold_current(pattern_root))
+        self.assertIn(
+            f"[{pattern_cold['entry_id']}] [K:{pattern_key}]",
+            self.hot_text(pattern_root),
+        )
+        self.assertEqual(
+            self.state(pattern_root)["pattern_count"], pattern_count
+        )
+        self.assertEqual(self.current_count(pattern_key, pattern_root), 1)
+        self.assertIn(
+            "HOT",
+            self.cli("recall", "--key", pattern_key, root=pattern_root).stdout,
+        )
+        self.assertIn(
+            "PASSED",
+            self.cli("doctor", "--read-only", root=pattern_root).stdout,
+        )
 
     def test_historical_cold_base_survives_unrelated_head_advance(self):
         for operation in ("set", "touch", "close"):
@@ -1493,12 +1659,7 @@ class V510LifecycleTest(unittest.TestCase):
                         "recall", "--key", key, root=case_root
                     ).stdout,
                 )
-                doctor = self.cli(
-                    "doctor", "--read-only", root=case_root, check=False
-                )
-                self.assertEqual(
-                    doctor.returncode, 0, doctor.stdout + doctor.stderr
-                )
+                self.assert_legacy_completion_required(operation_run, case_root)
                 self.start(
                     f"cold-{operation}-applying-restart", root=case_root
                 )
@@ -1600,10 +1761,7 @@ class V510LifecycleTest(unittest.TestCase):
         self.assertEqual(
             self.decision(staged_id, cooled_root)["outcome"], "applying"
         )
-        doctor = self.cli(
-            "doctor", "--read-only", root=cooled_root, check=False
-        )
-        self.assertEqual(doctor.returncode, 0, doctor.stdout + doctor.stderr)
+        self.assert_legacy_completion_required(staged_run, cooled_root)
         self.start("hot-base-cooled-restart", root=cooled_root)
         self.cli("sync", "--run", staged_run, root=cooled_root)
         self.assertEqual(
@@ -1707,8 +1865,11 @@ class V510LifecycleTest(unittest.TestCase):
                 )
 
                 before = self.protected_snapshot(case_root)
+                # The legacy lane re-proves a store without a valid
+                # checkpoint; the read brief never audits (section 06 1.2).
                 started = self.cli(
                     "start",
+                    "--open-run",
                     "--actor",
                     "corruption-probe",
                     root=case_root,
@@ -1777,6 +1938,9 @@ class V510LifecycleTest(unittest.TestCase):
 
     def test_wall_clock_decay_can_cool_old_high_importance_before_recent_low(self):
         old_run, _ = self.start("old-high-importance")
+        # v5.2.0 confirmed decay floor: a confirmed subject never decays
+        # below 0.35, so decay (what this test pins) is shown on
+        # working/agent subjects of equal provenance.
         old_key = "retention.old-important"
         old_text = "Old high-importance context. " + "o" * 300
         self.apply_set(
@@ -1785,6 +1949,8 @@ class V510LifecycleTest(unittest.TestCase):
             old_text,
             new_subject=True,
             importance=5,
+            source="agent",
+            trust="working",
         )
 
         recent_run, _ = self.start("recent-low-importance")
@@ -1796,6 +1962,8 @@ class V510LifecycleTest(unittest.TestCase):
             recent_text,
             new_subject=True,
             importance=1,
+            source="agent",
+            trust="working",
         )
 
         state_path = self.root / ".bimri" / "state.json"
@@ -1830,6 +1998,9 @@ class V510LifecycleTest(unittest.TestCase):
 
     def test_referenced_run_dates_survive_500_run_save_restart_and_pressure(self):
         old_run, _ = self.start("retention-old-referenced")
+        # v5.2.0 confirmed decay floor: a confirmed subject never decays
+        # below 0.35, so decay (what this test pins) is shown on
+        # working/agent subjects of equal provenance.
         old_key = "retention.referenced-old"
         old_text = "Old referenced high-importance context. " + "o" * 300
         self.apply_set(
@@ -1838,6 +2009,8 @@ class V510LifecycleTest(unittest.TestCase):
             old_text,
             new_subject=True,
             importance=5,
+            source="agent",
+            trust="working",
         )
         old_date = (dt.date.today() - dt.timedelta(days=365)).isoformat()
         state_path = self.root.joinpath(".bimri", "state.json")
@@ -1863,6 +2036,8 @@ class V510LifecycleTest(unittest.TestCase):
             recent_text,
             new_subject=True,
             importance=1,
+            source="agent",
+            trust="working",
         )
         old_line = next(
             line for line in self.hot_text().splitlines()
@@ -2087,6 +2262,7 @@ class V510LifecycleTest(unittest.TestCase):
         self.assertIn(candidate_text, pull.stdout)
         self.assertIn("held", self.cli("status").stdout.lower())
         _later, started = self.start("authority-later")
+        started = self.with_read_brief(started, "authority-later")
         self.assertNotIn(candidate["proposal_id"], started.stdout + started.stderr)
 
         self.apply_set(
@@ -2118,6 +2294,7 @@ class V510LifecycleTest(unittest.TestCase):
         self.assertEqual(len(conflicts), 1)
 
         _later_run, started = self.start("unrelated-later")
+        started = self.with_read_brief(started, "unrelated-later")
         conflict_id = conflicts[0].stem
         upper_output = (started.stdout + started.stderr).upper()
         self.assertNotIn(conflict_id, started.stdout + started.stderr)
@@ -2297,11 +2474,13 @@ class V510LifecycleTest(unittest.TestCase):
             candidate_text, self.cli("recall", "--key", key).stdout
         )
 
+        # v5.2 (D5.2): the review classification left status; review carries
+        # the same counts, and status no longer names them.
         status = self.cli("status")
         default_review = self.cli("review")
         historical_review = self.cli("review", "--all")
-        self.assertIn("Actionable concurrent conflicts: 0", status.stdout)
-        self.assertIn("Satisfied historical candidates: 1", status.stdout)
+        self.assertNotIn("Satisfied historical candidates", status.stdout)
+        self.assertIn("Satisfied historical candidates: 1", default_review.stdout)
         self.assertIn("Actionable concurrent conflicts: 0", default_review.stdout)
         self.assertNotIn(conflict_id, default_review.stdout)
         self.assertIn("SATISFIED HISTORICAL CANDIDATE", historical_review.stdout)
@@ -2321,9 +2500,9 @@ class V510LifecycleTest(unittest.TestCase):
         later_run, _ = self.start("cold-satisfied-later")
         later_text = "Later distinct cold generation. " + "z" * 300
         self.apply_set(later_run, key, later_text)
-        later_status = self.cli("status")
-        self.assertIn("Actionable concurrent conflicts: 0", later_status.stdout)
-        self.assertIn("Satisfied historical candidates: 1", later_status.stdout)
+        later_review = self.cli("review")
+        self.assertIn("Actionable concurrent conflicts: 0", later_review.stdout)
+        self.assertIn("Satisfied historical candidates: 1", later_review.stdout)
         self.assertIn(later_text, self.cli("recall", "--key", key).stdout)
         self.assertEqual(decision_path.read_bytes(), decision_bytes)
         self.assertEqual(conflict_path.read_bytes(), conflict_bytes)
@@ -2786,8 +2965,24 @@ class V510LifecycleTest(unittest.TestCase):
 
         frozen_authority = authority_bytes()
         before_state = self.state()
+        # v5.2: the read brief never audits and never runs load-time
+        # recovery, so it cannot recover the resolution silently either; it
+        # points at doctor and leaves every byte alone (section 06 1.2).
+        state_bytes_before = self.root.joinpath(
+            ".bimri", "state.json"
+        ).read_bytes()
+        read_brief = self.cli("start", "--actor", "blocked-silent-reader")
+        self.assertIn("Checkpoint: unproven; run doctor", read_brief.stdout)
+        self.assertEqual(authority_bytes(), frozen_authority)
+        self.assertEqual(
+            self.root.joinpath(".bimri", "state.json").read_bytes(),
+            state_bytes_before,
+        )
+        # The legacy lane's cold load is the path that recovers interrupted
+        # authority; it must find the damage and refuse to recover silently.
         blocked_start = self.cli(
-            "start", "--actor", "blocked-silent-recovery", check=False
+            "start", "--open-run", "--actor", "blocked-silent-recovery",
+            check=False,
         )
         self.assertIn(
             "authority recovery",
@@ -3292,9 +3487,28 @@ class V510LifecycleTest(unittest.TestCase):
             engine=previous_engine,
             check=False,
         )
-        # The documented one-way contract: even decided v5.1.1 proposals
-        # remain immutable authority that a v5.1.0 engine keeps validating,
-        # so rollback exists only through the pre-update backup.
+        # v5.2.0: the authority write moved the state to format v5.2.0, so
+        # the older engine refuses at the state version before anything else.
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn(
+            "found 5.2.0", (refused.stdout + refused.stderr).lower()
+        )
+        # The documented one-way contract also holds below the state gate:
+        # with only the state version rolled back by hand, the decided
+        # proposals remain immutable authority that a v5.1.0 engine keeps
+        # validating, so rollback exists only through the pre-update backup.
+        state_path = self.root / ".bimri" / "state.json"
+        state = json.loads(state_path.read_text("utf-8"))
+        state["bimri_version"] = "5.1.0"
+        state_path.write_text(
+            json.dumps(state, indent=2, sort_keys=True) + "\n", "utf-8"
+        )
+        refused = self.cli(
+            "doctor",
+            "--read-only",
+            engine=previous_engine,
+            check=False,
+        )
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn(
             "preflight receipt engine release",
@@ -3347,7 +3561,7 @@ class V510LifecycleTest(unittest.TestCase):
             timeout=120,
         )
 
-        self.assertIn("BIMRI 5.1.2 installed", installed.stdout)
+        self.assertIn("BIMRI 5.2.0 installed", installed.stdout)
         self.assertIn("Memory preservation: PASSED", installed.stdout)
         self.assertEqual(old_receipt_path.read_bytes(), old_receipt_bytes)
         self.assertEqual(self.root.joinpath("bimri.md").read_bytes(), hot_bytes)
@@ -3373,25 +3587,19 @@ class V510LifecycleTest(unittest.TestCase):
         self.assertTrue(backed_up_states)
         self.assertIn(old_state_bytes, [path.read_bytes() for path in backed_up_states])
         self.assertIn(
-            'ENGINE_VERSION = "5.1.2"',
+            'ENGINE_VERSION = "5.2.0"',
             self.root.joinpath("bimri-engine.py").read_text("utf-8"),
         )
 
         installed_engine = self.root / "bimri-engine.py"
         protected_after_install = self.protected_snapshot(self.root)
-        doctor = self.cli(
-            "doctor",
-            "--read-only",
-            engine=installed_engine,
-            root=self.root,
-        )
-        self.assertIn("PASSED", doctor.stdout)
+        self.assert_legacy_completion_required("R000011", self.root, installed_engine)
         # Read-only audit leaves every byte in place.
         self.assertEqual(
             self.protected_snapshot(self.root), protected_after_install
         )
         status = self.cli("status", engine=installed_engine, root=self.root)
-        self.assertIn("BIMRI engine v5.1.2", status.stdout)
+        self.assertIn("BIMRI engine v5.2.0", status.stdout)
 
         def without_derived_audit(snapshot):
             prefixes = (
@@ -3400,11 +3608,22 @@ class V510LifecycleTest(unittest.TestCase):
                 ".bimri/audit-manifests",
                 ".bimri/audit-transition.json",
                 ".bimri/audit-drift",
+                # v5.2.0: the first live full audit records its derived
+                # verdict (the facts generation is under audit-manifests).
+                ".bimri/audit-verdict.json",
+                # v5.2.0 build step 2: ensure_layout creates the empty save
+                # ticket directories (saves, saves/open, saves/done) on the
+                # first full command; the code-only updater creates none.
+                # No trailing slash, so the ('directory', None) rows match.
+                ".bimri/saves",
             )
             return {
                 relative: fingerprint
                 for relative, fingerprint in snapshot.items()
                 if not relative.startswith(prefixes)
+                # Ordinary layout creation may add the empty settlement root.
+                # Every actual settlement file remains part of the comparison.
+                and not (relative == ".bimri/settlements" and fingerprint == ("directory", None))
             }
 
         # The first full command on the updated store may publish its
@@ -3439,7 +3658,7 @@ class V510LifecycleTest(unittest.TestCase):
             root=REPOSITORY,
             timeout=120,
         )
-        self.assertIn("BIMRI 5.1.2 installed", repeated.stdout)
+        self.assertIn("BIMRI 5.2.0 installed", repeated.stdout)
         self.assertIn("Memory preservation: PASSED", repeated.stdout)
         self.assertEqual(
             self.root.joinpath(".bimri", "state.json").read_bytes(),
@@ -3490,7 +3709,7 @@ class V510LifecycleTest(unittest.TestCase):
                 self.assertEqual(
                     interrupted["status"], "prepared-for-authority-activation"
                 )
-                self.assertEqual(interrupted["engine_release"], "5.1.2")
+                self.assertEqual(interrupted["engine_release"], "5.2.0")
                 self.assertEqual(interrupted["memory_format"], "5.1.0")
                 interrupted["engine_release"] = "5.1.0"
                 manifests[0].write_text(
@@ -3518,13 +3737,10 @@ class V510LifecycleTest(unittest.TestCase):
                     root=REPOSITORY,
                     timeout=120,
                 )
-                self.assertIn("BIMRI 5.1.2 installed", retry.stdout)
+                self.assertIn("BIMRI 5.2.0 installed", retry.stdout)
                 self.assertEqual(self.state(case_root)["bimri_version"], "5.1.0")
                 self.assertEqual(case_root.joinpath("bimri.md").read_bytes(), hot_bytes)
-                doctor = self.cli(
-                    "doctor", "--read-only", root=case_root, engine=case_root / "bimri-engine.py"
-                )
-                self.assertIn("PASSED", doctor.stdout)
+                self.assert_legacy_completion_required("R000011", case_root, case_root / "bimri-engine.py")
                 terminal = {
                     json.loads(path.read_text("utf-8"))["status"]
                     for path in case_root.joinpath(".bimri-update-backups").glob(
@@ -3583,16 +3799,10 @@ class V510LifecycleTest(unittest.TestCase):
             root=REPOSITORY,
             timeout=120,
         )
-        self.assertIn("BIMRI 5.1.2 installed", retry.stdout)
+        self.assertIn("BIMRI 5.2.0 installed", retry.stdout)
         self.assertEqual(self.state()["bimri_version"], "5.1.0")
         self.assertEqual(self.root.joinpath("bimri.md").read_bytes(), hot_bytes)
-        doctor = self.cli(
-            "doctor",
-            "--read-only",
-            root=self.root,
-            engine=self.root / "bimri-engine.py",
-        )
-        self.assertIn("PASSED", doctor.stdout)
+        self.assert_legacy_completion_required("R000011", self.root, self.root / "bimri-engine.py")
         statuses = {
             json.loads(path.read_text("utf-8"))["status"]
             for path in self.root.joinpath(".bimri-update-backups").glob(
@@ -3688,7 +3898,7 @@ class V510LifecycleTest(unittest.TestCase):
             root=REPOSITORY,
             timeout=120,
         )
-        self.assertIn("BIMRI 5.1.2 installed", retry.stdout)
+        self.assertIn("BIMRI 5.2.0 installed", retry.stdout)
         self.assertEqual(self.state()["bimri_version"], "5.1.0")
         self.assertEqual(self.root.joinpath("bimri.md").read_bytes(), hot_bytes)
         self.assertEqual(
@@ -3703,15 +3913,7 @@ class V510LifecycleTest(unittest.TestCase):
             }:
                 continue
             self.assertEqual(after[relative], fingerprint, relative)
-        self.assertIn(
-            "PASSED",
-            self.cli(
-                "doctor",
-                "--read-only",
-                root=self.root,
-                engine=self.root / "bimri-engine.py",
-            ).stdout,
-        )
+        self.assert_legacy_completion_required("R000011", self.root, self.root / "bimri-engine.py")
 
     def test_serial_and_concurrent_same_key_updates_remain_bounded(self):
         serial_run, _ = self.start("serial-updates")

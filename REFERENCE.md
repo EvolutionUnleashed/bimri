@@ -15,7 +15,7 @@ problems go to [GitHub Issues](https://github.com/EvolutionUnleashed/bimri/issue
 | Migrate an older BIMRI store | [`MIGRATION.md`](MIGRATION.md) |
 | Review releases and architecture changes | [`CHANGELOG.md`](CHANGELOG.md) |
 
-The current engine is v5.1.2, the authority format is v5.1.0, and the readable
+The 5.2.0 engine uses authority format v5.1.0. Its writable state is v5.2.0 and the readable
 hot-memory grammar remains v5.0.2.
 
 ## Supported AI Agent Runtimes
@@ -106,13 +106,12 @@ For a fresh target or v1-v4 migration, the installer command is:
 <verified-python> bimri-engine.py install --target /absolute/path/to/the/project
 ```
 
-Before any upgrade, make the target quiescent and create a verified, complete
-copy of the whole project folder somewhere outside it. For a v5.1.0 or v5.1.1
-store taking v5.1.2, that complete snapshot is the only rollback after the
-first v5.1.2 proposal is staged: v5.1.2 accepts receipts stamped v5.1.0,
-v5.1.1 and v5.1.2, but an older engine rejects the newer proposal receipt. A
-store the new engine has only started and closed, with no v5.1.2 proposal,
-remains readable by the older engine.
+Before any upgrade, stop the old engine processes and create a verified,
+complete copy of the whole project folder somewhere outside it. Installing
+5.2 and performing ordinary reads leave the prior 5.1.0 state readable by
+engine 5.1.2. After the first 5.2 authority write, engine 5.1.2 refuses the
+store. To roll back, restore the complete external snapshot and the prior
+engine together.
 
 For any existing v5 store, stop every old engine process first and attest that
 external handoff explicitly:
@@ -173,10 +172,37 @@ Global Instructions while v5 is active.
 
 ## Quick Start: Store and Retrieve Project Memory
 
-An agent starts by requesting its own run handle:
+For an ordinary handoff, use `recall --query "What is the cancellation deadline?" --current --json`.
+This mode matches content words against current subject keys, text and saved tags.
+Tags can record the owner's terminology. A missing term produces zero matches.
+Use exact-key `--history` for superseded decisions. Repeating a query leaves its
+result and the source's authority unchanged while the store stays the same.
+
+To review permanent memory, run `maintain --review-core`. Add one or more
+`--compare POLICY.md` options for project-relative Markdown files. The preview
+lists the bytes used by each permanent entry and identifies files containing
+its full text with whitespace and case normalised. The owner decides which
+entries to keep, revise or retire.
+
+A new chat starts with a read-only brief. For a correction, get the version
+token with `get --key <key> --json` and pass the returned token to the save.
+For a genuinely new subject use its observed absence token and `--new-subject`.
+A request ID identifies one logical change and must be reused after interruption.
 
 ```text
-<verified-python> bimri-engine.py start --actor codex
+<verified-python> bimri-engine.py start
+<verified-python> bimri-engine.py get --key checkout.next-step --json
+<verified-python> bimri-engine.py save --request checkout-review-1 --key checkout.next-step --observed <returned-token> --tier 2 --new-subject --text "Verify retry behavior."
+```
+
+Read the save result. `accepted` means the change was applied, `unchanged`
+means the current record already satisfied it, and `held`, `conflict` or
+`stale` require the agent to inspect the disposition. `cold` lists current
+subjects outside the startup brief. For a legacy staged workflow, explicitly
+request a run handle:
+
+```text
+<verified-python> bimri-engine.py start --open-run --actor codex
 ```
 
 The engine prints a brief and a handle such as `R000042`. The agent reads the
@@ -258,17 +284,9 @@ Proposals are applied by `sync` or `close`:
 Every agent closes only its own explicit handle. When several runs are active,
 a handle-free close is refused.
 
-The optional Claude `hook-start` adapter opens a run only when Claude's payload
-carries a `session_id` or `transcript_path`. A payload with neither, including
-empty, invalid or non-object stdin, is refused with exit 2 and a message ending
-in `[hook-identity-missing]`; nothing is created, and because Claude Code does
-not block a session on a `SessionStart` hook exit code the session opens
-without a brief, where the explicit `start --actor` command still works. The
-`hook-close` adapter closes only its mapped session. If Claude sends
-`SessionEnd` without a corresponding active mapping, the hook returns a
-successful no-op and never guesses another run to close; the reason Claude
-supplies is flattened to one line and bounded before it is recorded, so it
-cannot fail the close.
+The optional Claude `hook-start` adapter reads accepted memory even when the
+host omits its session ID. `hook-close` handles an existing legacy mapping.
+New-style saves finish independently of the host's end-of-session event.
 
 An orphaned run is never reaped automatically. The start brief lists orphan
 candidates by inactivity: a run whose last recorded activity
@@ -288,69 +306,36 @@ outcomes.
 
 ## Exact Recall and Integrity Performance
 
-Engine v5.1.1 introduced a validated fast path for current exact-key
-retrieval, and v5.1.2 keeps it. A `get --key` or `recall --key` command without
-`--history` resolves the accepted hot revision and keyed cold-current storage
-directly and returns only the accepted current generation. Held candidates and
-superseded generations remain available through `--history` and the review
-workflow. The current lookup does not construct one combined collection from
-every historical generation.
+In 5.2, `get --key` and `recall --key` return the accepted current generation.
+With a valid checkpoint, hot lookup reads the accepted head. Cold lookup also
+validates the selected subject's archive month. Use the `--history` option
+with exact recall for prior generations and held candidates.
 
-The fast path is gated by `.bimri/audit-witness.json`, an engine-managed,
-non-authoritative integrity checkpoint. The compact witness binds the engine
-release, memory format, authority policy version (`5.1.2-authority-1` in this
-release), accepted head, and canonical current-memory state. A checkpoint
-written under an earlier engine or policy version is a cache miss: the first
-command after an engine update re-proves the store with one full audit, about
-35 seconds on a 700-run store, and publishes a fresh checkpoint, which is why
-`INSTALL.md` asks for one `doctor` run before the first session. Recovery
-records may still use sealed v5.1.1 checkpoints as comparison
-evidence; they cannot use them as a current-policy audit pass. Detailed
-path-and-SHA-256 evidence for the last full audit lives separately in
-`.bimri/audit-manifest.json`, so a warm exact lookup does not parse or hash the
-historical inventory. Neither file stores memory, conflicts, or held
-candidates.
+The reference engine binds its compact checkpoint, `.bimri/audit-witness.json`,
+to the engine release, authority policy (`5.2.0-authority-1`), accepted head and
+current state. Detailed inventory evidence lives in `.bimri/audit-manifest.json`.
+The checkpoint represents the last full audit plus subsequent verified engine
+writes. A warm save checks the accepted head and the records its decision
+depends on. The engine records the protected paths it changes and uses them to
+advance the checkpoint. Damage elsewhere in history can surface when a later
+operation uses that record or when a full audit checks it.
 
-With a valid checkpoint, a hot exact lookup reads the bounded accepted head. A
-cold exact lookup additionally validates only the selected subject's archive
-month. It does not enumerate run logs, revisions, proposals, decisions,
-conflicts, resolutions, recovery evidence, or unrelated archives. Normal start
-and journal commands likewise avoid historical traversal.
+`status` reports the checkpoint condition. A cold `start` reports that an audit
+is needed. `doctor` and `review` normally verify a captured copy and release
+the live lock after capture. Exit code 3 means capture was deferred or the
+result was superseded. A clean result covers the captured snapshot. Run
+`doctor --live` to verify the live store under lock and establish a checkpoint.
 
-Full verification still happens before authority-changing writes (`propose`,
-`sync`, authority `close` and `resolve`) and during explicit audit, `status`,
-historical recall, task-language search, `review`, `index`, `maintain` and
-`migrate`. Those checks compare the live protected inventory with the prior
-manifest. Protected
-roots are flat; an unexpected subdirectory or redirected path prevents a valid
-audit. Divergence from the prior manifest is a cache miss, never a verdict:
-the full semantic audit decides. When it passes over changes the engine cannot
-attribute to its own recorded operation, a sealed drift receipt is durably
-recorded and validated under `.bimri/audit-drift/` before the new baseline can
-publish. The receipt carries the diverging paths with prior and current hashes,
-inline up to a documented per-section bound with any remainder counted, and
-pins the complete delta in a validated attachment when truncated. `doctor`
-validates every receipt (seal, filename binding, and each referenced
-attachment's existence, size and hash) before trusting it. A receipt that
-cannot be written keeps the prior checkpoint as the baseline and surfaces as an
-error, and a checkpoint whose referenced manifest evidence is missing refuses
-rebaselining instead of adopting new bytes blind. A failed semantic audit
-refuses into damaged-authority recovery and invalidates the checkpoint at every
-boundary that is not read-only. Two mechanisms exist. `doctor`, `status`,
-task-language and historical recall, `search`, `review`, `index`, `maintain`,
-`migrate`, `sync`, authority `close` and `resolve` advance the state's audit
-epoch and leave the checkpoint bytes on disk as the prior baseline for
-receipts, quarantine and restore; a degraded `propose` deletes the checkpoint
-file instead. Either way the next `start` prints `AUTHORITY RECOVERY NEEDED`
-and exact reads refuse until the store is repaired, exactly as v5.1.0 behaved
-(v5.1.1 left the checkpoint valid after a refused `sync`, `close` or
-`resolve`; v5.1.2 closes that gap). Read-only `doctor`, the quarantine shadow
-audit, a blocked-quarantine or prior-evidence-invalid issue and a strict
-restore comparison never invalidate; only a blocked receipt sink, an open
-quarantine, or a strict restore comparison keeps the prior checkpoint
-readable. This detects and records standalone or accidental edits; it is not a
-defense against a coordinated writer editing history and derived evidence
-together, which no local store can prove from its own bytes.
+When prior inventory evidence differs, the engine requires a full semantic
+audit and a durable drift receipt before it can adopt a changed baseline.
+The receipt records the paths and hashes under `.bimri/audit-drift/`.
+A failed live proof preserves evidence for recovery. See `BIMRI-PROTOCOL.md`
+for the rules for quarantine, restore and receipt validation.
+
+Engine 5.1.1 introduced bounded exact-key reads. Engine 5.1.2 used policy
+`5.1.2-authority-1` and extended invalidation after failed authority checks.
+An old checkpoint can provide comparison evidence in recovery. The 5.2 engine
+requires a current-policy audit to establish its own baseline.
 
 ### Support Envelope
 
@@ -361,14 +346,11 @@ that shape, warm exact reads run in the low hundreds of milliseconds end to
 end, start and journal likewise, authority-changing writes about 1.3 seconds,
 and the full audit that seeds the checkpoint runs once at about 30 to 35
 seconds.
-Outside that shape the documented ceilings apply until the planned v5.2
-work: exact reads scale with total current-state size, a selected cold key
-scans its whole archive month, every operation serializes behind one
-exclusive lock, task-language `recall --query` is unranked ASCII substring
-matching on the fully audited path, and authority writes rescan retained
-history. Larger current-state sets, high reader concurrency, ranked or
-non-ASCII retrieval, multi-machine fleets, and indefinite-lifetime storage
-are explicitly not claims of this release.
+In 5.2 a warm save verifies the accepted head and its declared inputs.
+A full audit checks unrelated protected history and reports drift. A copied
+audit releases the live lock after capture. Current-only question lookup
+matches terms against accepted keys, tags and text. All writers still share
+one operating-system lock domain.
 
 This is a cooperative local integrity model, not a claim that each read takes a
 filesystem snapshot. An out-of-engine edit to unrelated protected history can
@@ -379,11 +361,10 @@ lock. Run logs under `.bimri/log/` sit outside the witnessed inventory
 altogether: the audit validates active-run logs and the run facts that bear on
 authority, and it does not hash closed journals. A missing or unreadable
 checkpoint can still require a full audit before the fast path is
-re-established. While an interrupted authority write leaves a decision or
-resolution `applying` that the next command's recovery pass cannot settle on
-its own, the engine withholds the checkpoint and every start and exact read
-takes the full-audit path until that run's own sync or close settles it;
-`doctor` passes meanwhile and lists each unfinished applying decision. BIMRI
+re-established. An interrupted legacy applying decision keeps the checkpoint
+unavailable. The startup brief reports the recorded recovery condition. A
+full diagnostic names the run whose owner can finish it with `sync --run`
+and returns a nonzero exit until completion. BIMRI
 does not promise one universal latency across filesystems, security scanners,
 or unbounded current state.
 
@@ -592,8 +573,9 @@ immutable revision is already preserved and is simply healed as a stale view.
 
 Proposals, decisions, conflicts, and resolutions form the authority graph. If
 one of those JSON records is unreadable or invalid while state and the accepted
-head remain healthy, BIMRI enters a degraded recovery mode. `start` still
-provides a run and a brief, and `status` still prints the complete status plus
+head remain healthy, BIMRI enters a degraded recovery mode. A plain `start`
+provides a read brief. The legacy `start --open-run` lane can open a run for
+isolated work, and `status` still prints the complete status plus
 `AUTHORITY RECOVERY NEEDED`; `status` exits nonzero so automation cannot mistake
 the warning for health. Shared-memory commits, conflict resolution,
 maintenance, migration, and index rebuilding remain paused. Isolated run

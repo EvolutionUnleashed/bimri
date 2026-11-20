@@ -1,4 +1,27 @@
-# BIMRI Migration and the v5.1.0 Lifecycle Upgrade
+# BIMRI Migration
+
+## Upgrading from 5.1.x to 5.2
+
+Stop old writers and take a complete external snapshot of the project memory
+and installed engine. Run the candidate installer with `--quiescent` from
+outside the target. Both the first install and a repeated install must
+preserve the hot file, accepted revision and protected store bytes.
+
+A 5.2 read, explicit legacy start, journal or lifecycle-only close leaves a
+5.1.0 state readable by 5.1.2. The first authority write changes the state
+format to 5.2.0. That includes a save, legacy proposal, sync, authority
+close, resolution, owner cleanup, or moving a pattern to cold storage. The
+5.1.2 engine then reports `unsupported BIMRI state version: 5.2.0`. Restore
+the entire pre-update snapshot to return to the older engine.
+
+Update adapters that parse a run handle from plain `start`. Use
+`start --open-run` for legacy journals or proposals. A new adapter reads the
+brief, observes a subject token, then uses one stable request ID per save.
+An existing staged legacy proposal remains pending until its owner authorises
+its disposition. Preview legacy cleanup before using it. Tier 1 stays in the
+brief until the owner changes or retires an entry.
+
+## Earlier migration history
 
 Engine v5.1.2 uses authority format v5.1.0 while retaining the readable v5.0.2
 hot-memory grammar. The upgrade from v5.1.0 or v5.1.1 is one-way: v5.1.2
