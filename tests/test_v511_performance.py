@@ -1840,7 +1840,7 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         old_record = json.loads(old_path.read_text("utf-8"))
         self.assertEqual(old_record["bimri_version"], "5.1.0")
         self.assertEqual(
-            old_record["preflight_receipt"]["engine_release"], "5.2.0"
+            old_record["preflight_receipt"]["engine_release"], "5.2.1"
         )
         self.witness_path().unlink(missing_ok=True)
         old_record["preflight_receipt"]["engine_release"] = "5.1.0"
@@ -1856,7 +1856,7 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         self.assertIn("patch.compatibility-old", recalled.stdout)
         # v5.2.0: a store this engine creates is born at state format
         # v5.2.0; the artifacts (and their receipts) stay v5.1.0.
-        self.assertEqual(self.state()["bimri_version"], "5.2.0")
+        self.assertEqual(self.state()["bimri_version"], "5.2.1")
 
         new_run = self.start("patch-compatibility-new")
         new_proposal = self.propose(
@@ -1872,7 +1872,7 @@ class V511WitnessAndFastPathTest(unittest.TestCase):
         )
         self.assertEqual(new_record["bimri_version"], "5.1.0")
         self.assertEqual(
-            new_record["preflight_receipt"]["engine_release"], "5.2.0"
+            new_record["preflight_receipt"]["engine_release"], "5.2.1"
         )
 
     def test_exact_current_parity_and_no_global_record_collection(self):

@@ -1003,7 +1003,7 @@ class SaveRecordTest(V520Step2Base):
         self.assertEqual(set(ticket["intent"]), INTENT_FIELDS)
         self.assertEqual(set(ticket["result"]), RESULT_FIELDS)
         self.assertEqual(ticket["ticket_schema"], 1)
-        self.assertEqual(ticket["engine_release"], "5.2.0")
+        self.assertEqual(ticket["engine_release"], "5.2.1")
         self.assertEqual(ticket["status"], "finished")
         self.assertEqual(ticket["request_id"], rid)
         self.assertEqual(ticket["intent"]["observed"], observed)

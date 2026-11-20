@@ -1,8 +1,9 @@
+<!-- BIMRI:START -->
 @AGENTS.md
 
 ## Claude Code
 
-Use BIMRI engine v5.2.0, authority format v5.1.0 and state format v5.2.0. The
+Use BIMRI engine v5.2.1, authority format v5.1.0 and state format v5.2.1. The
 readable hot-memory grammar remains v5.0.2.
 `BIMRI-PROTOCOL.md` is the normative memory protocol.
 
@@ -35,3 +36,4 @@ Other agents may be working in the same folder and must never be treated as
 orphans.
 
 Without hooks, use the explicit start and save commands in `AGENTS.md`.
+<!-- BIMRI:END -->

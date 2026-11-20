@@ -304,7 +304,7 @@ class BimriCliTest(unittest.TestCase):
         """
         status = self.cli("status", root=root, check=False)
         self.assertIn(status.returncode, (0, 1), status.stdout + status.stderr)
-        self.assertRegex(status.stdout, r"(?m)^BIMRI engine v5\.2\.0 \| ")
+        self.assertRegex(status.stdout, r"(?m)^BIMRI engine v5\.2\.1 \| ")
         doctor = self.cli("doctor", "--read-only", root=root, check=False)
         self.assertEqual(doctor.returncode, 1, doctor.stdout + doctor.stderr)
         self.assertIn("BIMRI doctor (read-only): FAILED", doctor.stdout)
@@ -400,7 +400,7 @@ class BimriCliTest(unittest.TestCase):
             "engine_path": engine_path,
             "host_bound": True,
             "python_executable": python_executable,
-            "version": "5.2.0",
+            "version": "5.2.1",
         })
 
         template = json.loads(
@@ -1009,7 +1009,7 @@ class BimriCliTest(unittest.TestCase):
         receipt = proposal["preflight_receipt"]
         self.assertEqual(proposal["bimri_version"], "5.1.0")
         self.assertEqual(proposal["base_revision"], state["head_revision"])
-        self.assertEqual(receipt["engine_release"], "5.2.0")
+        self.assertEqual(receipt["engine_release"], "5.2.1")
         self.assertEqual(receipt["observed_head_revision"], state["head_revision"])
         self.assertEqual(receipt["observed_head_hash"], state["head_hash"])
         self.assertEqual(receipt["observed_key_hash"], "absent")
@@ -5359,7 +5359,7 @@ class BimriCliTest(unittest.TestCase):
         state = self.state()
         # v5.2.0: a migration creates a new store, born at state format
         # v5.2.0; its authority (memory) format stays v5.1.0.
-        self.assertEqual(state["bimri_version"], "5.2.0")
+        self.assertEqual(state["bimri_version"], "5.2.1")
         self.assertEqual(state["project_id"], "legacy-project")
         self.assertEqual(state["run_count"], 3)
         self.assertEqual(
@@ -7242,7 +7242,7 @@ class BimriCliTest(unittest.TestCase):
             (bdir / "revisions" / "V000000.md").read_bytes(), revision_before
         )
         # The resumed v4 migration creates a new store at state v5.2.0.
-        self.assertEqual(self.state()["bimri_version"], "5.2.0")
+        self.assertEqual(self.state()["bimri_version"], "5.2.1")
         self.assertIn("BIMRI doctor: PASSED", self.cli("doctor").stdout)
 
     def test_v4_historical_conversion_keeps_v000000_and_normalizes_active_head(self):
@@ -7952,7 +7952,7 @@ class BimriCliTest(unittest.TestCase):
         self.assertIn("[K:upgrade.pending]", self.hot())
         # The sync is the first authority write: the writer gate moves the
         # upgraded v5.1.0 state to v5.2.0 (artifacts stay v5.1.0).
-        self.assertEqual(self.state()["bimri_version"], "5.2.0")
+        self.assertEqual(self.state()["bimri_version"], "5.2.1")
         self.assertIn("BIMRI doctor: PASSED", self.cli("doctor").stdout)
 
     def test_installer_migrates_long_legacy_claim_with_receipt_and_repair_path(self):
@@ -8095,7 +8095,7 @@ class BimriCliTest(unittest.TestCase):
         )
         state = self.state()
         # A legacy migration creates a new store at state v5.2.0.
-        self.assertEqual(state["bimri_version"], "5.2.0")
+        self.assertEqual(state["bimri_version"], "5.2.1")
         self.assertEqual(state["head_revision"], 1)
         normalized = (revisions / "V000001.md").read_bytes()
         self.assertEqual((self.root / "bimri.md").read_bytes(), normalized)
@@ -8632,12 +8632,12 @@ class BimriCliTest(unittest.TestCase):
         state = self.state()
         # Engine 5.2.0, state format 5.2.0 (a new store), memory format
         # 5.1.0, hot grammar 5.0.2: four separate identities.
-        self.assertEqual(state["bimri_version"], "5.2.0")
+        self.assertEqual(state["bimri_version"], "5.2.1")
         self.assertIn("<!-- BIMRI v5.0.2 |", self.hot())
         status = self.cli("status")
         # v5.2 status header (D5.1) names the live state version too.
         self.assertIn(
-            "BIMRI engine v5.2.0 | memory format v5.1.0 | state v5.2.0 | "
+            "BIMRI engine v5.2.1 | memory format v5.1.0 | state v5.2.1 | "
             "revision V000000",
             status.stdout,
         )
@@ -8960,7 +8960,7 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(old_waiter.returncode, 2, old_stdout + old_stderr)
         # The store was created by this engine at state format v5.2.0.
         self.assertIn(
-            "unsupported BIMRI state version: 5.2.0",
+            "unsupported BIMRI state version: 5.2.1",
             old_stdout + old_stderr,
         )
         self.assertNotIn("BIMRI RUN HANDLE:", old_stdout)
@@ -9018,17 +9018,17 @@ class BimriCliTest(unittest.TestCase):
             timeout=60,
         )
 
-        self.assertIn("BIMRI 5.2.0 installed.", result.stdout)
+        self.assertIn("BIMRI 5.2.1 installed.", result.stdout)
         # migrate + sync: a v5.2.0 state (new store, then an authority
         # write); a byte-identical code-only update keeps it at v5.2.0.
-        self.assertIn("Existing authority store v5.2.0 verified", result.stdout)
+        self.assertIn("Existing authority store v5.2.1 verified", result.stdout)
         self.assertIn("Memory preservation: PASSED", result.stdout)
         self.assertEqual(protected_tree_snapshot(self.root), before)
-        self.assertEqual(self.state()["bimri_version"], "5.2.0")
+        self.assertEqual(self.state()["bimri_version"], "5.2.1")
         runtime = json.loads(
             (bdir / "runtime.local.json").read_text("utf-8")
         )
-        self.assertEqual(runtime["version"], "5.2.0")
+        self.assertEqual(runtime["version"], "5.2.1")
         manifests = list(
             (self.root / ".bimri-update-backups").glob(
                 "*/install-manifest.json"
@@ -9036,12 +9036,12 @@ class BimriCliTest(unittest.TestCase):
         )
         self.assertEqual(len(manifests), 1)
         manifest = json.loads(manifests[0].read_text("utf-8"))
-        self.assertEqual(manifest["engine_release"], "5.2.0")
-        self.assertEqual(manifest["memory_format"], "5.2.0")
+        self.assertEqual(manifest["engine_release"], "5.2.1")
+        self.assertEqual(manifest["memory_format"], "5.2.1")
         # v5.1.2: a same-format update keeps the stricter code-only-update
         # label, which binds the before and after tree and state digests.
         self.assertEqual(manifest["mode"], "code-only-update")
-        self.assertEqual(manifest["source_memory_format"], "5.2.0")
+        self.assertEqual(manifest["source_memory_format"], "5.2.1")
         self.assertFalse(manifest["state_activated"])
         self.assertEqual(manifest["before_state_sha256"], manifest["after_state_sha256"])
         self.assertEqual(manifest["before_tree_digest"], manifest["after_tree_digest"])

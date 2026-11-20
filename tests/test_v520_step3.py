@@ -754,19 +754,20 @@ class Step3Base(unittest.TestCase):
 
     def manifest_rows(self, witness=None, root=None):
         witness = witness or self.witness(root)
-        record = read_json(
-            self.bdir(root) / "audit-manifests"
-            / "{}.json".format(witness["manifest_hash"])
-        )
-        rows = record["manifest"] if isinstance(record, dict) else record
+        engine, paths = self.generation_reader(root)
+        rows = engine.load_audit_manifest_evidence(paths, witness)
         return {row["path"]: row["sha256"] for row in rows}
+
+    def generation_reader(self, root):
+        spec = importlib.util.spec_from_file_location("bimri_generation_reader", ENGINE)
+        engine = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(engine)
+        return engine, engine.Paths(root or self.root)
 
     def facts(self, witness=None, root=None):
         witness = witness or self.witness(root)
-        return read_json(
-            self.bdir(root) / "audit-manifests"
-            / "facts-{}.json".format(witness["facts_hash"])
-        )
+        engine, paths = self.generation_reader(root)
+        return engine.load_audit_facts_evidence(paths, witness)
 
     def drift_receipts(self, root=None):
         directory = self.bdir(root) / "audit-drift"

@@ -814,6 +814,8 @@ class V512DefectsTest(unittest.TestCase):
         # In-process check of the merge itself: only the real block moves.
         engine = load_engine_module("bimri_v512_block_merge")
         merged = engine.merged_marked_block_content(target / "AGENTS.md", "NEW BLOCK")
+        # The installer preserves the project's original newline convention.
+        merged = "\n".join(merged.splitlines())
         self.assertTrue(merged.startswith(owner_text.rstrip() + "\n\n<!-- BIMRI:START -->\nNEW BLOCK\n<!-- BIMRI:END -->"))
         self.assertEqual(merged.count("<!-- BIMRI:START -->"), 2)
 
@@ -827,7 +829,7 @@ class V512DefectsTest(unittest.TestCase):
         self.assertEqual(same_format[0]["mode"], "code-only-update")
         # v5.2.0: a store created by this engine is born at state format
         # v5.2.0, and a same-format update records the format it found.
-        self.assertEqual(same_format[0]["source_memory_format"], "5.2.0")
+        self.assertEqual(same_format[0]["source_memory_format"], "5.2.1")
         self.assertFalse(same_format[0]["state_activated"])
         self.assertEqual(same_format[0]["status"], "installed")
 
@@ -946,24 +948,24 @@ class V512DefectsTest(unittest.TestCase):
         status = self.cli("status")
         # v5.2 status header (D5.1) names the live state version too.
         self.assertIn(
-            "BIMRI engine v5.2.0 | memory format v5.1.0 | state v5.2.0 | "
+            "BIMRI engine v5.2.1 | memory format v5.1.0 | state v5.2.1 | "
             "revision V000001",
             status.stdout,
         )
         # The state format moved; every authority artifact stays v5.1.0.
-        self.assertEqual(self.state()["bimri_version"], "5.2.0")
+        self.assertEqual(self.state()["bimri_version"], "5.2.1")
         self.assertIn("<!-- BIMRI v5.0.2 |", self.hot())
         record = self.proposal(proposal)
         self.assertEqual(record["bimri_version"], "5.1.0")
-        self.assertEqual(record["preflight_receipt"]["engine_release"], "5.2.0")
+        self.assertEqual(record["preflight_receipt"]["engine_release"], "5.2.1")
         witness = self.witness()
-        self.assertEqual(witness["engine_version"], "5.2.0")
-        self.assertEqual(witness["policy_version"], "5.2.0-authority-1")
+        self.assertEqual(witness["engine_version"], "5.2.1")
+        self.assertEqual(witness["policy_version"], "5.2.1-authority-1")
         self.assertEqual(witness["memory_format_version"], "5.1.0")
 
         path = self.root / ".bimri" / "proposals" / f"{proposal}.json"
         for release, accepted in (
-            ("5.1.2", True), ("5.1.1", True), ("5.1.0", True), ("5.2.1", False),
+            ("5.1.2", True), ("5.1.1", True), ("5.1.0", True), ("5.2.0", True), ("5.2.2", False),
         ):
             with self.subTest(release=release):
                 record["preflight_receipt"]["engine_release"] = release
@@ -1047,8 +1049,8 @@ class V512DefectsTest(unittest.TestCase):
         served = self.cli("get", "--key", "policy.key")
         self.assertIn("Checkpoint probe.", served.stdout)
         republished = self.witness()
-        self.assertEqual(republished["engine_version"], "5.2.0")
-        self.assertEqual(republished["policy_version"], "5.2.0-authority-1")
+        self.assertEqual(republished["engine_version"], "5.2.1")
+        self.assertEqual(republished["policy_version"], "5.2.1-authority-1")
         self.assertEqual(republished["witness_schema"], 2)
         started = self.cli("start", "--actor", "after-reprove")
         self.assertNotIn("AUTHORITY RECOVERY NEEDED", started.stdout)
@@ -1093,8 +1095,8 @@ class V512DefectsTest(unittest.TestCase):
 
     def assert_upgrade_reproved(self):
         self.assertFalse(self.root.joinpath(".bimri", "audit-transition.json").exists())
-        self.assertEqual(self.witness()["engine_version"], "5.2.0")
-        self.assertEqual(self.witness()["policy_version"], "5.2.0-authority-1")
+        self.assertEqual(self.witness()["engine_version"], "5.2.1")
+        self.assertEqual(self.witness()["policy_version"], "5.2.1-authority-1")
         self.assertEqual(self.witness()["witness_schema"], 2)
         self.assertIn("PASSED", self.cli("doctor", "--read-only").stdout)
         self.assertEqual(list(self.root.joinpath(".bimri", "audit-drift").glob("*.json")), [])
@@ -1195,7 +1197,7 @@ class V512DefectsTest(unittest.TestCase):
         # receipt names the format the update found.
         self.assertEqual(
             [(receipt["engine_release"], receipt["memory_format"]) for receipt in receipts],
-            [("5.2.0", "5.2.0")],
+            [("5.2.1", "5.2.1")],
         )
         manifest_path = sorted(
             self.root.joinpath(".bimri-update-backups").glob("*/install-manifest.json")
@@ -1206,21 +1208,21 @@ class V512DefectsTest(unittest.TestCase):
         receipt["memory_format"] = "5.1.0"
         manifest_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", "utf-8")
         repeated = self.install(self.root, "--quiescent")
-        self.assertIn("BIMRI 5.2.0 installed.", repeated.stdout)
+        self.assertIn("BIMRI 5.2.1 installed.", repeated.stdout)
         self.assertIn("Memory preservation: PASSED", repeated.stdout)
         self.assertEqual(
             sorted(
                 (receipt["engine_release"], receipt["memory_format"], receipt["status"])
                 for receipt in self.manifests(self.root)
             ),
-            [("5.1.1", "5.1.0", "installed"), ("5.2.0", "5.2.0", "installed")],
+            [("5.1.1", "5.1.0", "installed"), ("5.2.1", "5.2.1", "installed")],
         )
         receipt["engine_release"] = "9.9.9"
         manifest_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", "utf-8")
         refused = self.install(self.root, "--quiescent", check=False)
         self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
         self.assertIn("unsupported release identity", refused.stderr)
-        self.assertIn("BIMRI engine v5.2.0", self.cli("status").stdout)
+        self.assertIn("BIMRI engine v5.2.1", self.cli("status").stdout)
 
 
 def _sha256_json(value):

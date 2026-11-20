@@ -15,7 +15,7 @@ problems go to [GitHub Issues](https://github.com/EvolutionUnleashed/bimri/issue
 | Migrate an older BIMRI store | [`MIGRATION.md`](MIGRATION.md) |
 | Review releases and architecture changes | [`CHANGELOG.md`](CHANGELOG.md) |
 
-The 5.2.0 engine uses authority format v5.1.0. Its writable state is v5.2.0 and the readable
+The 5.2.1 engine uses authority format v5.1.0. Its writable state is v5.2.1 and the readable
 hot-memory grammar remains v5.0.2.
 
 ## Supported AI Agent Runtimes
@@ -312,7 +312,7 @@ validates the selected subject's archive month. Use the `--history` option
 with exact recall for prior generations and held candidates.
 
 The reference engine binds its compact checkpoint, `.bimri/audit-witness.json`,
-to the engine release, authority policy (`5.2.0-authority-1`), accepted head and
+to the engine release, authority policy (`5.2.1-authority-1`), accepted head and
 current state. Detailed inventory evidence lives in `.bimri/audit-manifest.json`.
 The checkpoint represents the last full audit plus subsequent verified engine
 writes. A warm save checks the accepted head and the records its decision
@@ -322,15 +322,34 @@ operation uses that record or when a full audit checks it.
 
 `status` reports the checkpoint condition. A cold `start` reports that an audit
 is needed. `doctor` and `review` normally verify a captured copy and release
-the live lock after capture. Exit code 3 means capture was deferred or the
+the live lock after capture. When an exact lookup, a save or a default doctor
+needs a healthy checkpoint, it can rebuild one from private bytes and verify
+those bytes against the live store before publication. A competing change may
+require the same request to retry. Exit code 3 means capture was deferred or the
 result was superseded. A clean result covers the captured snapshot. Run
 `doctor --live` to verify the live store under lock and establish a checkpoint.
+
+A cold proof needs space for a private copy of its inputs. The verifier reads
+the live files again before publication. After process death, a later cold
+proof or writable doctor can reclaim the copy by its ownership record and
+operating-system lease. An unchanged status poll can run during verification.
+A cold save waits for a verified checkpoint. If another writer changes the
+inputs first, retry with the same request and observation. Legacy explicit
+run writers and repair of a recorded interrupted transaction can still hold
+the lock for a full audit.
 
 When prior inventory evidence differs, the engine requires a full semantic
 audit and a durable drift receipt before it can adopt a changed baseline.
 The receipt records the paths and hashes under `.bimri/audit-drift/`.
 A failed live proof preserves evidence for recovery. See `BIMRI-PROTOCOL.md`
 for the rules for quarantine, restore and receipt validation.
+
+Large scoped updates can write manifest and facts generations as byte ranges
+against one retained full generation. A new full baseline is written when
+the change is too large, when the old base is unsuitable, or at the periodic
+rebase. The engine verifies both the base and the reconstructed logical record.
+Keep the whole memory directory together when backing it up. Save cost still
+includes checking the current state and preparing the successor checkpoint.
 
 Engine 5.1.1 introduced bounded exact-key reads. Engine 5.1.2 used policy
 `5.1.2-authority-1` and extended invalidation after failed authority checks.

@@ -3,6 +3,23 @@
 This file records the public BIMRI architecture history. Historical instruction
 files are preserved under [`legacy/`](legacy/) and are not current installers.
 
+## 5.2.1
+
+- The installer checks both instruction files before installing. It names
+  missing markers and duplicate protocol sections, preserves literal examples,
+  and keeps owner edits found while recovering an interrupted update.
+- When an exact-key read or save needs a new checkpoint, the engine verifies
+  a private copy and compares it with the live files before publication.
+  Ordinary chat starts remain available during this work. A changed store
+  can require a retry with the same request ID.
+- Large scoped checkpoint updates can store the changed bytes against one
+  retained full generation. Fenced state and transition JSON use compact
+  formatting. Full checkpoints, recovery and large changes can still write
+  full records.
+- A new 5.2.1 save ticket fences older writers before the ticket is published.
+  The engine accepts 5.2.0 tickets, receipts and in-flight checkpoints.
+  Installation and ordinary reads retain the previous state format.
+
 ## 5.2.0
 
 - Starting a chat reads accepted memory. The explicit `start --open-run` mode

@@ -117,7 +117,7 @@ def main():
             before_refusal = protected_state(root)
             old = subprocess.run([sys.executable, str(args.prior_engine.resolve(strict=True)),
                                   "--root", str(root), "start"], capture_output=True, text=True)
-            refusal = "unsupported BIMRI state version: 5.2.0"
+            refusal = "unsupported BIMRI state version: 5.2.1"
             if old.returncode != 2 or refusal not in old.stderr or protected_state(root) != before_refusal:
                 raise RuntimeError("the earlier engine did not refuse without changing memory")
         print(json.dumps({"engine_sha256": hashlib.sha256(ENGINE.read_bytes()).hexdigest(),

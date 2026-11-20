@@ -1,4 +1,4 @@
-# BIMRI Protocol Release v5.2.0
+# BIMRI Protocol Release v5.2.1
 
 Brief Interaction Memory and Retrieval Intelligence.
 
@@ -6,7 +6,7 @@ This document is the normative protocol for a portable, human-governed BIMRI
 memory folder. `AGENTS.md` is the short runtime adapter. `bimri-engine.py` is
 the reference implementation.
 
-The reference engine is v5.2.0. The mutable state supports v5.1.0 and v5.2.0.
+The reference engine is v5.2.1. The mutable state supports v5.1.0, v5.2.0 and v5.2.1.
 New authority records retain the v5.1.0 format and the generated Markdown
 retains the v5.0.2 grammar. Frozen artifacts keep their original contracts.
 
@@ -417,8 +417,8 @@ An admitted proposal binds `base_revision` to that current accepted head and
 `base_hash` to the exact keyed line hash, or literal `absent`. It MAY also
 carry one backward-readable `preflight_receipt` containing the engine release
 that created it, accepted-head revision and hash, and observed key hash. The
-v5.2.0 engine stamps new receipts with its own release. It accepts v5.1.0,
-v5.1.1, v5.1.2 and v5.2.0 receipts. An older engine rejects a receipt
+v5.2.1 engine stamps new receipts with its own release. It accepts v5.1.0,
+v5.1.1, v5.1.2, v5.2.0 and v5.2.1 receipts. An older engine rejects a receipt
 stamped by a newer release: v5.1.1 rejects v5.1.2-authored receipts and v5.1.0
 rejects both v5.1.1 and v5.1.2. When present, the receipt MUST validate against
 the named immutable revision before the proposal may create a new concurrent
@@ -622,18 +622,20 @@ when the immutable preflight receipt and accepted authority prove genuine
 cross-run overlap. Same-run evolution, a run already stale at proposal time,
 capacity, validation, and policy refusal are not owner conflicts.
 
-State format and the rollback window (v5.2.0 reference engine). Authority
+State format and the rollback window (v5.2.1 reference engine). Authority
 artifacts keep the v5.1.0 memory format; `state.json` carries the state
-format. A new store is created at state format v5.2.0. An existing v5.1.0
-state moves to v5.2.0 in the same durable state write that advances the
+format. A new store is created at state format v5.2.1. An existing v5.1.0 or v5.2.0
+state advances to v5.2.1 before the first new save ticket is written, including
+a ticket recording an unchanged or stale answer. Other authority writes advance
+the format in the same durable state write that advances the
 audit epoch at the start of its first authority transition, and never moves
 back. An authority write that takes no new transition (degraded proposal
 staging, a write while unsettled records withhold the checkpoint, or a retry
 under a retained transition marker) moves it in its own state write before
-its first effect. A v5.1.2 engine refuses a v5.2.0 state with
-`unsupported BIMRI state version: 5.2.0` before any state, log or authority
-write. A store that 5.2.0 has only read, started, journaled or
-lifecycle-closed stays 5.1.0 and readable by 5.1.2; the first authority write
+its first effect. A v5.1.2 or v5.2.0 engine refuses a v5.2.1 state with
+`unsupported BIMRI state version: 5.2.1` before any state, log or authority
+write. A store that 5.2.1 has only read, started, journaled or
+lifecycle-closed retains its previous state format; the first authority write
 (save, propose, sync, authority close, resolve, recover-run --abandon,
 recover-save, dismiss-held, a Tier 3 cooling) is one-way.
 
@@ -1012,6 +1014,20 @@ audit, which condemns on failure. A write never adopts a changed byte it did not
 `doctor` and `review` normally audit a captured copy. A deferred capture or
 superseded verdict returns exit code 3. A positive copy does not become the
 live checkpoint. `doctor --live` explicitly takes the full audit under lock.
+For a cold checkpoint rebuild, the engine may verify private bytes while
+other chats read. Before publishing, it MUST compare the complete named input
+set and contents to the live store, check for an intervening cooperating writer,
+and rebind the result to the current accepted head and control records under
+the store lock. If the inputs moved it MUST retry or report the interruption.
+Explicit live diagnostics and recovery of an interrupted mutation may still
+require the lock.
+
+A scoped manifest or facts generation MAY encode byte ranges against one
+retained full generation. The decoder MUST validate the base hash, the sealed
+delta, its reconstructed size and the original logical witness binding.
+Pruning MUST retain every base still needed by live, blocked or interrupted
+checkpoints. Fenced state and transition files may use compact JSON.
+
 When intact prior path-and-hash evidence disagrees
 with that audit, the engine MUST NOT silently bless the new bytes: it MUST
 re-prove the complete semantic authority graph, and only a passing proof may

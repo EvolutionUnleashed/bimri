@@ -1,18 +1,24 @@
 # BIMRI Migration
 
-## Upgrading from 5.1.x to 5.2
+## Upgrading from 5.1.x or 5.2.0 to 5.2.1
 
 Stop old writers and take a complete external snapshot of the project memory
 and installed engine. Run the candidate installer with `--quiescent` from
 outside the target. Both the first install and a repeated install must
 preserve the hot file, accepted revision and protected store bytes.
 
-A 5.2 read, explicit legacy start, journal or lifecycle-only close leaves a
-5.1.0 state readable by 5.1.2. The first authority write changes the state
-format to 5.2.0. That includes a save, legacy proposal, sync, authority
+An ordinary read, explicit legacy start, journal or lifecycle-only close
+retains the previous state format. The first authority write changes the state
+format to 5.2.1. That includes a new save ticket (including an unchanged or stale answer), legacy proposal, sync, authority
 close, resolution, owner cleanup, or moving a pattern to cold storage. The
-5.1.2 engine then reports `unsupported BIMRI state version: 5.2.0`. Restore
+5.1.2 and 5.2.0 engines then report `unsupported BIMRI state version: 5.2.1`. Restore
 the entire pre-update snapshot to return to the older engine.
+
+Check both instruction files before cutover. An unpaired marker or extra
+protocol heading stops the installer. Keep owner text outside the managed
+block. A cold checkpoint rebuild can now make progress while chats read.
+A warm save can publish compact checkpoint generations; backups must include
+the retained base files under `.bimri/audit-manifests/`.
 
 Update adapters that parse a run handle from plain `start`. Use
 `start --open-run` for legacy journals or proposals. A new adapter reads the

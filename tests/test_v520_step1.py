@@ -54,8 +54,8 @@ RUN_RE = re.compile(r"BIMRI RUN HANDLE: (R\d{6})")
 PROPOSAL_RE = re.compile(r"\bR\d{6}-Q\d{3}\b")
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 PRIOR_EVIDENCE_INVALID_PREFIX = "prior audit manifest evidence is invalid"
-STATE_REFUSAL = "unsupported BIMRI state version: 5.2.0"
-READ_ONLY_REFUSAL = "read-only audit requires memory format v5.1.0; found 5.2.0."
+STATE_REFUSAL = "unsupported BIMRI state version: 5.2.1"
+READ_ONLY_REFUSAL = "read-only audit requires memory format v5.1.0; found 5.2.1."
 WITNESSED_ROOTS = (
     "proposals",
     "decisions",
@@ -311,7 +311,7 @@ class V520Step1Test(unittest.TestCase):
     def setUpClass(cls):
         cls._class_temp = tempfile.TemporaryDirectory(prefix="bimri-v520-s1-")
         cls.class_workspace = Path(cls._class_temp.name)
-        cls._prior_release = None
+        cls._prior_releases = {}
         cls._help_cache = {}
 
     @classmethod
@@ -490,20 +490,20 @@ class V520Step1Test(unittest.TestCase):
 
     # ---- the 5.1.2 comparison engine (main at 2c936ec) --------------------
 
-    def prior_engine(self):
+    def prior_engine(self, release="5.1.2", commit=PRIOR_RELEASE_COMMIT):
         cls = type(self)
-        if cls._prior_release is None:
+        if commit not in cls._prior_releases:
             archived = subprocess.run(
                 ["git", "-c", f"safe.directory={REPOSITORY.as_posix()}",
-                 "archive", "--format=tar", PRIOR_RELEASE_COMMIT],
+                 "archive", "--format=tar", commit],
                 cwd=str(REPOSITORY), capture_output=True, timeout=60,
             )
             self.assertEqual(
                 archived.returncode, 0,
                 f"the checkout must contain release commit "
-                f"{PRIOR_RELEASE_COMMIT}: {archived.stderr!r}",
+                f"{commit}: {archived.stderr!r}",
             )
-            destination = cls.class_workspace / "release-5.1.2"
+            destination = cls.class_workspace / ("release-" + release)
             destination.mkdir()
             package_root = destination.resolve()
             with tarfile.open(
@@ -518,10 +518,112 @@ class V520Step1Test(unittest.TestCase):
                 archive.extractall(str(destination))
             engine = destination / "bimri-engine.py"
             self.assertIn(
-                b'ENGINE_VERSION = "5.1.2"', engine.read_bytes()
+                f'ENGINE_VERSION = "{release}"'.encode("ascii"), engine.read_bytes()
             )
-            cls._prior_release = engine
-        return cls._prior_release
+            cls._prior_releases[commit] = engine
+        return cls._prior_releases[commit]
+
+    def save_under_520(self, old, key):
+        missing = self.cli("get", "--key", key, "--json", engine=old, check=False)
+        self.assertEqual(missing.returncode, 1, missing.stdout + missing.stderr)
+        return ["save", "--request", key, "--key", key, "--new-subject", "--tier",
+                "2", "--text", "Original 5.2.0 statement.", "--observed",
+                json.loads(missing.stdout)["token"], "--json"]
+
+    def test_521_installs_over_520_and_preserves_completed_request_identity(self):
+        old = self.prior_engine("5.2.0", "414a4d7ff820f6f4eb0f8a8c604157e42792a1c1")
+        self.root.mkdir()
+        self.install(self.root, engine=old)
+        args = self.save_under_520(old, "compat.completed")
+        original = json.loads(self.cli(*args, engine=old).stdout)
+        self.install(self.root, "--quiescent", engine=old)
+        before = protected_tree_snapshot(self.root)
+        for _ in range(2):
+            self.install(self.root, "--quiescent")
+            self.assertEqual(before, protected_tree_snapshot(self.root))
+        self.assertEqual(self.state()["bimri_version"], "5.2.0")
+        self.cli("start", "--json")
+        replay = json.loads(self.cli(*args).stdout)
+        self.assertTrue(replay["replayed"])
+        for field in ("token", "proposal", "run", "revision", "decision"):
+            self.assertEqual(replay[field], original[field])
+        self.assertEqual(self.state()["bimri_version"], "5.2.0")
+        args = self.save_under_520(old, "compat.fence")
+        saved = json.loads(self.cli(*args).stdout)
+        self.assertEqual(saved["result"], "accepted")
+        self.assertEqual(self.state()["bimri_version"], "5.2.1")
+        fenced = protected_tree_snapshot(self.root)
+        for cmd in (["start", "--open-run", "--actor", "previous"], args):
+            refused = self.cli(*cmd, engine=old, check=False)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("5.2.1", refused.stderr + refused.stdout)
+            self.assertEqual(fenced, protected_tree_snapshot(self.root))
+
+    def test_521_fences_520_before_a_newly_admitted_ticket_can_be_stranded(self):
+        old = self.prior_engine("5.2.0", "414a4d7ff820f6f4eb0f8a8c604157e42792a1c1")
+        self.root.mkdir()
+        self.install(self.root, engine=old)
+        args = self.save_under_520(old, "compat.admission")
+        stopped = subprocess.run(
+            [sys.executable, str(REPOSITORY / "tests" / "crash_worker.py"),
+             str(ENGINE), "save_crash_after_ticket", str(self.root)] + args,
+            capture_output=True, text=True, encoding="utf-8", timeout=60)
+        self.assertEqual(stopped.returncode, 121, stopped.stdout + stopped.stderr)
+        self.assertEqual(self.state()["bimri_version"], "5.2.1")
+        before = protected_tree_snapshot(self.root)
+        refused = self.cli("start", "--open-run", "--actor", "older", engine=old, check=False)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("5.2.1", refused.stderr)
+        self.assertEqual(before, protected_tree_snapshot(self.root))
+        self.assertEqual(json.loads(self.cli(*args).stdout)["result"], "accepted")
+        self.assertTrue(json.loads(self.cli(*args).stdout)["replayed"])
+
+    def test_521_completes_interrupted_520_save_without_reallocating(self):
+        old = self.prior_engine("5.2.0", "414a4d7ff820f6f4eb0f8a8c604157e42792a1c1")
+        for mode, expected_exit in (("save_crash_after_epoch", 123),
+                                    ("save_crash_after_proposal", 124)):
+            with self.subTest(mode=mode):
+                self.root = self.workspace / mode
+                self.root.mkdir()
+                self.install(self.root, engine=old)
+                args = self.save_under_520(old, "compat.interrupted")
+                stopped = subprocess.run(
+                    [sys.executable, str(REPOSITORY / "tests" / "crash_worker.py"),
+                     str(old), mode, str(self.root)] + args,
+                    capture_output=True, text=True, encoding="utf-8", timeout=60)
+                self.assertEqual(stopped.returncode, expected_exit, stopped.stdout + stopped.stderr)
+                ticket = json.loads((self.root / ".bimri" / "saves" / "open" /
+                                     "compat.interrupted.json").read_text("utf-8"))
+                result = json.loads(self.cli(*args).stdout)
+                self.assertEqual(result["result"], "accepted")
+                self.assertEqual(result["proposal"], ticket["proposal_id"])
+                self.assertEqual(result["run"], ticket["run_id"])
+                self.assertTrue(json.loads(self.cli(*args).stdout)["replayed"])
+                self.assertIn("PASSED", self.cli("doctor", "--read-only").stdout)
+                self.assertEqual(1, len(list((self.root / ".bimri" / "proposals").glob("*.json"))))
+
+    def test_521_republishes_exact_frozen_520_witness_before_current_policy_audit(self):
+        old = self.prior_engine("5.2.0", "414a4d7ff820f6f4eb0f8a8c604157e42792a1c1")
+        self.root.mkdir()
+        self.install(self.root, engine=old)
+        args = self.save_under_520(old, "compat.frozen")
+        stopped = subprocess.run(
+            [sys.executable, str(REPOSITORY / "tests" / "crash_worker.py"),
+             str(old), "witness_crash_before_replace", str(self.root)] + args,
+            capture_output=True, text=True, encoding="utf-8", timeout=60)
+        self.assertEqual(stopped.returncode, 110, stopped.stdout + stopped.stderr)
+        frozen = json.loads(self.marker_path().read_bytes())["scope"]["completion"]["witness"]
+        self.assertEqual(frozen["engine_version"], "5.2.0")
+        head = self.state()["head_revision"]
+        drift = self.root / ".bimri" / "audit-drift"
+        original_receipts = list(drift.glob("*.json"))
+        result = json.loads(self.cli(*args).stdout)
+        self.assertEqual(result["result"], "accepted")
+        self.assertTrue(result["replayed"])
+        self.assertFalse(self.marker_path().exists())
+        self.assertEqual(self.state()["head_revision"], head)
+        self.assertEqual(list(drift.glob("*.json")), original_receipts)
+        self.assertIn("PASSED", self.cli("doctor", "--read-only").stdout)
 
     def test_two_upgrades_and_ten_new_saves_keep_old_staging_untouched(self):
         self.seed_prior_store()
@@ -660,9 +762,9 @@ class V520Step1Test(unittest.TestCase):
         """D2.3 / DESIGN 2.5: the nineteen-field schema-2 verdict."""
         self.assertEqual(set(witness), WITNESS_FIELDS_V2)
         self.assertEqual(witness["witness_schema"], 2)
-        self.assertEqual(witness["engine_version"], "5.2.0")
+        self.assertEqual(witness["engine_version"], "5.2.1")
         self.assertEqual(witness["memory_format_version"], "5.1.0")
-        self.assertEqual(witness["policy_version"], "5.2.0-authority-1")
+        self.assertEqual(witness["policy_version"], "5.2.1-authority-1")
         self.assertEqual(witness["witness_hash"], record_seal(witness, "witness_hash"))
         self.assertRegex(witness["facts_hash"], HASH_RE)
         self.assertIn(witness["audit_origin"], {"full", "scoped", "lifecycle"})
@@ -771,13 +873,13 @@ class V520Step1Test(unittest.TestCase):
         # MEMORY_FORMAT_VERSION and COMPATIBLE_ARTIFACT_VERSIONS do not, so
         # every artifact switch keeps 5.1.0 (risk: "the version cascade").
         engine = self.load_engine("constants")
-        self.assertEqual(engine.ENGINE_VERSION, "5.2.0")
+        self.assertEqual(engine.ENGINE_VERSION, "5.2.1")
         self.assertEqual(engine.V5_1_2_ENGINE_VERSION, "5.1.2")
         self.assertEqual(engine.V5_1_1_ENGINE_VERSION, "5.1.1")
         self.assertEqual(engine.V5_1_0_ENGINE_VERSION, "5.1.0")
-        self.assertEqual(engine.STATE_FORMAT_VERSION, "5.2.0")
-        self.assertEqual(set(engine.READABLE_STATE_VERSIONS), {"5.1.0", "5.2.0"})
-        self.assertEqual(engine.AUTHORITY_POLICY_VERSION, "5.2.0-authority-1")
+        self.assertEqual(engine.STATE_FORMAT_VERSION, "5.2.1")
+        self.assertEqual(set(engine.READABLE_STATE_VERSIONS), {"5.1.0", "5.2.0", "5.2.1"})
+        self.assertEqual(engine.AUTHORITY_POLICY_VERSION, "5.2.1-authority-1")
         self.assertEqual(engine.AUDIT_WITNESS_SCHEMA, 2)
         self.assertEqual(engine.AUDIT_FACTS_SCHEMA, 1)
         self.assertEqual(engine.SAVE_TICKET_SCHEMA, 1)
@@ -791,10 +893,10 @@ class V520Step1Test(unittest.TestCase):
             {"5.0", "5.0.1", "5.0.2", "5.1.0"},
         )
         # D0.3 / DESIGN 2.1 item 3 (L9): a new store is born at 5.2.0.
-        self.assertEqual(engine.fresh_state()["bimri_version"], "5.2.0")
-        self.assertEqual(engine.DEFAULT_STATE["bimri_version"], "5.2.0")
+        self.assertEqual(engine.fresh_state()["bimri_version"], "5.2.1")
+        self.assertEqual(engine.DEFAULT_STATE["bimri_version"], "5.2.1")
         # D0.3: validate_state reads both versions by default and nothing else.
-        for version in ("5.1.0", "5.2.0"):
+        for version in ("5.1.0", "5.2.0", "5.2.1"):
             with self.subTest(version=version):
                 state = engine.fresh_state()
                 state["bimri_version"] = version
@@ -805,9 +907,8 @@ class V520Step1Test(unittest.TestCase):
             engine.validate_state(state)
         self.assertIn("unsupported BIMRI state version: 5.3.0", str(raised.exception))
 
-    def test_code_update_receipt_identity_adds_two_pairs_and_keeps_four(self):
-        # D0.4: ("5.2.0","5.1.0") and ("5.2.0","5.2.0") join the four older
-        # pairs; anything else stays an unsupported release identity.
+    def test_code_update_receipt_identity_accepts_each_supported_release_and_state_pair(self):
+        # Each receipt pins its producer and the readable state it updated.
         engine = self.load_engine("receipts")
         accepted = (
             ("5.0.3", "5.0.2"),
@@ -816,6 +917,7 @@ class V520Step1Test(unittest.TestCase):
             ("5.1.2", "5.1.0"),
             ("5.2.0", "5.1.0"),
             ("5.2.0", "5.2.0"),
+            ("5.2.1", "5.1.0"), ("5.2.1", "5.2.0"), ("5.2.1", "5.2.1"),
         )
         for release, memory in accepted:
             with self.subTest(release=release, memory=memory):
@@ -826,7 +928,7 @@ class V520Step1Test(unittest.TestCase):
                     (release, memory),
                 )
         for release, memory in (
-            ("5.2.1", "5.1.0"), ("5.2.0", "5.0.2"), ("5.1.2", "5.2.0"),
+            ("5.2.2", "5.1.0"), ("5.2.0", "5.0.2"), ("5.1.2", "5.2.0"),
             ("9.9.9", "5.1.0"),
         ):
             with self.subTest(release=release, memory=memory):
@@ -843,7 +945,7 @@ class V520Step1Test(unittest.TestCase):
         engine = self.load_engine("whitelist")
         before = engine.fresh_state()
         before["bimri_version"] = "5.1.0"
-        flipped = dict(before, bimri_version="5.2.0")
+        flipped = dict(before, bimri_version="5.2.1")
         for operation in (
             "propose", "sync", "close-authority-run", "resolve",
             "recover-interrupted-authority", "authority-recovery",
@@ -974,10 +1076,18 @@ class V520Step1Test(unittest.TestCase):
                         record, allow_prior_policy=True
                     )
                 )
+        prior = resealed(dict(
+            current, engine_version="5.2.0", policy_version="5.2.0-authority-1"
+        ))
+        self.assertIsNone(engine.validate_sealed_audit_witness_record(prior))
+        self.assertIsNotNone(engine.validate_sealed_audit_witness_record(
+            prior, allow_prior_policy=True
+        ))
         refused = {
+            "schema 1 with prior schema 2 policy": schema_one("5.2.0", "5.2.0-authority-1"),
             "schema 1 mixed pair": schema_one("5.1.2", "5.1.1-authority-1"),
             "schema 1 unknown release": schema_one("9.9.9", "5.1.2-authority-1"),
-            "schema 1 current pair": schema_one("5.2.0", "5.2.0-authority-1"),
+            "schema 1 current pair": schema_one("5.2.1", "5.2.1-authority-1"),
             "schema 2 prior pair": resealed(dict(
                 current, engine_version="5.1.2", policy_version="5.1.2-authority-1"
             )),
@@ -1481,19 +1591,19 @@ class V520Step1Test(unittest.TestCase):
                 self.assertEqual(content["bimri_version"], "5.1.0", content)
             else:
                 self.assertGreater(epoch, epoch_before)
-                self.assertEqual(content["bimri_version"], "5.2.0", content)
+                self.assertEqual(content["bimri_version"], "5.2.1", content)
                 bumped.append(content)
         self.assertTrue(bumped, "the epoch bump carries the version flip")
         self.assertTrue(markers, "an authority marker was written")
         self.assertEqual(markers[0]["pre_write_state"]["bimri_version"], "5.1.0")
         self.assertEqual(markers[0]["epoch_before"], epoch_before)
-        self.assertEqual(self.state()["bimri_version"], "5.2.0")
+        self.assertEqual(self.state()["bimri_version"], "5.2.1")
         record = self.proposal(proposal)
         self.assertEqual(record["bimri_version"], "5.1.0")
-        self.assertEqual(record["preflight_receipt"]["engine_release"], "5.2.0")
+        self.assertEqual(record["preflight_receipt"]["engine_release"], "5.2.1")
 
         self.cli("sync", "--run", writer)
-        self.assertEqual(self.state()["bimri_version"], "5.2.0")
+        self.assertEqual(self.state()["bimri_version"], "5.2.1")
         self.assertEqual(self.decision(proposal)["bimri_version"], "5.1.0")
         self.assert_current_witness(self.witness())
         self.assertFalse(self.marker_path().exists())
@@ -1509,7 +1619,7 @@ class V520Step1Test(unittest.TestCase):
         self.assertEqual(protected_tree_snapshot(other), before)
         self.assertEqual(self.state_bytes(other), state_bytes)
         self.assertIn(
-            ("5.2.0", "5.1.0"),
+            ("5.2.1", "5.1.0"),
             [(r["engine_release"], r["memory_format"]) for r in self.receipts(other)],
         )
 
@@ -1539,7 +1649,7 @@ class V520Step1Test(unittest.TestCase):
         )
 
         self.apply_set("flip-writer", "flip.key", "One-way write.")
-        self.assertEqual(self.state()["bimri_version"], "5.2.0")
+        self.assertEqual(self.state()["bimri_version"], "5.2.1")
         before = protected_tree_snapshot(self.root)
         logs_before = sorted(
             path.name for path in self.root.joinpath(".bimri", "log").iterdir()
@@ -1575,16 +1685,16 @@ class V520Step1Test(unittest.TestCase):
         self.start("still-rollbackable", engine=old)
         self.assertEqual(self.state()["bimri_version"], "5.1.0")
 
-        self.apply_set("one-way", "oneway.key", "First 5.2.0 authority write.")
-        self.assertEqual(self.state()["bimri_version"], "5.2.0")
+        self.apply_set("one-way", "oneway.key", "First 5.2.1 authority write.")
+        self.assertEqual(self.state()["bimri_version"], "5.2.1")
         memory = protected_tree_snapshot(self.root)
         second = self.install(self.root, "--quiescent")
-        self.assertIn("Existing authority store v5.2.0 verified", second.stdout)
+        self.assertIn("Existing authority store v5.2.1 verified", second.stdout)
         self.assertIn("Memory preservation: PASSED", second.stdout)
         self.assertEqual(protected_tree_snapshot(self.root), memory)
-        self.assertEqual(self.state()["bimri_version"], "5.2.0")
+        self.assertEqual(self.state()["bimri_version"], "5.2.1")
         self.assertIn(
-            ("5.2.0", "5.2.0"),
+            ("5.2.1", "5.2.1"),
             [(r["engine_release"], r["memory_format"]) for r in self.receipts(self.root)],
         )
 
@@ -1622,7 +1732,7 @@ class V520Step1Test(unittest.TestCase):
             )
             installed_files = self.outside_memory_files()
             engine_bytes = self.root.joinpath("bimri-engine.py").read_bytes()
-            self.assertIn(b'ENGINE_VERSION = "5.2.0"', engine_bytes)
+            self.assertIn(b'ENGINE_VERSION = "5.2.1"', engine_bytes)
             result = self.install(self.root, "--quiescent", engine=old, check=False)
             self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
             self.assertIn(STATE_REFUSAL, result.stderr)
@@ -1710,7 +1820,7 @@ class V520Step1Test(unittest.TestCase):
             )
             self.assertIn(f"{conflict_id} resolved with {candidate}", retried.stdout)
             self.assertEqual(resolution(root, conflict_id)["status"], "resolved")
-            self.assertEqual(self.state(root)["bimri_version"], "5.2.0")
+            self.assertEqual(self.state(root)["bimri_version"], "5.2.1")
             self.assertFalse(self.marker_path(root).exists())
             assert_old_engine_refuses(root)
 
@@ -1723,9 +1833,9 @@ class V520Step1Test(unittest.TestCase):
             )
             self.assertEqual(
                 self.proposal(staged, root)["preflight_receipt"]["engine_release"],
-                "5.2.0",
+                "5.2.1",
             )
-            self.assertEqual(self.state(root)["bimri_version"], "5.2.0")
+            self.assertEqual(self.state(root)["bimri_version"], "5.2.1")
             assert_old_engine_refuses(root)
             # The flip is inside the retained 5.1.2 marker's whitelisted
             # delta: 5.2.0 still finishes the retry and the staged sync.
@@ -1736,7 +1846,7 @@ class V520Step1Test(unittest.TestCase):
             self.assertEqual(resolution(root, conflict_id)["status"], "resolved")
             self.cli("sync", "--run", spare_run, root=root)
             self.assertEqual(self.decision(staged, root)["outcome"], "accepted")
-            self.assertEqual(self.state(root)["bimri_version"], "5.2.0")
+            self.assertEqual(self.state(root)["bimri_version"], "5.2.1")
             self.assert_current_witness(self.witness(root))
 
     def test_rollback_stranded_lifecycle_run_is_closable(self):
@@ -1796,7 +1906,7 @@ class V520Step1Test(unittest.TestCase):
         self.assertNotIn(run_id, state["active_runs"])
         self.assertNotIn(run_id, state.get("session_runs", {}).values())
 
-        self.assertEqual(self.state()["bimri_version"], "5.2.0")
+        self.assertEqual(self.state()["bimri_version"], "5.2.1")
         proposal = self.root / ".bimri" / "proposals" / f"{damaged_run}-Q001.json"
         proposal.write_text("{}\n", encoding="utf-8")
         refused = self.cli(

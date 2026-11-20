@@ -96,14 +96,29 @@ two paths to its ignore rules explicitly.
    v5.1.x. Without the flag the install exits 2 and creates nothing in the
    target.
 
-5. Do not replace existing `AGENTS.md` or `CLAUDE.md`. The installer merges a
-   marked BIMRI block and backs up files it upgrades. The merge replaces only
-   the text between a `<!-- BIMRI:START -->` marker and the first
-   `<!-- BIMRI:END -->` that follows it with no other start marker between;
-   an orphan start marker in owner prose, and the prose after it, stay in
-   place. It packages `legacy/` as inert rollback material and copies BIMRI's
-   MIT notice to `BIMRI-LICENSE`; neither action replaces the target project's
-   root `LICENSE`.
+5. The installer checks both `AGENTS.md` and `CLAUDE.md` before installing
+   or updating. It replaces a single block enclosed by standalone
+   `<!-- BIMRI:START -->` and `<!-- BIMRI:END -->` lines. In a project with
+   no previous block, it appends one. Owner prose, literal examples in fenced
+   code, and an orphan start marker before the genuine pair are preserved.
+
+   If the installer reports a filename and line number, open the file there.
+   For a missing start marker, put `<!-- BIMRI:START -->` immediately above the
+   old BIMRI Engine or BIMRI Memory Protocol heading. In the short Claude
+   adapter it goes immediately above the managed `@AGENTS.md` import. Put
+   `<!-- BIMRI:END -->` immediately after the instructions. If there are two
+   live copies, review them, preserve any owner instructions outside the
+   markers, and keep just one paired BIMRI block. Retry the same install command.
+
+   If a 5.2.1 install was interrupted and an adapter changed afterwards,
+   recovery identifies the file and its original backup. Copy your edits
+   somewhere safe before restoring the recorded original and retrying.
+   For an interrupted older installer that recorded only the original hash,
+   recovery keeps the exact observed adapter under the transaction's
+   `observed-adapters/` directory and reports its path.
+
+   The installer packages `legacy/` as inert rollback material and copies
+   BIMRI's MIT notice to `BIMRI-LICENSE`. The target keeps its root `LICENSE`.
 6. Existing BIMRI v1-v4 memory migrates automatically and idempotently.
    Migration preserves exact source and backup bytes, records their hashes,
    and stops without overwriting ambiguous or malformed input. Inherited claim
@@ -125,9 +140,9 @@ two paths to its ignore rules explicitly.
 7. Run `<verified-python> bimri-engine.py doctor --read-only` from the updated
    target when you need to repeat the non-mutating audit. Use normal
    `doctor` only when repair-capable validation is intended, with one
-   exception: after updating a v5.1.x store, run normal `doctor` once from
+   exception: after updating a v5.1.x or v5.2.0 store, run normal `doctor` once from
    the updated target. This full audit establishes the first checkpoint
-   under `5.2.0-authority-1`. Allow time for the populated store to be
+   under `5.2.1-authority-1`. Allow time for the populated store to be
    checked. If doctor reports an interrupted legacy operation, use its named
    run and recovery instruction under that run owner's authority.
 8. Confirm the installer wrote both local binding records above; never commit

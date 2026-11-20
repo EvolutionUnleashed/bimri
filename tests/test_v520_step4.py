@@ -100,8 +100,8 @@ CHAT_SENTENCE_RE = re.compile(
     r"runs are for deliberate multi-step work\."
 )
 AGENT_BLOCK_HEADER = (
-    "## BIMRI Engine v5.2.0 | Authority Format v5.1.0 | "
-    "State Format v5.2.0 | Hot Grammar v5.0.2"
+    "## BIMRI Engine v5.2.1 | Authority Format v5.1.0 | "
+    "State Format v5.2.1 | Hot Grammar v5.0.2"
 )
 # D6.1 --json object (section 06 1.4 adds "checkpoint", local decision 15).
 D61_JSON_KEYS = {
@@ -816,7 +816,7 @@ class V520Step4ReadBriefTest(unittest.TestCase):
         ticket = {
             "ticket_schema": 1,
             "bimri_version": "5.1.0",
-            "engine_release": "5.2.0",
+            "engine_release": "5.2.1",
             "request_id": request_id,
             "actor": "ticket-agent",
             "status": "admitted",
@@ -1412,7 +1412,7 @@ class V520Step4ReadBriefTest(unittest.TestCase):
         prefix = ['/opt/py"3/python', "/srv/x y/bimri-engine.py"]
         (self.bdir() / "runtime.local.json").write_text(
             json.dumps({
-                "version": "5.2.0", "host_bound": True,
+                "version": "5.2.1", "host_bound": True,
                 "python_executable": prefix[0], "engine_path": prefix[1],
                 "argv_prefix": prefix,
             }, indent=2, sort_keys=True) + "\n",
@@ -1703,13 +1703,11 @@ class V520Step4ReadBriefTest(unittest.TestCase):
         self.assertNotIn("BIMRI RUN HANDLE", block)
 
     def test_agents_md_is_the_agent_block(self):
-        # D8.2 / section 01 6: repo AGENTS.md = `# AGENTS.md` + blank + the
-        # block, changed in the same commit.
         agents = (REPOSITORY / "AGENTS.md").read_text("utf-8")
         block = (REPOSITORY / "BIMRI-AGENT-BLOCK.md").read_text("utf-8")
-        self.assertTrue(agents.startswith("# AGENTS.md\n\n"), agents[:40])
         self.assertEqual(
-            agents[len("# AGENTS.md\n\n"):].strip(), block.strip()
+            agents, "# AGENTS.md\n\n<!-- BIMRI:START -->\n"
+            + block.strip() + "\n<!-- BIMRI:END -->\n"
         )
 
     def test_install_and_claude_docs_describe_the_read_brief_hooks(self):
@@ -1720,7 +1718,7 @@ class V520Step4ReadBriefTest(unittest.TestCase):
         self.assertIn("=== BIMRI BRIEF read", install)
         self.assertNotIn("[hook-identity-missing]", install)
         claude = normalized((REPOSITORY / "CLAUDE.md").read_text("utf-8"))
-        self.assertIn("Use BIMRI engine v5.2.0", claude)
+        self.assertIn("Use BIMRI engine v5.2.1", claude)
         self.assertNotIn("v5.1.2", claude)
         self.assertNotIn("confirm the test run closes", claude)
         self.assertNotIn("allocate or resume the correct run", claude)
@@ -1734,17 +1732,6 @@ class V520Step4ReadBriefTest(unittest.TestCase):
         )
 
     def test_installer_claude_block_names_start_and_save(self):
-        # D8.2: the installer's claude_block literal (both copies) gains
-        # "A chat reads with start and remembers with save; ...".
-        source = ENGINE.read_text("utf-8")
-        joined = re.sub(r'"\s*\n\s*"', "", source)
-        anchors = [
-            match.start() for match in
-            re.finditer(r"BIMRI shared memory is engine-managed\.", joined)
-        ]
-        self.assertTrue(anchors)
-        for anchor in anchors:
-            self.assertRegex(joined[anchor:anchor + 400], CHAT_SENTENCE_RE)
         target = self.workspace / "install-target"
         target.mkdir()
         installed = subprocess.run(

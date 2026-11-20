@@ -55,7 +55,7 @@ PROPOSAL_RE = re.compile(r"\bR\d{6}-Q\d{3}\b")
 
 # D5.1 / section 05 1.3 line grammar.
 HEADER_RE = re.compile(
-    r"^BIMRI engine v5\.2\.0 \| memory format v5\.1\.0 \| "
+    r"^BIMRI engine v5\.2\.1 \| memory format v5\.1\.0 \| "
     r"state v(\d+\.\d+\.\d+) \| revision V(\d{6}) \| runs (\d+) \| "
     r"active (\d+)$"
 )
@@ -649,7 +649,7 @@ class V520Step7StatusTest(unittest.TestCase):
         ticket = {
             "ticket_schema": 1,
             "bimri_version": "5.1.0",
-            "engine_release": "5.2.0",
+            "engine_release": "5.2.1",
             "request_id": request_id,
             "actor": "ticket-agent",
             "status": "admitted",

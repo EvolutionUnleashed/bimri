@@ -38,7 +38,7 @@ PRIOR_RELEASE_COMMIT = "69757b3"
 RUN_RE = re.compile(r"BIMRI RUN HANDLE: (R\d{6})")
 PROPOSAL_ID_RE = re.compile(r"\bR\d{6}-Q\d{3}\b")
 PATTERN_ID_RE = re.compile(r"^P\d+$")
-STATE_REFUSAL = "unsupported BIMRI state version: 5.2.0"
+STATE_REFUSAL = "unsupported BIMRI state version: 5.2.1"
 DEFAULT_HOT_MAX_BYTES = 49152
 
 
@@ -278,7 +278,7 @@ class V520Step10Test(unittest.TestCase):
         Pattern score: 1 (emerging) x 0.1 (evidence run 365 days old) = 0.1.
         Neighbour: importance 1 x 1.0 x 2.0 (confirmed) x 1.25 (user) = 2.5.
         ``fixture_engine`` writes the pattern and the neighbour (the 5.1.2
-        engine for the one-way test); the pressure admission is always 5.2.0.
+        engine for the one-way test); the pressure admission is always 5.2.1.
         """
         pattern_key = "pattern.stale-signal"
         neighbour_key = "notes.fresh-neighbour"
@@ -690,7 +690,7 @@ class V520Step10Test(unittest.TestCase):
         self.assertEqual(
             self.cold_current()[fixture["pattern_key"]]["tier"], 3
         )
-        self.assertEqual(self.state()["bimri_version"], "5.2.0")
+        self.assertEqual(self.state()["bimri_version"], "5.2.1")
         before = self.protected_snapshot(self.root)
         refused = self.cli(
             "start", "--actor", "too-old", engine=prior, check=False

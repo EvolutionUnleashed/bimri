@@ -82,7 +82,7 @@ PASSED_LIVE_RE = re.compile(
     r"^BIMRI doctor: PASSED \(live audit held the lock [\d.]+ s\)$",
     re.MULTILINE,
 )
-NO_CHECKPOINT_LINE = "BIMRI doctor: no valid checkpoint; auditing live under lock"
+NO_CHECKPOINT_LINE = "BIMRI doctor: no valid checkpoint; verifying frozen memory before publication"
 NEWEST_VERDICT_TAIL = (
     r"(?:last deep audit \S+ (?:PASSED|FAILED)(?: as of V\d{6})?"
     r"|no deep audit on record)\)"
@@ -1255,23 +1255,21 @@ class CopyUnderLockTest(unittest.TestCase):
 
     # ---- seeding: the live path -----------------------------------------------
 
-    def test_doctor_live_seeds_when_no_checkpoint(self):
-        # D5.3.2, section 05 3.1-3.2: without a valid checkpoint doctor audits
-        # live, says so first, publishes a schema-2 witness with its facts and
-        # a source: live verdict.
+    def test_doctor_reproves_then_diagnoses_when_no_checkpoint(self):
         (self.root / WITNESS).unlink()
         doctor = self.cli("doctor")
         lines = doctor.stdout.splitlines()
         self.assertEqual(lines[0], NO_CHECKPOINT_LINE)
-        self.assertIsNotNone(PASSED_LIVE_RE.match(lines[1]), doctor.stdout)
+        self.assertIsNotNone(PASSED_COPY_RE.match(lines[1]), doctor.stdout)
         witness = self.witness()
         self.assertEqual(witness["witness_schema"], 2)
         self.assertTrue(
             (self.root / GENERATIONS / ("facts-%s.json" % witness["facts_hash"])).is_file()
         )
         verdict = self.verdict()
-        self.assertEqual((verdict["source"], verdict["status"]), ("live", "passed"))
-        self.assertIsNone(verdict["copy_capture_ms"])
+        self.assertEqual(witness["audit_origin"], "full")
+        self.assertEqual((verdict["source"], verdict["status"]), ("copy", "passed"))
+        self.assertIsNotNone(verdict["copy_capture_ms"])
 
     def test_doctor_after_seeding_takes_the_copy_path(self):
         # D5.3.2: once seeded, the next default doctor audits a copy.

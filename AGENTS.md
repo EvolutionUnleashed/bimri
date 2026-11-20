@@ -1,6 +1,7 @@
 # AGENTS.md
 
-## BIMRI Engine v5.2.0 | Authority Format v5.1.0 | State Format v5.2.0 | Hot Grammar v5.0.2
+<!-- BIMRI:START -->
+## BIMRI Engine v5.2.1 | Authority Format v5.1.0 | State Format v5.2.1 | Hot Grammar v5.0.2
 
 This project uses BIMRI portable memory. `bimri.md` is the small, readable
 current state. Full evidence and history live under `.bimri/`.
@@ -154,3 +155,4 @@ it never dismisses a conflict or accepts an unreferenced ID. A wedged save
 that `doctor` names is repaired only on the owner's word with
 `recover-save <id> --cancel|--rebuild --summary "..."`. `BIMRI-PROTOCOL.md` is
 the normative specification.
+<!-- BIMRI:END -->

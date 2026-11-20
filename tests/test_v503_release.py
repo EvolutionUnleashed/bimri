@@ -141,11 +141,11 @@ class V510ReleaseContractTest(unittest.TestCase):
         self.start()
         status = self.cli("status")
 
-        self.assertIn("BIMRI engine v5.2.0", status.stdout)
+        self.assertIn("BIMRI engine v5.2.1", status.stdout)
         self.assertIn("memory format v5.1.0", status.stdout)
         # v5.2.0: a store this engine creates is born at state format
         # v5.2.0; the authority (memory) format stays v5.1.0.
-        self.assertEqual(self.state()["bimri_version"], "5.2.0")
+        self.assertEqual(self.state()["bimri_version"], "5.2.1")
         self.assertIn(
             "<!-- BIMRI v5.0.2 | Generated view.",
             (self.root / "bimri.md").read_text("utf-8"),
@@ -330,12 +330,12 @@ class V510ReleaseContractTest(unittest.TestCase):
             root=REPOSITORY,
             timeout=60,
         )
-        self.assertIn("BIMRI 5.2.0 installed.", installed.stdout)
+        self.assertIn("BIMRI 5.2.1 installed.", installed.stdout)
         # The target was created by this engine, so it is a v5.2.0 state.
-        self.assertIn("Existing authority store v5.2.0 verified", installed.stdout)
+        self.assertIn("Existing authority store v5.2.1 verified", installed.stdout)
         self.assertIn("Memory preservation: PASSED", installed.stdout)
         self.assertEqual(self.authority_snapshot(target), before)
-        self.assertEqual(self.state(target)["bimri_version"], "5.2.0")
+        self.assertEqual(self.state(target)["bimri_version"], "5.2.1")
 
         installed_engine = target / "bimri-engine.py"
         second_audit = self.cli(
@@ -354,8 +354,8 @@ class V510ReleaseContractTest(unittest.TestCase):
         )
         self.assertEqual(len(manifests), 1)
         prior_patch_receipt = json.loads(manifests[0].read_text("utf-8"))
-        self.assertEqual(prior_patch_receipt["engine_release"], "5.2.0")
-        self.assertEqual(prior_patch_receipt["memory_format"], "5.2.0")
+        self.assertEqual(prior_patch_receipt["engine_release"], "5.2.1")
+        self.assertEqual(prior_patch_receipt["memory_format"], "5.2.1")
         # A 5.1.0 receipt always named memory format 5.1.0.
         prior_patch_receipt["engine_release"] = "5.1.0"
         prior_patch_receipt["memory_format"] = "5.1.0"
@@ -372,7 +372,7 @@ class V510ReleaseContractTest(unittest.TestCase):
             root=REPOSITORY,
             timeout=60,
         )
-        self.assertIn("BIMRI 5.2.0 installed.", repeated.stdout)
+        self.assertIn("BIMRI 5.2.1 installed.", repeated.stdout)
         receipts = [
             json.loads(path.read_text("utf-8"))
             for path in target.joinpath(".bimri-update-backups").glob(
@@ -387,7 +387,7 @@ class V510ReleaseContractTest(unittest.TestCase):
             },
         )
         self.assertIn(
-            ("5.2.0", "5.2.0"),
+            ("5.2.1", "5.2.1"),
             {
                 (receipt["engine_release"], receipt["memory_format"])
                 for receipt in receipts
