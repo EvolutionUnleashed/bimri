@@ -2629,6 +2629,11 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(self.monthly_archive_snapshot(), stable_archive)
         self.assertIn("Open conflicts: 0", self.cli("status").stdout)
 
+    def assert_read_only_audit_passes(self):
+        # Recovery assertions need the full audit verdict. Step 8 tests copy-budget deferral.
+        audit = self.cli("doctor", "--read-only", "--budget-ms", "120000", timeout=150)
+        self.assertIn("BIMRI doctor (read-only): PASSED", audit.stdout)
+
     def assert_stale_close_archive_effect(self, fixture, archive_before, collateral=False):
         close_id, conflict_id, line_a, line_b, _ = fixture
         archive_after = self.monthly_archive_snapshot()
@@ -2667,7 +2672,7 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(decision["initial_outcome"], "contested")
         self.assertEqual(decision["resolution_id"], conflict_id)
         self.assertEqual(decision["revision"], resolution["revision_after"])
-        self.assertIn("PASSED", self.cli("doctor", "--read-only").stdout)
+        self.assert_read_only_audit_passes()
         return resolution
 
     def assert_old_close_preserves_later_generation(self, fixture, cold=False):
@@ -2716,7 +2721,7 @@ class BimriCliTest(unittest.TestCase):
         self.assertEqual(resolution_path.read_bytes(), old_resolution)
         self.assertEqual(decision_path.read_bytes(), old_decision)
         self.assertIn(value_c, self.cli("recall", "--key", "stale.close").stdout)
-        self.assertIn("PASSED", self.cli("doctor", "--read-only").stdout)
+        self.assert_read_only_audit_passes()
 
     def test_stale_close_hot_and_cold_resolution_crash_matrix(self):
         outer_root = self.root

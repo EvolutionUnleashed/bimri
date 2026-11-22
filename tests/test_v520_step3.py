@@ -35,6 +35,7 @@ import json
 import os
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -1408,19 +1409,23 @@ class PublicationCostTest(Step3Base):
         # + 50 ms.
         large = self.workspace / "large"
         copy_store(fixture("F2x3"), large)
-        figures = {}
-        for label, root in (("F2", self.root), ("F2x3", large)):
-            result = self.save_on(root, "test-slope-" + label.lower(), "cost.slope", "time_publish")
-            self.assert_save(result, "accepted", 0)
-            timing = json.loads((root / ".test-publish-ms").read_text("utf-8"))
-            self.assertGreaterEqual(timing["calls"], 1, timing)
-            figures[label] = timing["ms"]
-        sys.stderr.write(
-            "\n[step3] save_publish_ms F2={:.1f} F2x3={:.1f}\n".format(
-                figures["F2"], figures["F2x3"]
-            )
-        )
-        self.assertLessEqual(figures["F2x3"], 4.0 * figures["F2"] + 50.0, figures)
+        # Pair adjacent saves and alternate order so a single scheduling or
+        # disk stall on a shared runner doesn't decide the growth rate.
+        stores = (("F2", self.root), ("F2x3", large))
+        samples = []
+        for index in range(5):
+            key = "cost.slope.{}".format(index)
+            pair = {}
+            for label, root in (stores if index % 2 == 0 else reversed(stores)):
+                result = self.save_on(root, "test-slope-{}".format(index), key, "time_publish")
+                self.assert_save(result, "accepted", 0)
+                timing = json.loads((root / ".test-publish-ms").read_text("utf-8"))
+                self.assertGreaterEqual(timing["calls"], 1, timing)
+                pair[label] = timing["ms"]
+            samples.append(pair)
+        sys.stderr.write("\n[step3] save_publish_ms pairs: {}\n".format(samples))
+        excess = [pair["F2x3"] - 4.0 * pair["F2"] for pair in samples]
+        self.assertLessEqual(statistics.median(excess), 50.0, samples)
 
 
 # ---- F4: the live-store copy on this machine (skipped without it) ----------
