@@ -837,9 +837,16 @@ class V512DefectsTest(unittest.TestCase):
         shutil.copytree(POPULATED_FIXTURE, activated)
         first = self.install(activated, "--quiescent")
         self.assertIn("Authority store activated from v5.0.2 to v5.1.0", first.stdout)
+        activation_receipts = self.manifests(activated)
+        self.assertEqual(
+            [receipt["mode"] for receipt in activation_receipts],
+            ["lossless-authority-activation"],
+        )
         self.install(activated, "--quiescent")
         receipts = self.manifests(activated)
-        self.assertEqual(
+        # Backup names include a random suffix; two installs can share a second.
+        self.assertIn(activation_receipts[0], receipts)
+        self.assertCountEqual(
             [(receipt["mode"], receipt["source_memory_format"], receipt["state_activated"])
              for receipt in receipts],
             [
